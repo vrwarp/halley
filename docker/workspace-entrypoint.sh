@@ -6,6 +6,7 @@ WORKSPACE_DIR="${VOLUME_DIR}/workspace"
 STATE_DIR="${VOLUME_DIR}/state"
 
 mkdir -p "${STATE_DIR}"
+git config --global --add safe.directory '*'
 
 if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
   git clone "${HALLEY_MIRROR_PATH:-/halley-mirror}" "${WORKSPACE_DIR}"
