@@ -1,0 +1,32 @@
+{
+  "name": "halley-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.0.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --sort build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "dev:control-plane": "pnpm --filter @halley/control-plane dev",
+    "dev:web": "pnpm --filter @halley/web dev",
+    "docker:build:workspace": "docker build -f docker/workspace.Dockerfile -t halley-workspace:latest .",
+    "docker:build:control-plane": "docker build -f docker/control-plane.Dockerfile -t halley-control-plane:latest .",
+    "docker:build": "pnpm docker:build:workspace && pnpm docker:build:control-plane"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.1.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp"
+    ]
+  }
+}
