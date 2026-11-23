@@ -19,6 +19,8 @@ export interface HalleyConfig {
   allowedDomains: string[];
   sessionSecret: string;
   anthropicApiKey: string;
+  anthropicBaseUrl: string;
+  githubApiBaseUrl: string;
   modelProvider: string;
   modelId: string;
   thinkingLevel: 'off' | 'low' | 'medium' | 'high';
@@ -62,6 +64,8 @@ export function loadConfig(): HalleyConfig {
     allowedDomains: splitCsv(process.env.HALLEY_ALLOWED_DOMAINS).map((d) => d.replace(/^@/, '')),
     sessionSecret: process.env.SESSION_SECRET || 'halley-dev-insecure-secret',
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+    anthropicBaseUrl: (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, ''),
+    githubApiBaseUrl: (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/$/, ''),
     modelProvider: process.env.HALLEY_MODEL_PROVIDER || 'anthropic',
     modelId: process.env.HALLEY_MODEL_ID || 'haiku-latest',
     thinkingLevel: (process.env.HALLEY_THINKING_LEVEL || 'high') as 'off' | 'low' | 'medium' | 'high',

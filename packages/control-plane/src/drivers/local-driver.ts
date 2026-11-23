@@ -90,7 +90,9 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
 
       await fs.mkdir(baseDir, { recursive: true });
       await runGit(baseDir, ['clone', mirrorDir, 'workspace']);
-      if (!this.config.devLocalRepo) {
+      if (this.config.devLocalRepo) {
+        await runGit(workspaceDir, ['remote', 'set-url', 'origin', this.config.devLocalRepo]);
+      } else {
         await runGit(workspaceDir, [
           'remote',
           'set-url',

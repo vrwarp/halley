@@ -21,8 +21,9 @@ RUN pnpm --filter @halley/shared build \
  && pnpm --filter @halley/control-plane build
 
 FROM node:22-bookworm-slim AS runner
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates docker-cli \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /app
 COPY --from=builder /app/package.json /app/pnpm-workspace.yaml ./

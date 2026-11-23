@@ -1,0 +1,36 @@
+name: Docker Hub Build (PR)
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  docker-build-only:
+    name: Build Docker Images (${{ matrix.image.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: halley-control-plane
+            dockerfile: docker/control-plane.Dockerfile
+          - name: halley-workspace
+            dockerfile: docker/workspace.Dockerfile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: false
+          tags: halley/${{ matrix.image.name }}:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}

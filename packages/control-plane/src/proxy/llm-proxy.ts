@@ -82,7 +82,7 @@ export function createLlmProxyHandler(
     }
 
     const subPath = c.req.path.replace(/^\/internal\/llm\/anthropic/, '') || '/v1/messages';
-    const upstreamUrl = `https://api.anthropic.com${subPath}`;
+    const upstreamUrl = `${config.anthropicBaseUrl}${subPath}`;
     const bodyText = await c.req.text();
     let requestedModel = config.modelId;
     try {

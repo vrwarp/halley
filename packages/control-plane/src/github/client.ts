@@ -49,7 +49,7 @@ export class GitHubService {
       }
       const jwt = this.createAppJwt();
       const res = await fetch(
-        `https://api.github.com/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
+        `${this.config.githubApiBaseUrl}/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
         {
           method: 'POST',
           headers: {
@@ -78,7 +78,7 @@ export class GitHubService {
 
   private async api<T>(path: string, init?: RequestInit): Promise<T> {
     const token = await this.getAccessToken();
-    const res = await fetch(`https://api.github.com${path}`, {
+    const res = await fetch(`${this.config.githubApiBaseUrl}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -152,7 +152,7 @@ export class GitHubService {
   async tryEnableNativeAutoMerge(prNodeId: string, commitHeadline: string): Promise<boolean> {
     try {
       const token = await this.getAccessToken();
-      const res = await fetch('https://api.github.com/graphql', {
+      const res = await fetch(`${this.config.githubApiBaseUrl}/graphql`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
