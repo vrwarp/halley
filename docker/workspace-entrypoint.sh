@@ -8,7 +8,7 @@ STATE_DIR="${VOLUME_DIR}/state"
 mkdir -p "${STATE_DIR}"
 
 if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
-  git clone /halley-mirror "${WORKSPACE_DIR}"
+  git clone "${HALLEY_MIRROR_PATH:-/halley-mirror}" "${WORKSPACE_DIR}"
   cd "${WORKSPACE_DIR}"
   git remote set-url origin "https://github.com/${HALLEY_REPO}.git"
   git checkout -B "${HALLEY_WORKING_BRANCH}" "${HALLEY_BASE_BRANCH}"

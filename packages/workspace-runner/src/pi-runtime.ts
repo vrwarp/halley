@@ -283,7 +283,10 @@ export class HalleyPiRuntime {
         const url = `http://127.0.0.1:${opts.astroPort}${base}${cleanRoute}`;
         const size = args.viewport === 'mobile' ? { width: 390, height: 844 } : { width: 1440, height: 900 };
 
-        const browser = await chromium.launch({ headless: true });
+        const browser = await chromium.launch({
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        });
         try {
           const page = await browser.newPage({ viewport: size });
           await page.goto(url, { waitUntil: 'networkidle', timeout: 25_000 });

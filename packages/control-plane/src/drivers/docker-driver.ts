@@ -93,12 +93,37 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       await dockerRequest('POST', '/volumes/create', { Name: session.volume_name });
       await dockerRequest('POST', '/volumes/create', { Name: 'halley-pkg-cache' });
 
+      // Resolve how dataDir is mounted into control-plane so the host Docker daemon
+      // can mount git-mirror into the sibling workspace container.
+      let mirrorBind = `${mirrorDir}:/halley-mirror:ro`;
+      let mirrorPathEnv = '/halley-mirror';
+      if (process.env.HOST_DATA_DIR) {
+        mirrorBind = `${path.posix.join(process.env.HOST_DATA_DIR, 'git-mirror/repo.git')}:/halley-mirror:ro`;
+      } else {
+        const os = await import('node:os');
+        const self = await dockerRequest<{
+          Mounts?: Array<{ Type: string; Source: string; Destination: string; Name?: string }>;
+        }>('GET', `/containers/${os.hostname()}/json`).catch(() => null);
+        const dataMount = self?.status === 200
+          ? self.data?.Mounts?.find((m) => path.resolve(m.Destination) === path.resolve(this.config.dataDir))
+          : undefined;
+        if (dataMount) {
+          if (dataMount.Type === 'volume' && dataMount.Name) {
+            mirrorBind = `${dataMount.Name}:/halley-data:ro`;
+            mirrorPathEnv = '/halley-data/git-mirror/repo.git';
+          } else if (dataMount.Source) {
+            mirrorBind = `${path.posix.join(dataMount.Source, 'git-mirror/repo.git')}:/halley-mirror:ro`;
+          }
+        }
+      }
+
       const env = [
         `HALLEY_SESSION_ID=${session.id}`,
         `HALLEY_REPO=${session.repo}`,
         `HALLEY_BASE_BRANCH=${session.base_branch}`,
         `HALLEY_WORKING_BRANCH=${session.working_branch}`,
         `HALLEY_BASE_SHA=${session.base_sha}`,
+        `HALLEY_MIRROR_PATH=${mirrorPathEnv}`,
         `RUNNER_PORT=4100`,
         `ASTRO_PORT=4321`,
         `CONTROL_PLANE_INTERNAL_URL=${this.config.controlPlaneInternalUrl}`,
@@ -121,7 +146,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           Binds: [
             `${session.volume_name}:/halley-volume`,
             `halley-pkg-cache:/halley-pkg-cache`,
-            `${mirrorDir}:/halley-mirror:ro`,
+            mirrorBind,
           ],
           Memory: 2 * 1024 * 1024 * 1024,
         },
