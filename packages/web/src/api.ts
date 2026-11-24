@@ -112,23 +112,32 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
     }),
-  retryPageRequest: (id: string, pageRequestId: string) =>
+  retryPageRequest: (id: string, pageRequestId: string, viewport?: 'desktop' | 'tablet' | 'mobile') =>
     apiFetch<{ ok: boolean; pageRequest?: PageRequestMetadata }>(
       `/api/sessions/${id}/pages/${encodeURIComponent(pageRequestId)}/retry`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ viewport }),
+      },
     ),
   deletePage: (id: string, route: string) =>
     apiFetch<{ ok: boolean; deletedFile: string }>(
       `/api/sessions/${id}/pages?route=${encodeURIComponent(route)}`,
       { method: 'DELETE' },
     ),
-  setPageVisibility: (id: string, route: string, unlisted: boolean) =>
+  setPageVisibility: (
+    id: string,
+    route: string,
+    unlisted: boolean,
+    viewport?: 'desktop' | 'tablet' | 'mobile',
+  ) =>
     apiFetch<{ ok: boolean; route: string; unlisted: boolean; file: string }>(
       `/api/sessions/${id}/pages/visibility`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ route, unlisted }),
+        body: JSON.stringify({ route, unlisted, viewport }),
       },
     ),
   renamePage: (id: string, fromRoute: string, toSection: string, toSlug: string) =>
@@ -145,14 +154,14 @@ export const api = {
     }),
   getChanges: (id: string) =>
     apiFetch<{ changes: GitFileChange[]; checkpoints: CheckpointInfo[] }>(`/api/sessions/${id}/changes`),
-  getReview: (id: string, screenshots = false) =>
+  getReview: (id: string, screenshots = false, viewport: 'desktop' | 'mobile' = 'desktop') =>
     apiFetch<{
       cards: ChangeCardDto[];
       pages: VisualDiffPageDto[];
       mergeReview: MergeReviewStateDto | null;
       baseSha: string;
       prevBaseSha: string | null;
-    }>(`/api/sessions/${id}/review?screenshots=${screenshots ? '1' : '0'}`),
+    }>(`/api/sessions/${id}/review?screenshots=${screenshots ? '1' : '0'}&viewport=${viewport}`),
   getUpstreamStatus: (id: string) =>
     apiFetch<{
       behind: boolean;

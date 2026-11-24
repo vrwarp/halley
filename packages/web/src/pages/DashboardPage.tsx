@@ -113,6 +113,8 @@ export function DashboardPage({
   const [undoReason, setUndoReason] = useState('');
   const [undoBusy, setUndoBusy] = useState(false);
   const [undoError, setUndoError] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<EditorSessionDto | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const isFinished = (s: EditorSessionDto) => s.status === 'published' || s.status === 'merged';
   const myDrafts = sessions.filter((s) => s.isOwner && !isFinished(s));
@@ -152,10 +154,20 @@ export function DashboardPage({
     onOpenSession(session.id);
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Discard this draft and its workspace?')) return;
-    await api.deleteSession(id);
-    await onRefresh();
+  const handleDelete = (s: EditorSessionDto) => {
+    setDeleteTarget(s);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      await api.deleteSession(deleteTarget.id);
+      setDeleteTarget(null);
+      await onRefresh();
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const handleConfirmUndo = async (e: React.FormEvent) => {
@@ -182,21 +194,21 @@ export function DashboardPage({
   };
 
   return (
-    <div className="min-h-screen bg-[#FAF9F7] text-[#1C1917]">
+    <div className="min-h-dvh bg-[#FAF9F7] text-[#1C1917]">
       <header className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/90 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-3.5">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-stone-900 text-amber-400">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-3 sm:px-6 sm:py-3.5">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-stone-900 text-amber-400">
               <Sparkles className="h-4 w-4" />
             </div>
-            <div>
+            <div className="min-w-0">
               <h1 className="text-sm font-semibold tracking-tight text-stone-900">Halley</h1>
-              <p className="text-xs text-stone-500">{repo}</p>
+              <p className="truncate text-xs text-stone-500">{repo}</p>
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <span className="hidden text-xs text-stone-500 sm:inline">
+          <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+            <span className="hidden text-xs text-stone-500 md:inline">
               Daily AI budget: ${spend.spentTodayUsd.toFixed(2)} / $
               {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}
             </span>
@@ -204,19 +216,22 @@ export function DashboardPage({
               <button
                 type="button"
                 onClick={onOpenAdmin}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50"
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 sm:px-3"
               >
                 <Settings className="h-3.5 w-3.5" />
-                Admin
+                <span>Admin</span>
               </button>
             )}
-            <div className="flex items-center gap-2 border-l border-stone-200 pl-3">
-              <span className="text-xs font-medium text-stone-700">{user.name}</span>
+            <div className="flex items-center gap-1.5 border-l border-stone-200 pl-2 sm:gap-2 sm:pl-3">
+              <span className="hidden max-w-[120px] truncate text-xs font-medium text-stone-700 sm:inline">
+                {user.name}
+              </span>
               <button
                 type="button"
                 onClick={onLogout}
                 title="Sign out"
-                className="rounded-lg p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                aria-label="Sign out"
+                className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
               >
                 <LogOut className="h-4 w-4" />
               </button>
@@ -225,8 +240,8 @@ export function DashboardPage({
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-6 shadow-xs">
+      <main className="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-10">
+        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-4 shadow-xs sm:p-6">
           <h2 className="text-lg font-semibold text-stone-900">Start a new website edit</h2>
           <p className="mt-1 text-sm text-stone-500">
             Every edit gets its own private live preview. Publish whenever you&apos;re ready.
@@ -242,7 +257,7 @@ export function DashboardPage({
             <button
               type="submit"
               disabled={!title.trim() || creating}
-              className="inline-flex items-center justify-center gap-2 rounded-xl bg-stone-900 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-stone-900 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
             >
               <Plus className="h-4 w-4" />
               {creating ? 'Starting…' : 'New edit'}
@@ -251,11 +266,11 @@ export function DashboardPage({
         </section>
 
         {/* Q20: Split Dashboard into Active Drafts vs Published History */}
-        <div className="mt-8 flex items-center gap-2 border-b border-stone-200">
+        <div className="mt-6 flex items-center gap-1 border-b border-stone-200 sm:mt-8 sm:gap-2">
           <button
             type="button"
             onClick={() => setTab('drafts')}
-            className={`border-b-2 px-4 py-2.5 text-sm font-semibold transition ${
+            className={`border-b-2 px-3 py-2.5 text-xs font-semibold transition sm:px-4 sm:text-sm ${
               tab === 'drafts'
                 ? 'border-stone-900 text-stone-900'
                 : 'border-transparent text-stone-500 hover:text-stone-800'
@@ -269,13 +284,13 @@ export function DashboardPage({
               setTab('history');
               void loadHistory();
             }}
-            className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-semibold transition ${
+            className={`inline-flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-xs font-semibold transition sm:px-4 sm:text-sm ${
               tab === 'history'
                 ? 'border-stone-900 text-stone-900'
                 : 'border-transparent text-stone-500 hover:text-stone-800'
             }`}
           >
-            <History className="h-4 w-4" />
+            <History className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             Published History ({history.length})
           </button>
         </div>
@@ -349,9 +364,10 @@ export function DashboardPage({
                           </button>
                           <button
                             type="button"
-                            onClick={() => void handleDelete(s.id)}
+                            onClick={() => handleDelete(s)}
                             title="Discard draft"
-                            className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-red-600"
+                            aria-label="Discard draft"
+                            className="flex h-8 w-8 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-red-600"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
@@ -547,12 +563,49 @@ export function DashboardPage({
               <button
                 type="submit"
                 disabled={!undoReason.trim() || undoBusy}
-                className="rounded-lg bg-stone-900 px-4 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+                className="min-h-[40px] rounded-lg bg-stone-900 px-4 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
               >
                 {undoBusy ? 'Preparing undo…' : 'Review & undo'}
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[2px]">
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white p-5 shadow-xl space-y-4 sm:p-6"
+          >
+            <div>
+              <h3 className="text-base font-semibold text-stone-900">
+                Discard &ldquo;{deleteTarget.title}&rdquo;?
+              </h3>
+              <p className="mt-1 text-xs text-stone-500">
+                This permanently removes this unpublished draft and its workspace. Your live site is not affected.
+              </p>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={() => setDeleteTarget(null)}
+                className="min-h-[40px] rounded-lg px-3.5 py-2 text-xs font-medium text-stone-600 hover:bg-stone-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={() => void handleConfirmDelete()}
+                className="min-h-[40px] rounded-lg bg-red-600 px-4 py-2 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-40"
+              >
+                {deleting ? 'Discarding…' : 'Discard draft'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

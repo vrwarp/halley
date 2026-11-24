@@ -787,12 +787,13 @@ export function createControlPlane(
     const spend = db.getSpendStatus(check.user.id);
     const ep = await driver.ensureRunning(check.session);
     const pageRequestId = c.req.param('pageRequestId')!;
+    const reqBody = (await c.req.json().catch(() => ({}))) as { viewport?: string };
     const res = await fetch(
       `${ep.runnerUrl}/internal/pages/${encodeURIComponent(pageRequestId)}/retry`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ capped: spend.capped }),
+        body: JSON.stringify({ capped: spend.capped, viewport: reqBody.viewport }),
       },
     );
     return c.json(await res.json(), res.status as 200);
@@ -1045,6 +1046,8 @@ export function createControlPlane(
     if (!s) return c.json({ error: 'Not found' }, 404);
     const ep = await driver.ensureRunning(s);
     const includeScreenshots = c.req.query('screenshots') === '1';
+    const rawViewport = c.req.query('viewport');
+    const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
     const qs = new URLSearchParams({
       baseRef: `origin/${s.base_branch}`,
     });
@@ -1058,6 +1061,7 @@ export function createControlPlane(
       mergedFromLiveFiles?: string[];
       astroReady?: boolean;
       previewBase?: string;
+      liveSiteUrl?: string | null;
       mergeReview: unknown;
       baseSha?: string;
       prevBaseSha?: string | null;
@@ -1071,12 +1075,19 @@ export function createControlPlane(
         ...data.cards.map((card) => card.route || '/'),
         ...(data.cards.length === 0 ? ['/'] : []),
       ];
+      const envLive = config.liveSiteUrl;
+      const liveBaseUrl =
+        envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off'
+          ? null
+          : envLive || data.liveSiteUrl || null;
       data.pages = await screenshotService
         .captureLiveVsDraftPages({
           routes,
           draftFiles: data.draftFiles ?? [],
           mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
           draftBaseUrl,
+          liveBaseUrl,
+          viewport: screenshotViewport,
           liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
         })
         .catch(() => []);

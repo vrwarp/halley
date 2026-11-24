@@ -1009,10 +1009,12 @@ export class HalleyPiRuntime {
     pageRequest: PageRequestMetadata,
     instructions: string,
     whenBusy?: 'followUp',
+    viewport?: 'desktop' | 'tablet' | 'mobile',
   ): Promise<void> {
     this.trackedPageRequestIds.add(pageRequest.pageRequestId);
+    const effectiveViewport = viewport ?? this.lastEditorContext?.viewport ?? 'desktop';
     const header = `[Halley Page Request] ${JSON.stringify({ pageRequestId: pageRequest.pageRequestId })}`;
-    const ctxLine = `[Current Preview] route=${pageRequest.route} viewport=desktop mode=browse`;
+    const ctxLine = `[Current Preview] route=${pageRequest.route} viewport=${effectiveViewport} mode=browse`;
     const parts: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
 
     let enrichedText = `${header}\n${ctxLine}\n\n${instructions}`;

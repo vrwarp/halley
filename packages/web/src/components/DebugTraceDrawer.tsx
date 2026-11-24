@@ -245,8 +245,11 @@ export function DebugTraceDrawer({
     <div className="fixed inset-0 z-50 flex justify-end bg-stone-950/40 backdrop-blur-[1px]">
       <div className="flex h-full w-full max-w-3xl flex-col bg-white shadow-2xl border-l border-stone-200">
         {/* Header */}
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-5 py-3.5 bg-stone-50">
-          <div className="flex items-center gap-2.5 min-w-0">
+        <div
+          className="flex flex-wrap items-center justify-between gap-2.5 border-b border-stone-200 bg-stone-50 px-4 py-3 sm:px-5 sm:py-3.5"
+          style={{ paddingTop: 'max(0.75rem, env(safe-area-inset-top))' }}
+        >
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-stone-900 text-white">
               <Bug className="h-4 w-4" />
             </div>
@@ -260,7 +263,7 @@ export function DebugTraceDrawer({
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
             <button
               type="button"
               onClick={() => void loadTrace()}
@@ -269,7 +272,7 @@ export function DebugTraceDrawer({
               className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-100 disabled:opacity-50"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-              Refresh
+              <span className="hidden sm:inline">Refresh</span>
             </button>
             <button
               type="button"
@@ -310,7 +313,7 @@ export function DebugTraceDrawer({
               type="button"
               onClick={onClose}
               title="Close debug panel"
-              className="ml-1 rounded-lg p-1.5 text-stone-500 hover:bg-stone-200/70 hover:text-stone-900"
+              className="ml-1 flex h-9 w-9 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-200/70 hover:text-stone-900"
             >
               <X className="h-4 w-4" />
             </button>
@@ -318,7 +321,7 @@ export function DebugTraceDrawer({
         </div>
 
         {/* Metadata strip */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-stone-200 bg-white px-5 py-2.5 text-[11px] text-stone-600">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-stone-200 bg-white px-4 py-2.5 text-[11px] text-stone-600 sm:px-5">
           <span>
             <strong className="text-stone-800">Route:</strong>{' '}
             <code className="font-mono text-stone-700">{currentRoute}</code>
@@ -346,8 +349,8 @@ export function DebugTraceDrawer({
         </div>
 
         {/* Filter bar */}
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200 bg-stone-50/70 px-5 py-2">
-          <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200 bg-stone-50/70 px-4 py-2 sm:px-5">
+          <div className="flex flex-wrap items-center gap-1">
             {(
               [
                 ['all', `All (${counts.all})`],

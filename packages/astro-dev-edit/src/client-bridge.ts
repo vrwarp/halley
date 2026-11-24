@@ -45,6 +45,7 @@ export function buildClientBridgeScript(previewBase: string): string {
   let mode = 'browse';
   let readOnly = false;
   let persona = 'non-technical';
+  let touchLayout = false;
   let workspaceLocked = false;
 
   // Current selection
@@ -52,6 +53,7 @@ export function buildClientBridgeScript(previewBase: string): string {
   let selMeta = null;
   let selInfo = null; // inspect result, null while inspecting
   let selToken = 0;
+  let lastNotifiedSelectionActive = false;
 
   // Inline editing (only ever the selected element)
   let activeEl = null;
@@ -93,12 +95,22 @@ export function buildClientBridgeScript(previewBase: string): string {
     '.pin-badge { position: absolute; top: -9px; left: -9px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: #d97706; color: #fff; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 2px #fff; }',
     '.toolbar { position: fixed; display: none; pointer-events: auto; align-items: center; gap: 2px; padding: 3px; background: #fff; border: 1px solid #e7e5e4; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.12), 0 1px 3px rgba(0,0,0,0.06); }',
     '.toolbar.open { display: flex; }',
+    '.toolbar.touch { left: 0 !important; right: 0; top: auto !important; width: 100%; border-radius: 14px 14px 0 0; border-left: none; border-right: none; border-bottom: none; padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); gap: 6px; justify-content: space-between; box-shadow: 0 -8px 28px rgba(0,0,0,0.14); }',
+    '.toolbar.touch .btn { min-height: 38px; padding: 6px 10px; font-size: 13px; border-radius: 8px; }',
+    '.toolbar.touch .label { flex: 1; min-width: 0; max-width: none; font-size: 12px; padding: 0 4px; }',
+    '.toolbar.touch .sep { display: none; }',
+    '.toolbar.touch.editing .label, .toolbar.touch.editing .touch-select-only { display: none !important; }',
+    '.toolbar:not(.touch) .touch-only { display: none !important; }',
+    '.toolbar.touch:not(.editing) .done-btn { display: none !important; }',
+    '.toolbar.touch .edit-btn { display: none; background: #fef3c7; color: #92400e; }',
+    '.toolbar.touch.can-edit:not(.editing) .edit-btn { display: inline-flex; }',
     '.label { font-size: 11px; color: #57534e; padding: 0 6px; max-width: 240px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
     '.label b { font-weight: 600; color: #1c1917; }',
     '.label code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; font-weight: 600; color: #1c1917; }',
     '.fmt { display: none; align-items: center; gap: 2px; }',
     '.toolbar.editing .fmt { display: inline-flex; }',
-    '.btn { border: none; background: transparent; color: #1c1917; font-size: 12px; font-weight: 600; padding: 5px 8px; border-radius: 5px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }',
+    '.toolbar.touch.editing .fmt { gap: 4px; }',
+    '.btn { border: none; background: transparent; color: #1c1917; font-size: 12px; font-weight: 600; padding: 5px 8px; border-radius: 5px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 4px; white-space: nowrap; }',
     '.btn:hover { background: #f5f5f4; }',
     '.btn:disabled { opacity: 0.35; cursor: default; background: transparent; }',
     '.btn.primary { background: #1c1917; color: #fff; }',
@@ -110,10 +122,13 @@ export function buildClientBridgeScript(previewBase: string): string {
     '.toast.visible { opacity: 1; }',
     '.link-pop { position: fixed; display: none; pointer-events: auto; width: 290px; background: #fff; border: 1px solid #e7e5e4; border-radius: 10px; box-shadow: 0 14px 36px rgba(0,0,0,0.14); padding: 8px; }',
     '.link-pop.open { display: block; }',
+    '.link-pop.touch { left: 0 !important; right: 0; top: auto !important; width: 100%; border-radius: 14px 14px 0 0; border-left: none; border-right: none; border-bottom: none; padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px)); box-shadow: 0 -12px 36px rgba(0,0,0,0.18); }',
     '.link-input { width: 100%; border: 1px solid #d6d3d1; border-radius: 6px; padding: 6px 8px; font-size: 12px; color: #1c1917; outline: none; }',
+    '.link-pop.touch .link-input { font-size: 16px; padding: 10px 12px; border-radius: 10px; }',
     '.link-input:focus { border-color: #d97706; }',
     '.route-list { max-height: 160px; overflow-y: auto; margin-top: 6px; }',
     '.route-item { width: 100%; text-align: left; border: none; background: transparent; padding: 5px 8px; border-radius: 5px; font-size: 12px; color: #292524; cursor: pointer; display: flex; justify-content: space-between; }',
+    '.link-pop.touch .route-item { padding: 10px 10px; font-size: 14px; }',
     '.route-item:hover { background: #f5f5f4; }',
     '.link-actions { display: flex; justify-content: space-between; margin-top: 6px; padding-top: 6px; border-top: 1px solid #f5f5f4; }',
     '</style>',
@@ -129,9 +144,11 @@ export function buildClientBridgeScript(previewBase: string): string {
     '    <button class="btn" data-cmd="link" title="Link (Cmd+K)">Link</button>',
     '  </span>',
     '  <span class="sep"></span>',
-    '  <button class="btn" data-act="parent" title="Select the surrounding block">&#8593; Parent</button>',
-    '  <button class="btn primary" data-act="ask" title="Attach this to the chat box">Ask Halley&hellip;</button>',
-    '  <button class="btn close" data-act="close" title="Close selection (Esc)" aria-label="Close selection">&times;</button>',
+    '  <button class="btn touch-only edit-btn" data-act="edit" title="Edit text">Edit text</button>',
+    '  <button class="btn touch-select-only" data-act="parent" title="Select the surrounding block">&#8593; Parent</button>',
+    '  <button class="btn primary touch-select-only" data-act="ask" title="Attach this to the chat box">Ask Halley&hellip;</button>',
+    '  <button class="btn primary touch-only done-btn" data-act="done" title="Finish editing">Done</button>',
+    '  <button class="btn close touch-select-only" data-act="close" title="Close selection (Esc)" aria-label="Close selection">&times;</button>',
     '</div>',
     '<div class="link-pop">',
     '  <input class="link-input" type="text" placeholder="Search site pages or paste https://..." />',
@@ -250,7 +267,32 @@ export function buildClientBridgeScript(previewBase: string): string {
     box.style.height = r.height + 'px';
   }
 
+  function notifySelectionChanged(active) {
+    const next = Boolean(active);
+    if (next === lastNotifiedSelectionActive) return;
+    lastNotifiedSelectionActive = next;
+    window.parent.postMessage({ type: 'halley:selection-changed', active: next }, '*');
+  }
+
+  function keyboardBottomOffset() {
+    const vv = window.visualViewport;
+    if (!vv) return 0;
+    return Math.max(0, Math.round(window.innerHeight - (vv.offsetTop + vv.height)));
+  }
+
   function placeToolbar(r) {
+    toolbar.classList.toggle('touch', touchLayout);
+    linkPop.classList.toggle('touch', touchLayout);
+    if (touchLayout) {
+      const kb = keyboardBottomOffset();
+      toolbar.style.bottom = kb + 'px';
+      if (linkPop.classList.contains('open')) {
+        linkPop.style.bottom = kb + 'px';
+      }
+      return;
+    }
+    toolbar.style.bottom = '';
+    linkPop.style.bottom = '';
     const tw = toolbar.offsetWidth || 280;
     const th = toolbar.offsetHeight || 34;
     let top = r.top - th - 8;
@@ -275,10 +317,12 @@ export function buildClientBridgeScript(previewBase: string): string {
       place(selBox, r);
       toolbar.classList.add('open');
       placeToolbar(r);
+      notifySelectionChanged(true);
     } else {
       selBox.style.display = 'none';
       toolbar.classList.remove('open');
       linkPop.classList.remove('open');
+      notifySelectionChanged(false);
     }
     const flashEl = flashKey ? findByKey(flashKey) : null;
     if (flashEl) {
@@ -340,7 +384,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     if (!selEl) return;
     const tag = selEl.tagName.toLowerCase();
     const kind = friendlyKind(tag);
-    const editable = selInfo && selInfo.editability === 'editable-static';
+    const editable = Boolean(selInfo && selInfo.editability === 'editable-static');
     let hint;
     if (!selInfo) hint = 'checking&hellip;';
     else if (activeEl === selEl) hint = 'editing';
@@ -351,8 +395,11 @@ export function buildClientBridgeScript(previewBase: string): string {
     const titleHtml = persona === 'developer'
       ? '<code>&lt;' + tag + '&gt;</code>'
       : '<b>' + kind + '</b>';
-    labelEl.innerHTML = titleHtml + ' &middot; ' + hint;
+    labelEl.innerHTML = touchLayout ? titleHtml : (titleHtml + ' &middot; ' + hint);
     labelEl.title = selMeta ? (basename(selMeta.file) + (selInfo && selInfo.reason ? ' — ' + selInfo.reason : '')) : '';
+    toolbar.classList.toggle('touch', touchLayout);
+    linkPop.classList.toggle('touch', touchLayout);
+    toolbar.classList.toggle('can-edit', Boolean(editable && !workspaceLocked));
     toolbar.classList.toggle('editing', activeEl === selEl);
     selBox.classList.toggle('editable', Boolean(editable));
     parentBtn.disabled = !mappedParent(selEl);
@@ -427,6 +474,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     selMeta = null;
     selInfo = null;
     linkPop.classList.remove('open');
+    notifySelectionChanged(false);
     layout();
   }
 
@@ -469,14 +517,20 @@ export function buildClientBridgeScript(previewBase: string): string {
     }, '*');
   }
 
-  // Keep focus/selection in the page when pressing toolbar buttons.
-  toolbar.addEventListener('mousedown', (e) => { e.preventDefault(); });
+  // Keep focus/selection in the page when pressing toolbar buttons (pointerdown works on both mouse and touch).
+  toolbar.addEventListener('pointerdown', (e) => { e.preventDefault(); });
   toolbar.addEventListener('click', (e) => {
     const act = e.target.closest && e.target.closest('button[data-act]');
     if (!act) return;
     const which = act.getAttribute('data-act');
     if (which === 'ask') void askHalley();
     else if (which === 'parent') void selectParent();
+    else if (which === 'edit') {
+      if (selEl && selMeta && selInfo && selInfo.editability === 'editable-static' && !workspaceLocked) {
+        beginEditing(selEl, selMeta, selInfo.snapshotHash, null);
+        renderToolbar();
+      }
+    } else if (which === 'done') void clearSelection(true);
     else if (which === 'close') void clearSelection(true);
   });
 
@@ -505,7 +559,7 @@ export function buildClientBridgeScript(previewBase: string): string {
       btn.className = 'route-item';
       btn.type = 'button';
       btn.textContent = item.route;
-      btn.addEventListener('mousedown', (e) => {
+      btn.addEventListener('pointerdown', (e) => {
         e.preventDefault();
         linkInput.value = item.route;
         applyLink();
@@ -582,11 +636,11 @@ export function buildClientBridgeScript(previewBase: string): string {
       if (activeEl) activeEl.focus();
     }
   });
-  shadow.querySelector('[data-link="apply"]').addEventListener('mousedown', (e) => {
+  shadow.querySelector('[data-link="apply"]').addEventListener('pointerdown', (e) => {
     e.preventDefault();
     applyLink();
   });
-  shadow.querySelector('[data-link="remove"]').addEventListener('mousedown', (e) => {
+  shadow.querySelector('[data-link="remove"]').addEventListener('pointerdown', (e) => {
     e.preventDefault();
     linkPop.classList.remove('open');
     if (activeEl) activeEl.focus();
@@ -639,23 +693,29 @@ export function buildClientBridgeScript(previewBase: string): string {
 
   // ---------- Pointer & keyboard handling ----------
 
+  // Notify parent whenever the user taps/clicks inside the preview so mobile floating chat card can dismiss cleanly.
+  document.addEventListener('pointerdown', () => {
+    window.parent.postMessage({ type: 'halley:preview-pointerdown' }, '*');
+  }, { capture: true, passive: true });
+
   document.addEventListener('click', (e) => {
     if (mode !== 'edit' || readOnly) return;
     if (e.target === host || host.contains(e.target)) return;
-    // Cmd/Ctrl-click follows links without leaving Edit mode.
-    if ((e.metaKey || e.ctrlKey) && e.target.closest && e.target.closest('a[href]')) return;
+    // Cmd/Ctrl-click follows links without leaving Edit mode (desktop).
+    if (!touchLayout && (e.metaKey || e.ctrlKey) && e.target.closest && e.target.closest('a[href]')) return;
     e.preventDefault();
     e.stopPropagation();
     if (activeEl && activeEl.contains(e.target)) return; // caret moves natively
-    // Re-clicking an already-selected editable element whose caret blurred re-enters editing.
-    if (selEl && selEl === e.target && selInfo && selInfo.editability === 'editable-static' && !activeEl && !workspaceLocked) {
+    // Desktop: re-clicking an already-selected editable element whose caret blurred re-enters editing.
+    if (!touchLayout && selEl && selEl === e.target && selInfo && selInfo.editability === 'editable-static' && !activeEl && !workspaceLocked) {
       beginEditing(selEl, selMeta, selInfo.snapshotHash, { x: e.clientX, y: e.clientY });
       renderToolbar();
       return;
     }
     const found = findMappedElement(e.target);
     if (!found) { void clearSelection(true); return; }
-    void selectElement(found.el, found.meta, { allowEdit: true, point: { x: e.clientX, y: e.clientY } });
+    // On mobile touchLayout, Tap 1 selects without opening the keyboard; Tap 2 ("Edit text") begins editing.
+    void selectElement(found.el, found.meta, { allowEdit: !touchLayout, point: { x: e.clientX, y: e.clientY } });
   }, true);
 
   document.addEventListener('selectionchange', rememberRange);
@@ -698,6 +758,10 @@ export function buildClientBridgeScript(previewBase: string): string {
 
   window.addEventListener('resize', () => layout());
   window.addEventListener('scroll', () => layout(), { capture: true, passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => layout());
+    window.visualViewport.addEventListener('scroll', () => layout());
+  }
 
   window.addEventListener('message', (e) => {
     const msg = e.data;
@@ -705,6 +769,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     if (msg.type === 'halley:set-mode') {
       readOnly = Boolean(msg.readOnly);
       if (msg.persona) persona = msg.persona;
+      if (typeof msg.touchLayout === 'boolean') touchLayout = msg.touchLayout;
       const next = readOnly ? 'browse' : (msg.mode === 'select' ? 'edit' : (msg.mode || 'browse'));
       mode = next;
       syncCursorStyle();

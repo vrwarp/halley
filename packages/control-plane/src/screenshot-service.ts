@@ -191,10 +191,15 @@ export class ScreenshotService {
     draftBaseUrl: string;
     liveBaseUrl?: string | null;
     liveTimestamp: string;
+    viewport?: ScreenshotViewport;
   }): Promise<VisualDiffPageDto[]> {
     if (this.closed) {
       return Promise.reject(new Error('ScreenshotService has been closed'));
     }
+
+    const viewport: ScreenshotViewport = opts.viewport === 'mobile' ? 'mobile' : 'desktop';
+    const size = VIEWPORT_SIZES[viewport];
+    const MAX_REVIEW_HEIGHT = 2400;
 
     const run = async (): Promise<VisualDiffPageDto[]> => {
       const uniqueRoutes = [
@@ -221,72 +226,121 @@ export class ScreenshotService {
           let liveScreenshotDataUrl: string | undefined;
           let highlights: VisualDiffHighlightDto[] = [];
           let title = route === '/' ? 'Homepage' : route;
+          let captureHeight = size.height;
 
-          const context = await browser.newContext({ viewport: { width: 1280, height: 860 } });
+          const context = await browser.newContext({ viewport: size, deviceScaleFactor: 1 });
           try {
             const page = await context.newPage();
             await page.goto(draftUrl, { waitUntil: 'networkidle', timeout: 20_000 });
             if (this.settleWaitMs > 0) await page.waitForTimeout(this.settleWaitMs);
             title = (await page.title()) || title;
 
-            highlights = await page.evaluate(
-              ({ dFiles, mFiles }: { dFiles: string[]; mFiles: string[] }) => {
-                const out: Array<{
-                  x: number;
-                  y: number;
-                  width: number;
-                  height: number;
-                  kind: 'draft' | 'merged_from_live';
-                  file: string;
-                }> = [];
-                const doc = (
-                  globalThis as unknown as {
-                    document: {
-                      querySelectorAll: (sel: string) => Iterable<{
-                        getAttribute: (name: string) => string | null;
-                        getBoundingClientRect: () => {
-                          left: number;
-                          top: number;
-                          width: number;
-                          height: number;
-                          bottom: number;
-                        };
-                      }>;
-                    };
-                  }
-                ).document;
-                const els = doc.querySelectorAll('[data-astro-source-file]');
-                for (const el of els) {
-                  const src = (el.getAttribute('data-astro-source-file') || '').replace(/\\/g, '/');
-                  const isDraft = dFiles.some((f) => src.endsWith(f));
-                  const isMerged = mFiles.some((f) => src.endsWith(f));
-                  if (!isDraft && !isMerged) continue;
-                  const rect = el.getBoundingClientRect();
-                  if (rect.width < 8 || rect.height < 8 || rect.top > 860 || rect.bottom < 0) continue;
-                  out.push({
-                    x: Math.round((rect.left / 1280) * 1000) / 10,
-                    y: Math.round((rect.top / 860) * 1000) / 10,
-                    width: Math.round((rect.width / 1280) * 1000) / 10,
-                    height: Math.round((rect.height / 860) * 1000) / 10,
-                    kind: isDraft ? 'draft' : 'merged_from_live',
-                    file: src,
-                  });
-                  if (out.length >= 16) break;
-                }
-                return out;
-              },
-              { dFiles: [...draftSet], mFiles: [...mergedSet] },
-            );
+            if (typeof page.evaluate === 'function') {
+              const docHeight = await page
+                .evaluate<number>(
+                  'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
+                )
+                .catch(() => size.height);
+              captureHeight = Math.min(Math.max(docHeight || size.height, size.height), MAX_REVIEW_HEIGHT);
 
-            const jpg = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
+              highlights = await page.evaluate(
+                ({
+                  dFiles,
+                  mFiles,
+                  vpW,
+                  vpH,
+                }: {
+                  dFiles: string[];
+                  mFiles: string[];
+                  vpW: number;
+                  vpH: number;
+                }) => {
+                  const out: Array<{
+                    x: number;
+                    y: number;
+                    width: number;
+                    height: number;
+                    kind: 'draft' | 'merged_from_live';
+                    file: string;
+                  }> = [];
+                  const doc = (
+                    globalThis as unknown as {
+                      document: {
+                        querySelectorAll: (sel: string) => Iterable<{
+                          getAttribute: (name: string) => string | null;
+                          getBoundingClientRect: () => {
+                            left: number;
+                            top: number;
+                            width: number;
+                            height: number;
+                            bottom: number;
+                          };
+                        }>;
+                      };
+                    }
+                  ).document;
+                  const els = doc.querySelectorAll('[data-astro-source-file]');
+                  for (const el of els) {
+                    const src = (el.getAttribute('data-astro-source-file') || '').replace(/\\/g, '/');
+                    const isDraft = dFiles.some((f) => src.endsWith(f));
+                    const isMerged = mFiles.some((f) => src.endsWith(f));
+                    if (!isDraft && !isMerged) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 8 || rect.height < 8 || rect.top >= vpH || rect.bottom <= 0) continue;
+                    const clampedTop = Math.max(0, rect.top);
+                    const clampedBottom = Math.min(vpH, rect.bottom);
+                    const clampedHeight = clampedBottom - clampedTop;
+                    if (clampedHeight < 4) continue;
+                    out.push({
+                      x: Math.round((Math.max(0, rect.left) / vpW) * 1000) / 10,
+                      y: Math.round((clampedTop / vpH) * 1000) / 10,
+                      width: Math.round((Math.min(vpW - Math.max(0, rect.left), rect.width) / vpW) * 1000) / 10,
+                      height: Math.round((clampedHeight / vpH) * 1000) / 10,
+                      kind: isDraft ? 'draft' : 'merged_from_live',
+                      file: src,
+                    });
+                    if (out.length >= 24) break;
+                  }
+                  return out;
+                },
+                { dFiles: [...draftSet], mFiles: [...mergedSet], vpW: size.width, vpH: captureHeight },
+              );
+            }
+
+            const jpg = await page.screenshot({
+              type: 'jpeg',
+              quality: 80,
+              fullPage: true,
+              clip: { x: 0, y: 0, width: size.width, height: captureHeight },
+            });
             draftScreenshotDataUrl = `data:image/jpeg;base64,${jpg.toString('base64')}`;
 
             if (liveUrl) {
-              const livePage = await context.newPage();
-              await livePage.goto(liveUrl, { waitUntil: 'networkidle', timeout: 20_000 });
-              if (this.settleWaitMs > 0) await livePage.waitForTimeout(this.settleWaitMs);
-              const liveJpg = await livePage.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
-              liveScreenshotDataUrl = `data:image/jpeg;base64,${liveJpg.toString('base64')}`;
+              try {
+                const livePage = await context.newPage();
+                const liveRes = await livePage.goto(liveUrl, { waitUntil: 'networkidle', timeout: 15_000 });
+                if (!liveRes || liveRes.status() < 400) {
+                  if (this.settleWaitMs > 0) await livePage.waitForTimeout(this.settleWaitMs);
+                  let liveHeight = size.height;
+                  if (typeof livePage.evaluate === 'function') {
+                    const liveDocHeight = await livePage
+                      .evaluate<number>(
+                        'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
+                      )
+                      .catch(() => size.height);
+                    liveHeight = Math.min(Math.max(liveDocHeight || size.height, size.height), MAX_REVIEW_HEIGHT);
+                  }
+                  const liveJpg = await livePage.screenshot({
+                    type: 'jpeg',
+                    quality: 80,
+                    fullPage: true,
+                    clip: { x: 0, y: 0, width: size.width, height: liveHeight },
+                  });
+                  liveScreenshotDataUrl = `data:image/jpeg;base64,${liveJpg.toString('base64')}`;
+                }
+              } catch {
+                // Live route may not exist yet (new page) or site may be unreachable
+              }
             }
           } catch {
             // best-effort screenshot
@@ -294,12 +348,26 @@ export class ScreenshotService {
             await context.close().catch(() => {});
           }
 
-          pages.push({
-            route,
-            title,
+          const shot = {
             liveScreenshotDataUrl,
             draftScreenshotDataUrl,
             highlights,
+            width: size.width,
+            height: captureHeight,
+          };
+
+          pages.push({
+            route,
+            title,
+            liveScreenshotDataUrl: viewport === 'desktop' ? liveScreenshotDataUrl : undefined,
+            draftScreenshotDataUrl: viewport === 'desktop' ? draftScreenshotDataUrl : undefined,
+            mobileLiveScreenshotDataUrl: viewport === 'mobile' ? liveScreenshotDataUrl : undefined,
+            mobileDraftScreenshotDataUrl: viewport === 'mobile' ? draftScreenshotDataUrl : undefined,
+            highlights,
+            viewport,
+            shots: {
+              [viewport]: shot,
+            },
             liveTimestamp: opts.liveTimestamp,
           });
         }
