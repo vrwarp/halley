@@ -411,6 +411,22 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     return c.json(data, res.ok ? 200 : 502);
   });
 
+  app.get('/api/sessions/:id/debug-trace', auth.requireAuth, async (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    try {
+      const ep = await driver.ensureRunning(s);
+      const res = await fetch(`${ep.runnerUrl}/internal/debug/trace`);
+      const data = await res.json().catch(() => ({ error: 'Invalid debug trace response' }));
+      return c.json(data, res.ok ? 200 : 502);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Workspace is not running' },
+        503,
+      );
+    }
+  });
+
   app.post('/api/sessions/:id/fix-with-pi', auth.requireAuth, async (c) => {
     const check = await requireSessionEdit(c);
     if ('error' in check) return c.json({ error: check.error }, check.status);

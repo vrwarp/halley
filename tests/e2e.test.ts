@@ -275,7 +275,7 @@ function startFakeAnthropicServer(): Promise<{ url: string; close: () => Promise
         }
       }
 
-      const lower = lastUserPrompt.toLowerCase();
+      const lower = lastUserPrompt.replace(/^\[Current Preview\][^\n]*\n*/i, '').toLowerCase();
 
       if (lower.includes('womens-gathering') || lower.includes('unlisted')) {
         if (!isToolResult) {
@@ -671,7 +671,8 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       const frameLocator = page.frameLocator('iframe');
       await frameLocator.locator('h1:has-text("Welcome to our community")').waitFor({ timeout: 60_000 });
 
-      // 3. Inline fine-tuning edit on homepage paragraph
+      // 3. Switch to Edit mode (Browse is default) and apply inline fine-tuning edit
+      await page.click('button:has-text("Edit")');
       const pEl = frameLocator.locator('p').first();
       await pEl.click();
       await pEl.evaluate((el) => {
@@ -709,6 +710,12 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       await chatInput.fill('Run checks on the site');
       await chatInput.press('Enter');
       await page.waitForSelector('text=passed all site checks', { timeout: 30_000 });
+
+      // 6b. Verify Debug Trace panel loads full prompts, injected context, and tool calls
+      await page.click('button[aria-label="Open agent debug trace"]');
+      await page.waitForSelector('text=Agent Debug Trace', { timeout: 10_000 });
+      await page.waitForSelector('text=[Current Preview]', { timeout: 10_000 });
+      await page.click('button[title="Close debug panel"]');
 
       // 7. Publish via Modal -> fake GitHub PR + squash merge
       await page.click('button:has-text("Publish")');

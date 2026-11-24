@@ -14,6 +14,7 @@ import type {
 } from '@halley/shared';
 import {
   ArrowLeft,
+  Bug,
   CheckCircle2,
   ChevronDown,
   Copy,
@@ -36,6 +37,7 @@ import {
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
+import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
 import { PublishModal } from '../components/PublishModal.js';
 
 interface Props {
@@ -85,7 +87,7 @@ export function EditorPage({
   const [changedCount, setChangedCount] = useState(0);
   const [publishProgress, setPublishProgress] = useState<PublishProgressPayload | null>(null);
 
-  const [mode, setMode] = useState<PreviewMode>('edit');
+  const [mode, setMode] = useState<PreviewMode>('browse');
   const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [currentRoute, setCurrentRoute] = useState('/');
   const [siteRoutes, setSiteRoutes] = useState<Array<{ route: string; label: string; unlisted?: boolean }>>([]);
@@ -96,6 +98,7 @@ export function EditorPage({
   const [newPageUnlisted, setNewPageUnlisted] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showPublish, setShowPublish] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
 
   const [input, setInput] = useState('');
   const [chips, setChips] = useState<ElementContext[]>([]);
@@ -109,6 +112,22 @@ export function EditorPage({
   const wsRef = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const lastPreviewReloadAtRef = useRef(0);
+  const lastNavigationAtRef = useRef(0);
+  const pendingRouteRef = useRef<string | null>(null);
+  const prevBusyRef = useRef(false);
+  const hadMutatingToolRef = useRef(false);
+
+  const reloadPreview = (force = false) => {
+    const now = Date.now();
+    if (!force) {
+      if (pendingRouteRef.current !== null) return;
+      if (now - lastNavigationAtRef.current < 3000) return;
+      if (now - lastPreviewReloadAtRef.current < 1200) return;
+    }
+    lastPreviewReloadAtRef.current = now;
+    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload', force }, '*');
+  };
 
   const loadSessionMeta = async () => {
     const res = await api.getSession(sessionId);
@@ -171,6 +190,9 @@ export function EditorPage({
         } else if (msg.type === 'checkpoint_created') {
           setChangedCount(msg.changedFilesCount);
           setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
+          if (!msg.checkpoint.message.startsWith('Inline edit in ')) {
+            reloadPreview();
+          }
         } else if (msg.type === 'publish_state') {
           setPublishProgress(msg.payload);
           if (msg.payload.state === 'published') {
@@ -222,6 +244,22 @@ export function EditorPage({
     return () => clearInterval(timer);
   }, [sessionId, wsConnected]);
 
+  // Track mutating tools during an agent run and refresh preview + session metadata when the run completes
+  useEffect(() => {
+    if (live.busy) {
+      if (live.activeTools.some((t) => ['edit', 'write', 'bash', 'undo_last_change'].includes(t.name))) {
+        hadMutatingToolRef.current = true;
+      }
+    } else if (prevBusyRef.current) {
+      void loadSessionMeta();
+      if (hadMutatingToolRef.current || !wsConnected) {
+        reloadPreview();
+      }
+      hadMutatingToolRef.current = false;
+    }
+    prevBusyRef.current = live.busy;
+  }, [live.busy, live.activeTools, wsConnected]);
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [entries.length, live.streamingText]);
@@ -239,6 +277,9 @@ export function EditorPage({
       const data = e.data as PostMessageFromPreview;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'halley:ready') {
+        if (pendingRouteRef.current === data.route) {
+          pendingRouteRef.current = null;
+        }
         setCurrentRoute(data.route);
         if (session) {
           iframeRef.current?.contentWindow?.postMessage(
@@ -247,6 +288,9 @@ export function EditorPage({
           );
         }
       } else if (data.type === 'halley:route-changed') {
+        if (pendingRouteRef.current === data.route) {
+          pendingRouteRef.current = null;
+        }
         setCurrentRoute(data.route);
       } else if (data.type === 'halley:element-context') {
         setChips((prev) => {
@@ -274,6 +318,8 @@ export function EditorPage({
     if (!session) return;
     const clean = route.startsWith('/') ? route : `/${route}`;
     const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
+    lastNavigationAtRef.current = Date.now();
+    pendingRouteRef.current = clean;
     if (iframeRef.current) {
       iframeRef.current.src = `/p/${session.id}${baseSuffixVal}${clean}`;
     }
@@ -395,6 +441,17 @@ export function EditorPage({
               )}
             </>
           )}
+
+          <button
+            type="button"
+            onClick={() => setShowDebug(true)}
+            title="Inspect & download full agent debug trace"
+            aria-label="Open agent debug trace"
+            className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50 hover:text-stone-900"
+          >
+            <Bug className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Debug</span>
+          </button>
 
           {session.canEdit && (
             <>
@@ -569,6 +626,7 @@ export function EditorPage({
                     text={entry.text}
                     onNavigateRoute={navigatePreview}
                     knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                    astroBase={session.astroBase}
                   />
                 </div>
               );
@@ -590,6 +648,7 @@ export function EditorPage({
                   text={live.streamingText}
                   onNavigateRoute={navigatePreview}
                   knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                  astroBase={session.astroBase}
                 />
                 <span className="inline-block h-3.5 w-1.5 ml-0.5 animate-pulse bg-amber-600 align-middle" />
               </div>
@@ -931,7 +990,7 @@ export function EditorPage({
 
               <button
                 type="button"
-                onClick={() => iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload' }, '*')}
+                onClick={() => reloadPreview(true)}
                 title="Reload preview"
                 className="rounded-md p-1 text-stone-500 hover:bg-stone-200/70 hover:text-stone-900"
               >
@@ -1019,6 +1078,16 @@ export function EditorPage({
           }}
           onStartNewEdit={onBack}
           onChangedFilesUpdated={loadSessionMeta}
+        />
+      )}
+
+      {showDebug && (
+        <DebugTraceDrawer
+          sessionId={session.id}
+          sessionTitle={session.title}
+          currentRoute={currentRoute}
+          wsConnected={wsConnected}
+          onClose={() => setShowDebug(false)}
         />
       )}
     </div>

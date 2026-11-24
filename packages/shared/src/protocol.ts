@@ -261,3 +261,39 @@ export interface AllowlistEntryDto {
   addedBy: string | null;
   createdAt: string;
 }
+
+export interface DebugTraceEntryDto {
+  id: string;
+  kind: string;
+  role: 'user' | 'assistant' | 'tool' | 'other';
+  text?: string;
+  thinking?: string;
+  toolCalls?: Array<{ id?: string; name: string; arguments: unknown }>;
+  toolCallId?: string;
+  toolName?: string;
+  toolOutput?: string;
+  isError?: boolean;
+  imagesCount?: number;
+  model?: string;
+  stopReason?: string;
+  usage?: unknown;
+}
+
+export interface DebugTraceDto {
+  exportedAt: string;
+  sessionId: string;
+  modelId: string;
+  thinkingLevel: string;
+  persona: string;
+  previewBase: string;
+  lastEditorContext?: EditorContext | null;
+  systemPrompt: {
+    halleyRole: string;
+    agentsMd: string | null;
+  };
+  usageUsd: number;
+  usageByModel: Record<string, unknown>;
+  live: LiveRunStateDto;
+  entries: DebugTraceEntryDto[];
+}
+
