@@ -32,6 +32,7 @@ export interface HalleyConfig {
   workspaceDriver: 'docker' | 'local';
   workspaceImage: string;
   workspaceDockerNetwork: string;
+  workspaceMemoryMb: number;
   controlPlaneInternalUrl: string;
   workspaceIdleTimeoutMs: number;
   browserIdleTimeoutMs: number;
@@ -97,6 +98,7 @@ export function loadConfig(): HalleyConfig {
     workspaceDriver,
     workspaceImage: process.env.WORKSPACE_IMAGE || 'vrwarp/halley-workspace:latest',
     workspaceDockerNetwork: process.env.WORKSPACE_DOCKER_NETWORK || '',
+    workspaceMemoryMb: Math.max(512, Number(process.env.WORKSPACE_MEMORY_MB || 3072) || 3072),
     controlPlaneInternalUrl:
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),

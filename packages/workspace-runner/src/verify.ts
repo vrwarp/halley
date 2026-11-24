@@ -50,6 +50,10 @@ async function runShell(
   timeoutMs = 180_000,
 ): Promise<{ passed: boolean; durationMs: number; output: string }> {
   const start = Date.now();
+  const existingNodeOpts = process.env.NODE_OPTIONS || '';
+  const nodeOptions = existingNodeOpts.includes('--max-old-space-size')
+    ? existingNodeOpts
+    : `${existingNodeOpts} --max-old-space-size=1024`.trim();
   return new Promise((resolve) => {
     const child = spawn('bash', ['-lc', command], {
       cwd,
@@ -59,6 +63,7 @@ async function runShell(
         FORCE_COLOR: '0',
         NO_COLOR: '1',
         CI: '1',
+        NODE_OPTIONS: nodeOptions,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -347,7 +352,21 @@ export async function runUnlistedIntegrityCheck(
   };
 }
 
-export async function runAllVerificationChecks(
+let verifyQueue: Promise<unknown> = Promise.resolve();
+
+export function runAllVerificationChecks(
+  repoRoot: string,
+): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
+  const run = () => runAllVerificationChecksUnlocked(repoRoot);
+  const result = verifyQueue.then(run, run);
+  verifyQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+async function runAllVerificationChecksUnlocked(
   repoRoot: string,
 ): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
   const results: VerificationCheckResult[] = [];

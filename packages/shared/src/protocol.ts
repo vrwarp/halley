@@ -108,6 +108,9 @@ export interface BootProgressDto {
   startedAt: string;
   updatedAt: string;
   warmHit?: boolean;
+  crashLoop?: boolean;
+  oom?: boolean;
+  retryAfterSec?: number;
 }
 
 export const SessionKindSchema = z.enum(['edit', 'continuation', 'revert']);
@@ -269,6 +272,11 @@ export type ChatServerMessage =
   | {
       type: 'boot_progress';
       progress: BootProgressDto;
+    }
+  | {
+      type: 'preview_paused';
+      paused: boolean;
+      reason?: string;
     }
   | {
       type: 'page_request_state';

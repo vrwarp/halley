@@ -9,12 +9,15 @@ import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { GitHubService } from '../github/client.js';
 import { hashWorkspaceToken } from '../proxy/llm-proxy.js';
 import {
+  CrashLoopTracker,
+  WorkspaceCrashLoopError,
   ensureBareMirror,
   runGit,
   withGitAskPass,
   type BootProgressListener,
   type WarmPoolStatus,
   type WarmReservation,
+  type WorkspaceCrashInfo,
   type WorkspaceDriver,
   type WorkspaceEndpoint,
 } from './workspace-driver.js';
@@ -113,6 +116,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
   private resolvedNetwork: string | null = null;
   private bootProgress = new Map<string, BootProgressDto>();
   private bootProgressListener: BootProgressListener | null = null;
+  private crashTracker = new CrashLoopTracker();
 
   private warmPool: WarmSlot[] = [];
   private reservedWarmSlots = new Map<string, WarmSlot>();
@@ -124,6 +128,10 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     private db: ControlPlaneDb,
     private github: GitHubService,
   ) {}
+
+  private workspaceMemoryBytes(): number {
+    return this.config.workspaceMemoryMb * 1024 * 1024;
+  }
 
   setRawWorkspaceToken(sessionId: string, token: string): void {
     this.sessionTokens.set(sessionId, token);
@@ -151,11 +159,22 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     return this.bootProgress.get(sessionId) ?? null;
   }
 
+  getCrashInfo(sessionId: string): WorkspaceCrashInfo | null {
+    return this.crashTracker.getInfo(sessionId);
+  }
+
   private emitProgress(
     sessionId: string,
     stage: BootStage,
     message: string,
-    opts?: { detail?: string; warmHit?: boolean; startedAt?: string },
+    opts?: {
+      detail?: string;
+      warmHit?: boolean;
+      startedAt?: string;
+      crashLoop?: boolean;
+      oom?: boolean;
+      retryAfterSec?: number;
+    },
   ): BootProgressDto {
     const prev = this.bootProgress.get(sessionId);
     const now = new Date().toISOString();
@@ -166,6 +185,9 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       startedAt: opts?.startedAt ?? prev?.startedAt ?? now,
       updatedAt: now,
       warmHit: opts?.warmHit ?? prev?.warmHit,
+      crashLoop: opts?.crashLoop,
+      oom: opts?.oom,
+      retryAfterSec: opts?.retryAfterSec,
     };
     this.bootProgress.set(sessionId, progress);
     this.bootProgressListener?.(sessionId, progress);
@@ -424,7 +446,8 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
             `halley-pkg-cache:/halley-pkg-cache`,
             `halley-git-mirror:/halley-mirror`,
           ],
-          Memory: 2 * 1024 * 1024 * 1024,
+          Memory: this.workspaceMemoryBytes(),
+          MemorySwap: this.workspaceMemoryBytes(),
         },
       });
       if (created.status >= 400) {
@@ -576,6 +599,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     const deadline = Date.now() + timeoutMs;
     let pollCount = 0;
     let lastStage: BootStage | null = null;
+    let triedAstroRestart = false;
 
     while (Date.now() < deadline) {
       pollCount++;
@@ -585,9 +609,18 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           const health = (await res.json()) as {
             originalBase?: string;
             astroReady?: boolean;
+            astroState?: 'starting' | 'ready' | 'paused' | 'crashed';
             baseSha?: string;
           };
           if (health.astroReady) return health;
+          if (health.astroState === 'crashed' && !triedAstroRestart) {
+            triedAstroRestart = true;
+            onStage('starting_preview', 'Restarting Astro live preview…');
+            await fetch(`${runnerUrl}/internal/astro/restart`, {
+              method: 'POST',
+              signal: AbortSignal.timeout(35_000),
+            }).catch(() => {});
+          }
         }
       } catch {
         // still booting
@@ -615,9 +648,10 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       // Periodically verify container didn't crash on startup
       if (pollCount % 6 === 0) {
         const check = await dockerRequest<{
-          State?: { Running?: boolean; Status?: string; ExitCode?: number };
+          State?: { Running?: boolean; Status?: string; ExitCode?: number; OOMKilled?: boolean };
         }>('GET', `/containers/${name}/json`).catch(() => null);
         if (check?.status === 200 && check.data?.State && !check.data.State.Running) {
+          const oomKilled = Boolean(check.data.State.OOMKilled);
           const logsRes = await dockerRequest<string>(
             'GET',
             `/containers/${name}/logs?stdout=1&stderr=1&tail=25`,
@@ -626,9 +660,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
             typeof logsRes?.data === 'string'
               ? logsRes.data.replace(/[^\x20-\x7E\r\n\t]/g, '').trim().slice(-500)
               : '';
-          throw new Error(
-            `Workspace container exited unexpectedly (exit=${check.data.State.ExitCode ?? '?'}). ${snippet}`,
-          );
+          const reason = oomKilled
+            ? `Workspace container ran out of memory (OOMKilled, exit=${check.data.State.ExitCode ?? 137}).`
+            : `Workspace container exited unexpectedly (exit=${check.data.State.ExitCode ?? '?'}).`;
+          const err = new Error(`${reason} ${snippet}`.trim());
+          (err as Error & { oom?: boolean }).oom = oomKilled;
+          throw err;
         }
       }
 
@@ -710,9 +747,43 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     const pending = this.booting.get(session.id);
     if (pending) return pending;
 
+    try {
+      this.crashTracker.assertCanAttempt(session.id);
+    } catch (err) {
+      if (err instanceof WorkspaceCrashLoopError) {
+        this.emitProgress(
+          session.id,
+          'error',
+          err.oom ? 'Workspace ran out of memory' : 'Workspace paused after repeated crashes',
+          {
+            detail: err.message,
+            crashLoop: true,
+            oom: err.oom,
+            retryAfterSec: err.retryAfterSec,
+          },
+        );
+      }
+      throw err;
+    }
+
     const p = this.startOrResume(session).finally(() => this.booting.delete(session.id));
     this.booting.set(session.id, p);
     return p;
+  }
+
+  async restart(session: SessionRecord): Promise<WorkspaceEndpoint> {
+    const name = this.containerName(session.id);
+    this.crashTracker.reset(session.id);
+    this.bootProgress.delete(session.id);
+    this.reservedWarmSlots.delete(session.id);
+    await dockerRequest('DELETE', `/containers/${name}?force=true`).catch(() => {});
+    this.db.updateSession(session.id, {
+      status: 'starting',
+      runner_url: null,
+      astro_url: null,
+    });
+    const fresh = this.db.getSession(session.id) ?? session;
+    return this.ensureRunning(fresh);
   }
 
   private async claimWarmSlot(
@@ -824,28 +895,31 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
 
     const name = this.containerName(session.id);
     const isFrozen = session.status === 'published' || session.status === 'merged';
+    let observedOom = false;
     try {
       // Fast-path: if container is already running & healthy (and has a valid WORKSPACE_TOKEN), return immediately
       let inspect = await dockerRequest<{
-        State?: { Running?: boolean; Status?: string; ExitCode?: number };
+        State?: { Running?: boolean; Status?: string; ExitCode?: number; OOMKilled?: boolean };
         Config?: { Env?: string[] };
         Image?: string;
         Id?: string;
       }>('GET', `/containers/${name}/json`);
+
+      const runnerUrl = `http://${name}:4100`;
+      const astroUrl = `http://${name}:4321`;
 
       if (
         inspect.status === 200 &&
         inspect.data?.State?.Running &&
         !hasEmptyWorkspaceToken(inspect.data?.Config?.Env)
       ) {
-        const runnerUrl = `http://${name}:4100`;
-        const astroUrl = `http://${name}:4321`;
         try {
           const res = await fetch(`${runnerUrl}/health`, { signal: AbortSignal.timeout(2000) });
           if (res.ok) {
             const health = (await res.json()) as {
               originalBase?: string;
               astroReady?: boolean;
+              astroState?: 'starting' | 'ready' | 'paused' | 'crashed';
               baseSha?: string;
             };
             if (health.astroReady) {
@@ -860,26 +934,40 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
                 node_modules_pruned_at: null,
                 last_active_at: new Date().toISOString(),
               });
+              this.crashTracker.recordSuccess(session.id);
               this.emitProgress(session.id, 'ready', 'Workspace ready!');
               return { runnerUrl, astroUrl, astroBase, baseSha };
             }
           }
         } catch {
-          // container is running but still booting; fall through to poll
+          // container is running but still booting; skip mirror/image sync and poll directly
         }
+
+        const health = await this.pollContainerReady(name, runnerUrl, (stage, message) => {
+          this.emitProgress(session.id, stage, message);
+        });
+        const astroBase = health.originalBase || session.astro_base || '/';
+        const baseSha = health.baseSha || session.base_sha;
+        this.db.updateSession(session.id, {
+          status: isFrozen ? session.status : 'running',
+          base_sha: baseSha,
+          runner_url: runnerUrl,
+          astro_url: astroUrl,
+          astro_base: astroBase,
+          node_modules_pruned_at: null,
+          last_active_at: new Date().toISOString(),
+        });
+        this.crashTracker.recordSuccess(session.id);
+        this.emitProgress(session.id, 'ready', 'Workspace ready!');
+        return { runnerUrl, astroUrl, astroBase, baseSha };
       }
 
-      this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
-      const token = this.config.devLocalRepo
-        ? ''
-        : await this.github.getAccessToken().catch(() => '');
-      const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
-      await ensureBareMirror(
-        mirrorDir,
-        session.repo,
-        token || undefined,
-        this.config.devLocalRepo || undefined,
-      );
+      if (inspect.status === 200 && inspect.data?.State?.OOMKilled) {
+        observedOom = true;
+        console.warn(
+          `[halley-docker] Detected previous OOMKilled exit on ${name} (exit=${inspect.data.State.ExitCode ?? 137})`,
+        );
+      }
 
       this.emitProgress(session.id, 'checking_image', 'Checking workspace container image…');
       const targetImageId = await this.ensureImagePresent(this.config.workspaceImage, () => {
@@ -887,21 +975,24 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       });
       const networkName = await this.resolveDockerNetwork();
 
-      // Re-inspect after mirror/image check
+      // Re-inspect after image check
       inspect = await dockerRequest<{
-        State?: { Running?: boolean; Status?: string; ExitCode?: number };
+        State?: { Running?: boolean; Status?: string; ExitCode?: number; OOMKilled?: boolean };
         Config?: { Env?: string[] };
         Image?: string;
         Id?: string;
       }>('GET', `/containers/${name}/json`);
 
-      // Self-heal stale, broken, tokenless, or outdated stopped containers while preserving the session volume
+      // Self-heal stale, broken, OOMKilled, tokenless, or outdated stopped containers while preserving the session volume
       if (inspect.status === 200) {
         const state = inspect.data?.State;
         const status = state?.Status || '';
+        const wasOomKilled = Boolean(state?.OOMKilled);
+        if (wasOomKilled) observedOom = true;
         const isBrokenState =
           status === 'created' ||
           status === 'dead' ||
+          wasOomKilled ||
           (!state?.Running &&
             (state?.ExitCode ?? 0) !== 0 &&
             state?.ExitCode !== 137 &&
@@ -914,7 +1005,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         const hasMissingToken = hasEmptyWorkspaceToken(inspect.data?.Config?.Env);
         if (isBrokenState || isOutdatedStopped || hasMissingToken) {
           console.log(
-            `[halley-docker] Recreating container ${name} (status=${status}, exit=${state?.ExitCode ?? 0}, outdated=${Boolean(isOutdatedStopped)}, missingToken=${hasMissingToken}) while preserving volume ${session.volume_name}`,
+            `[halley-docker] Recreating container ${name} (status=${status}, exit=${state?.ExitCode ?? 0}, oom=${wasOomKilled}, outdated=${Boolean(isOutdatedStopped)}, missingToken=${hasMissingToken}) while preserving volume ${session.volume_name}`,
           );
           await dockerRequest('DELETE', `/containers/${name}?force=true`).catch(() => {});
           inspect = { status: 404, data: {} };
@@ -922,6 +1013,18 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       }
 
       if (inspect.status === 404) {
+        this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
+        const token = this.config.devLocalRepo
+          ? ''
+          : await this.github.getAccessToken().catch(() => '');
+        const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
+        await ensureBareMirror(
+          mirrorDir,
+          session.repo,
+          token || undefined,
+          this.config.devLocalRepo || undefined,
+        );
+
         this.emitProgress(session.id, 'creating_container', 'Creating isolated workspace container…');
         await dockerRequest('POST', '/volumes/create', { Name: session.volume_name });
         await dockerRequest('POST', '/volumes/create', { Name: 'halley-pkg-cache' });
@@ -959,7 +1062,8 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
               `halley-pkg-cache:/halley-pkg-cache`,
               `halley-git-mirror:/halley-mirror`,
             ],
-            Memory: 2 * 1024 * 1024 * 1024,
+            Memory: this.workspaceMemoryBytes(),
+            MemorySwap: this.workspaceMemoryBytes(),
           },
         });
         if (created.status >= 400) {
@@ -980,9 +1084,6 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         }
       }
 
-      const runnerUrl = `http://${name}:4100`;
-      const astroUrl = `http://${name}:4321`;
-
       const health = await this.pollContainerReady(name, runnerUrl, (stage, message) => {
         this.emitProgress(session.id, stage, message);
       });
@@ -999,11 +1100,31 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         last_active_at: new Date().toISOString(),
       });
 
+      this.crashTracker.recordSuccess(session.id);
       this.emitProgress(session.id, 'ready', 'Workspace ready!');
       return { runnerUrl, astroUrl, astroBase, baseSha };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.emitProgress(session.id, 'error', 'Workspace failed to start', { detail: msg });
+      const isOom = observedOom || Boolean((err as { oom?: boolean } | null)?.oom);
+      const info = this.crashTracker.recordFailure(session.id, msg, { oom: isOom });
+      this.emitProgress(
+        session.id,
+        'error',
+        info.crashLoop
+          ? info.oom
+            ? 'Workspace ran out of memory'
+            : 'Workspace paused after repeated crashes'
+          : 'Workspace failed to start',
+        {
+          detail: msg,
+          crashLoop: info.crashLoop,
+          oom: info.oom,
+          retryAfterSec: info.retryAfterSec,
+        },
+      );
+      if (info.crashLoop) {
+        this.db.updateSession(session.id, { status: 'error', runner_url: null, astro_url: null });
+      }
       throw err;
     }
   }

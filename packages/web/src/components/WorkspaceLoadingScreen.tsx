@@ -91,8 +91,15 @@ export function WorkspaceLoadingScreen({ session, bootProgress, onRetry, onBack 
     ? 1
     : getStepIndex(steps, bootProgress?.stage);
 
+  const isCrashLoop = Boolean(bootProgress?.crashLoop);
+  const isOom = Boolean(bootProgress?.oom);
+
   const heading = isError
-    ? 'Couldn’t start your workspace'
+    ? isOom
+      ? 'Workspace ran out of memory'
+      : isCrashLoop
+        ? 'Workspace paused after repeated crashes'
+        : 'Couldn’t start your workspace'
     : isWarmFastPath
       ? 'Connecting to ready workspace…'
       : session.status === 'sleeping'
@@ -104,6 +111,12 @@ export function WorkspaceLoadingScreen({ session, bootProgress, onRetry, onBack 
     (session.status === 'sleeping'
       ? 'Resuming your saved draft container…'
       : 'Starting isolated workspace container…');
+
+  const errorSubtitle = isOom
+    ? 'The workspace container hit its memory limit and auto-restart was paused. Your saved edits are safe.'
+    : isCrashLoop
+      ? 'Auto-restart was paused to prevent a crash loop. Your saved edits are safe.'
+      : 'Something went wrong while booting this edit environment.';
 
   const errorDetail = bootProgress?.detail || session.publishError;
 
@@ -125,7 +138,7 @@ export function WorkspaceLoadingScreen({ session, bootProgress, onRetry, onBack 
 
           <h1 className="mt-5 font-serif text-2xl text-stone-900">{heading}</h1>
           <p className="mt-1.5 text-sm text-stone-600">
-            {isError ? 'Something went wrong while booting this edit environment.' : activeMessage}
+            {isError ? errorSubtitle : activeMessage}
           </p>
 
           {!isError && (
@@ -162,7 +175,7 @@ export function WorkspaceLoadingScreen({ session, bootProgress, onRetry, onBack 
                 className="inline-flex items-center gap-1.5 rounded-xl bg-stone-900 px-4 py-2 text-xs font-semibold text-white hover:bg-stone-800"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
-                Try again
+                {isCrashLoop ? 'Restart workspace' : 'Try again'}
               </button>
             </div>
           </div>

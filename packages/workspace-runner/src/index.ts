@@ -227,11 +227,24 @@ async function main() {
       ok: true,
       sessionId: SESSION_ID,
       astroReady: astro.ready,
+      astroState: astro.state,
+      astroCrashCount: astro.crashCount,
+      astroLastExitCode: astro.lastExitCode,
       astroPort: astro.port,
       originalBase,
       previewBase,
       readOnly,
       baseSha,
+    });
+  });
+
+  app.post('/internal/astro/restart', async (c) => {
+    await astroManager.restart();
+    const astro = astroManager.getStatus();
+    return c.json({
+      ok: true,
+      astroReady: astro.ready,
+      astroState: astro.state,
     });
   });
 
@@ -1102,8 +1115,29 @@ async function main() {
   });
 
   app.post('/internal/verify', async (c) => {
-    const result = await runAllVerificationChecks(REPO_ROOT);
-    return c.json(result);
+    const body = (await c.req.json().catch(() => ({}))) as { pausePreview?: boolean };
+    const shouldPause = Boolean(body.pausePreview);
+    if (shouldPause) {
+      broadcast({
+        type: 'preview_paused',
+        paused: true,
+        reason: 'Running pre-publish checks…',
+      });
+      await astroManager.pause();
+    }
+    try {
+      const result = await runAllVerificationChecks(REPO_ROOT);
+      return c.json(result);
+    } finally {
+      if (shouldPause) {
+        try {
+          await astroManager.resume();
+        } catch (err) {
+          console.error('[halley-runner] Failed to resume astro dev after verify:', err);
+        }
+        broadcast({ type: 'preview_paused', paused: false });
+      }
+    }
   });
 
   app.post('/internal/uploads', async (c) => {

@@ -394,7 +394,7 @@ export class HalleyPiRuntime {
         > = [];
 
         for (const vp of viewports) {
-          const fallbackSize = vp === 'mobile' ? { width: 390, height: 844 } : { width: 1440, height: 900 };
+          const fallbackSize = vp === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 };
           const res = await fetch(endpoint, {
             method: 'POST',
             headers: {
@@ -421,9 +421,11 @@ export class HalleyPiRuntime {
             };
           }
 
+          const rawContentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]!.trim();
+          const mimeType = rawContentType.startsWith('image/') ? rawContentType : 'image/jpeg';
           const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
           const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
-          const png = Buffer.from(await res.arrayBuffer());
+          const imgBytes = Buffer.from(await res.arrayBuffer());
           output.push(
             {
               type: 'text',
@@ -431,8 +433,8 @@ export class HalleyPiRuntime {
             },
             {
               type: 'image',
-              data: png.toString('base64'),
-              mimeType: 'image/png',
+              data: imgBytes.toString('base64'),
+              mimeType,
             },
           );
         }

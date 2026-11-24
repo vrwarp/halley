@@ -4,7 +4,7 @@ import { chromium, type Browser } from 'playwright';
 export type ScreenshotViewport = 'desktop' | 'mobile';
 
 export const VIEWPORT_SIZES: Record<ScreenshotViewport, { width: number; height: number }> = {
-  desktop: { width: 1440, height: 900 },
+  desktop: { width: 1280, height: 800 },
   mobile: { width: 390, height: 844 },
 };
 
@@ -17,7 +17,8 @@ export interface ScreenshotRequest {
 const MAX_FULL_PAGE_HEIGHT = 3600;
 
 export interface ScreenshotResult {
-  png: Buffer;
+  data: Buffer;
+  mimeType: 'image/jpeg';
   width: number;
   height: number;
 }
@@ -133,7 +134,7 @@ export class ScreenshotService {
       const size = VIEWPORT_SIZES[req.viewport];
       try {
         const browser = await this.ensureBrowser();
-        const context = await browser.newContext({ viewport: size });
+        const context = await browser.newContext({ viewport: size, deviceScaleFactor: 1 });
         try {
           const page = await context.newPage();
           await page.goto(req.url, { waitUntil: 'networkidle', timeout: 25_000 });
@@ -150,15 +151,16 @@ export class ScreenshotService {
                 .catch(() => size.height);
               captureHeight = Math.min(Math.max(docHeight || size.height, size.height), MAX_FULL_PAGE_HEIGHT);
             }
-            const png = await page.screenshot({
-              type: 'png',
+            const data = await page.screenshot({
+              type: 'jpeg',
+              quality: 80,
               fullPage: true,
               clip: { x: 0, y: 0, width: size.width, height: captureHeight },
             });
-            return { png, width: size.width, height: captureHeight };
+            return { data, mimeType: 'image/jpeg', width: size.width, height: captureHeight };
           }
-          const png = await page.screenshot({ type: 'png', fullPage: false });
-          return { png, width: size.width, height: size.height };
+          const data = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
+          return { data, mimeType: 'image/jpeg', width: size.width, height: size.height };
         } finally {
           await context.close().catch(() => {});
         }

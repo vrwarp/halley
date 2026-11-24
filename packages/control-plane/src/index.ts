@@ -13,7 +13,7 @@ import { loadConfig, type HalleyConfig } from './config.js';
 import { ControlPlaneDb } from './db.js';
 import { DockerWorkspaceDriver } from './drivers/docker-driver.js';
 import { LocalWorkspaceDriver } from './drivers/local-driver.js';
-import type { WorkspaceDriver } from './drivers/workspace-driver.js';
+import { WorkspaceCrashLoopError, type WorkspaceDriver } from './drivers/workspace-driver.js';
 import { GitHubService } from './github/client.js';
 import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
 import { createPreviewProxy } from './proxy/preview-proxy.js';
@@ -176,10 +176,10 @@ export function createControlPlane(
         viewport,
         fullPage,
       });
-      return new Response(new Uint8Array(result.png), {
+      return new Response(new Uint8Array(result.data), {
         status: 200,
         headers: {
-          'Content-Type': 'image/png',
+          'Content-Type': result.mimeType,
           'X-Screenshot-Width': String(result.width),
           'X-Screenshot-Height': String(result.height),
         },
@@ -338,6 +338,25 @@ export function createControlPlane(
     }
     const updated = db.getSession(s.id)!;
     void driver.ensureRunning(updated).catch((err) => {
+      db.updateSession(s.id, { status: 'error', publish_error: String(err) });
+    });
+    return c.json({ session: enrichSessionDto(updated, user) });
+  });
+
+  app.post('/api/sessions/:id/restart', auth.requireAuth, async (c) => {
+    const user = c.get('user');
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    if (s.owner_user_id !== user.id && !user.isAdmin) {
+      return c.json({ error: 'Only the session owner or an admin can restart this workspace.' }, 403);
+    }
+
+    db.updateSession(s.id, { status: 'starting', publish_error: null, runner_url: null, astro_url: null });
+    const updated = db.getSession(s.id)!;
+    const starter = driver.restart
+      ? driver.restart(updated)
+      : driver.stop(updated).then(() => driver.ensureRunning(updated));
+    void starter.catch((err) => {
       db.updateSession(s.id, { status: 'error', publish_error: String(err) });
     });
     return c.json({ session: enrichSessionDto(updated, user) });
@@ -1178,15 +1197,49 @@ export function createControlPlane(
       });
     }
 
-    const ep = await driver.ensureRunning(s);
-    const res = await fetch(`${ep.runnerUrl}/internal/transcript`);
-    const data = (await res
-      .json()
-      .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }))) as Record<
-      string,
-      unknown
-    >;
-    return c.json({ ...data, priorThread }, res.ok ? 200 : 502);
+    if (!s.runner_url || (s.status !== 'running' && s.status !== 'published' && s.status !== 'merged')) {
+      const ownArchive = db.getSessionArchive(s.id);
+      if (ownArchive) {
+        try {
+          const parsed = JSON.parse(ownArchive.transcriptJson) as Record<string, unknown>;
+          return c.json({ ...parsed, priorThread });
+        } catch {
+          // fall through
+        }
+      }
+      return c.json(
+        {
+          error: 'Workspace is not running',
+          status: s.status,
+          bootProgress: driver.getBootProgress?.(s.id) ?? null,
+          priorThread,
+        },
+        503,
+      );
+    }
+
+    try {
+      const res = await fetch(`${s.runner_url}/internal/transcript`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      const data = (await res
+        .json()
+        .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }))) as Record<
+        string,
+        unknown
+      >;
+      return c.json({ ...data, priorThread }, res.ok ? 200 : 502);
+    } catch {
+      return c.json(
+        {
+          error: 'Workspace is not reachable',
+          status: s.status,
+          bootProgress: driver.getBootProgress?.(s.id) ?? null,
+          priorThread,
+        },
+        503,
+      );
+    }
   });
 
   app.get('/api/sessions/:id/debug-trace', auth.requireAuth, async (c) => {
@@ -1362,17 +1415,18 @@ export function createControlPlane(
         }
       }, 20_000);
 
-      // Push current spend, publish status, and boot progress immediately
-      const spend = db.getSpendStatus(session.owner_user_id);
+      // Push current spend, publish status, and boot progress immediately (re-read latest DB state)
+      const latestSession = db.getSession(sessionId) ?? session;
+      const spend = db.getSpendStatus(latestSession.owner_user_id);
       browserWs.send(JSON.stringify({ type: 'spend_status', ...spend }));
       browserWs.send(
         JSON.stringify({
           type: 'publish_state',
           payload: {
-            state: session.publish_state,
-            prNumber: session.pr_number,
-            prUrl: session.pr_url,
-            error: session.publish_error,
+            state: latestSession.publish_state,
+            prNumber: latestSession.pr_number,
+            prUrl: latestSession.pr_url,
+            error: latestSession.publish_error,
           },
         }),
       );
@@ -1395,7 +1449,7 @@ export function createControlPlane(
       });
 
       try {
-        const ep = await driver.ensureRunning(session);
+        const ep = await driver.ensureRunning(latestSession);
         const wsUrl = ep.runnerUrl.replace(/^http/, 'ws') + '/ws';
         runnerWs = new WebSocket(wsUrl);
         runnerWs.on('open', () => {
@@ -1420,6 +1474,26 @@ export function createControlPlane(
         });
       } catch (err) {
         if (browserWs.readyState === WebSocket.OPEN) {
+          if (err instanceof WorkspaceCrashLoopError) {
+            const now = new Date().toISOString();
+            browserWs.send(
+              JSON.stringify({
+                type: 'boot_progress',
+                progress: {
+                  stage: 'error',
+                  message: err.oom
+                    ? 'Workspace ran out of memory'
+                    : 'Workspace paused after repeated crashes',
+                  detail: err.message,
+                  startedAt: now,
+                  updatedAt: now,
+                  crashLoop: true,
+                  oom: err.oom,
+                  retryAfterSec: err.retryAfterSec,
+                },
+              }),
+            );
+          }
           browserWs.send(
             JSON.stringify({
               type: 'error',

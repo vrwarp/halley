@@ -34,11 +34,144 @@ export type BootProgressListener = (sessionId: string, progress: BootProgressDto
 
 export type DuplicateMode = 'branch-off' | 'fresh-from-main';
 
+export interface WorkspaceCrashInfo {
+  crashLoop: boolean;
+  oom: boolean;
+  failureCount: number;
+  lastError?: string;
+  retryAfterSec?: number;
+}
+
+export class WorkspaceCrashLoopError extends Error {
+  readonly crashLoop = true;
+  readonly oom: boolean;
+  readonly retryAfterSec: number;
+  readonly failureCount: number;
+  readonly lastError: string;
+
+  constructor(opts: {
+    oom: boolean;
+    retryAfterSec: number;
+    failureCount: number;
+    lastError: string;
+  }) {
+    const prefix = opts.oom
+      ? 'Workspace ran out of memory (OOM) repeatedly and was paused to prevent a crash loop.'
+      : 'Workspace crashed repeatedly and was paused to prevent a crash loop.';
+    super(`${prefix} ${opts.lastError}`.trim());
+    this.name = 'WorkspaceCrashLoopError';
+    this.oom = opts.oom;
+    this.retryAfterSec = opts.retryAfterSec;
+    this.failureCount = opts.failureCount;
+    this.lastError = opts.lastError;
+  }
+}
+
+interface CrashRecord {
+  failures: number[];
+  openCount: number;
+  openUntil: number;
+  lastError: string;
+  oom: boolean;
+}
+
+const DEFAULT_CRASH_WINDOW_MS = 10 * 60_000;
+const DEFAULT_CRASH_THRESHOLD = 3;
+const DEFAULT_COOLDOWNS_MS = [60_000, 120_000, 300_000];
+
+export class CrashLoopTracker {
+  private records = new Map<string, CrashRecord>();
+  private readonly threshold: number;
+  private readonly windowMs: number;
+  private readonly cooldownsMs: number[];
+
+  constructor(opts?: { threshold?: number; windowMs?: number; cooldownsMs?: number[] }) {
+    this.threshold = opts?.threshold ?? DEFAULT_CRASH_THRESHOLD;
+    this.windowMs = opts?.windowMs ?? DEFAULT_CRASH_WINDOW_MS;
+    this.cooldownsMs = opts?.cooldownsMs ?? DEFAULT_COOLDOWNS_MS;
+  }
+
+  assertCanAttempt(sessionId: string, now = Date.now()): void {
+    const rec = this.records.get(sessionId);
+    if (!rec) return;
+    if (rec.openUntil > now) {
+      const retryAfterSec = Math.max(1, Math.ceil((rec.openUntil - now) / 1000));
+      throw new WorkspaceCrashLoopError({
+        oom: rec.oom,
+        retryAfterSec,
+        failureCount: rec.failures.length,
+        lastError: rec.lastError,
+      });
+    }
+  }
+
+  recordFailure(
+    sessionId: string,
+    error: string,
+    opts?: { oom?: boolean; now?: number },
+  ): WorkspaceCrashInfo {
+    const now = opts?.now ?? Date.now();
+    const prev = this.records.get(sessionId) ?? {
+      failures: [],
+      openCount: 0,
+      openUntil: 0,
+      lastError: '',
+      oom: false,
+    };
+    const failures = prev.failures.filter((ts) => now - ts < this.windowMs);
+    failures.push(now);
+    const oom = Boolean(opts?.oom) || prev.oom;
+
+    let openCount = prev.openCount;
+    let openUntil = prev.openUntil;
+    if (failures.length >= this.threshold) {
+      const cooldown =
+        this.cooldownsMs[Math.min(openCount, this.cooldownsMs.length - 1)] ?? 300_000;
+      openUntil = now + cooldown;
+      openCount += 1;
+    }
+
+    const updated: CrashRecord = {
+      failures,
+      openCount,
+      openUntil,
+      lastError: error,
+      oom,
+    };
+    this.records.set(sessionId, updated);
+    return this.getInfo(sessionId, now)!;
+  }
+
+  recordSuccess(sessionId: string): void {
+    this.records.delete(sessionId);
+  }
+
+  reset(sessionId: string): void {
+    this.records.delete(sessionId);
+  }
+
+  getInfo(sessionId: string, now = Date.now()): WorkspaceCrashInfo | null {
+    const rec = this.records.get(sessionId);
+    if (!rec) return null;
+    const recent = rec.failures.filter((ts) => now - ts < this.windowMs);
+    const isOpen = rec.openUntil > now;
+    if (recent.length === 0 && !isOpen) return null;
+    return {
+      crashLoop: isOpen,
+      oom: rec.oom,
+      failureCount: recent.length,
+      lastError: rec.lastError,
+      retryAfterSec: isOpen ? Math.max(1, Math.ceil((rec.openUntil - now) / 1000)) : undefined,
+    };
+  }
+}
+
 export interface WorkspaceDriver {
   setRawWorkspaceToken?(sessionId: string, token: string): void;
   ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint>;
   stop(session: SessionRecord): Promise<void>;
   destroy(session: SessionRecord): Promise<void>;
+  restart?(session: SessionRecord): Promise<WorkspaceEndpoint>;
   pruneNodeModules?(session: SessionRecord): Promise<void>;
   duplicateWorkspace(
     source: SessionRecord,
@@ -49,6 +182,7 @@ export interface WorkspaceDriver {
   fetchIntoSession(session: SessionRecord, token: string): Promise<void>;
   setBootProgressListener?(listener: BootProgressListener): void;
   getBootProgress?(sessionId: string): BootProgressDto | null;
+  getCrashInfo?(sessionId: string): WorkspaceCrashInfo | null;
   startWarmPool?(): void;
   stopWarmPool?(): Promise<void>;
   reserveWarmWorkspace?(): WarmReservation | null;

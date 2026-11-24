@@ -10,11 +10,14 @@ function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delt
   let contextsClosed = 0;
   let closeCalls = 0;
   const visitedUrls: string[] = [];
+  const screenshotCalls: Array<Record<string, unknown>> = [];
+  const contextOptions: Array<Record<string, unknown>> = [];
 
   const browser = Object.assign(emitter, {
     isConnected: () => connected,
-    newContext: async () => {
+    newContext: async (ctxOpts?: Record<string, unknown>) => {
       contextsCreated += 1;
+      if (ctxOpts) contextOptions.push(ctxOpts);
       return {
         newPage: async () => ({
           goto: async (url: string) => {
@@ -25,7 +28,10 @@ function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delt
             }
           },
           waitForTimeout: async () => {},
-          screenshot: async () => Buffer.from('fake-png'),
+          screenshot: async (shotOpts?: Record<string, unknown>) => {
+            if (shotOpts) screenshotCalls.push(shotOpts);
+            return Buffer.from('fake-jpeg');
+          },
         }),
         close: async () => {
           contextsClosed += 1;
@@ -50,6 +56,8 @@ function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delt
       contextsClosed,
       closeCalls,
       visitedUrls,
+      screenshotCalls,
+      contextOptions,
     }),
     simulateCrash: () => {
       connected = false;
@@ -87,11 +95,20 @@ describe('ScreenshotService', () => {
         svc.capture({ url: 'http://ws-2:4321/p/s2/about', viewport: 'mobile' }),
       ]);
 
-      expect(r1.width).toBe(1440);
-      expect(r1.height).toBe(900);
+      expect(r1.width).toBe(1280);
+      expect(r1.height).toBe(800);
+      expect(r1.mimeType).toBe('image/jpeg');
       expect(r2.width).toBe(390);
       expect(r2.height).toBe(844);
-      expect(r1.png.toString()).toBe('fake-png');
+      expect(r1.data.toString()).toBe('fake-jpeg');
+      expect(fakeRef!.stats().screenshotCalls).toEqual([
+        { type: 'jpeg', quality: 80, fullPage: false },
+        { type: 'jpeg', quality: 80, fullPage: false },
+      ]);
+      expect(fakeRef!.stats().contextOptions[0]).toEqual({
+        viewport: { width: 1280, height: 800 },
+        deviceScaleFactor: 1,
+      });
       expect(launchCount).toBe(1);
       expect(maxActive).toBe(1);
       expect(svc.isBrowserRunning()).toBe(true);
@@ -194,12 +211,14 @@ describe('ScreenshotService', () => {
         viewport: 'desktop',
         fullPage: true,
       });
-      expect(res.width).toBe(1440);
+      expect(res.width).toBe(1280);
       expect(res.height).toBe(3600);
+      expect(res.mimeType).toBe('image/jpeg');
       expect(capturedOpts).toEqual({
-        type: 'png',
+        type: 'jpeg',
+        quality: 80,
         fullPage: true,
-        clip: { x: 0, y: 0, width: 1440, height: 3600 },
+        clip: { x: 0, y: 0, width: 1280, height: 3600 },
       });
     } finally {
       await svc.close();
