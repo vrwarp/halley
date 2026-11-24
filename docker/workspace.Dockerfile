@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.51.0-noble
+FROM mcr.microsoft.com/playwright:v1.65.1-noble
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -32,6 +32,10 @@ RUN chmod +x /usr/local/bin/halley-workspace-entrypoint.sh \
  && chown -R pwuser:pwuser /app /halley-volume /halley-pkg-cache
 
 USER pwuser
+
+# Fail the image build immediately if the installed playwright package and base image Chromium ever drift
+RUN node --input-type=module -e "import { chromium } from '/app/packages/workspace-runner/node_modules/playwright/index.mjs'; const b = await chromium.launch(); await b.close(); console.log('Playwright Chromium verified OK');"
+
 EXPOSE 4100 4321
 
 ENTRYPOINT ["/usr/local/bin/halley-workspace-entrypoint.sh"]
