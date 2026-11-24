@@ -1,13 +1,21 @@
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { createControlPlane } from '../src/index.js';
 import type { WorkspaceDriver } from '../src/drivers/workspace-driver.js';
+import { ScreenshotService } from '../src/screenshot-service.js';
 
-function createMockDriver(): WorkspaceDriver {
+function createMockDriver(tokens?: Map<string, string>): WorkspaceDriver & {
+  setRawWorkspaceToken: (id: string, token: string) => void;
+} {
   return {
+    setRawWorkspaceToken: (id, token) => {
+      tokens?.set(id, token);
+    },
     ensureRunning: async () => ({
       runnerUrl: 'http://127.0.0.1:49999',
       astroUrl: 'http://127.0.0.1:49998',
@@ -23,8 +31,34 @@ function createMockDriver(): WorkspaceDriver {
 }
 
 describe('control-plane auth, allowlist, spend caps & session permissions', () => {
-  it('enforces allowlist, daily USD spend cap + admin grant, and teammate read-only guard', async () => {
+  it('enforces allowlist, daily USD spend cap + admin grant, teammate read-only guard, and /internal/screenshot auth/routing', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-test-'));
+    const capturedUrls: string[] = [];
+    const tokens = new Map<string, string>();
+    const fakeScreenshotService = new ScreenshotService({
+      settleWaitMs: 0,
+      launchBrowser: async () => {
+        const emitter = new EventEmitter();
+        let connected = true;
+        return Object.assign(emitter, {
+          isConnected: () => connected,
+          newContext: async () => ({
+            newPage: async () => ({
+              goto: async (url: string) => {
+                capturedUrls.push(url);
+              },
+              waitForTimeout: async () => {},
+              screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+            }),
+            close: async () => {},
+          }),
+          close: async () => {
+            connected = false;
+            emitter.emit('disconnected');
+          },
+        }) as unknown as Browser;
+      },
+    });
     try {
       const cfg = {
         ...loadConfig(),
@@ -34,7 +68,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         dailyCostCapUsd: 5,
         devLoginEnabled: true,
       };
-      const cp = createControlPlane(cfg, createMockDriver());
+      const cp = createControlPlane(cfg, createMockDriver(tokens), fakeScreenshotService);
 
       expect(cp.db.isEmailAllowed('admin@thecrossing.website')).toBe(true);
       expect(cp.db.isEmailAllowed('pastor@thecrossing.website')).toBe(true);
@@ -66,6 +100,45 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       });
       expect(createRes.status).toBe(201);
       const { session } = (await createRes.json()) as { session: { id: string } };
+      const wsToken = tokens.get(session.id)!;
+      expect(wsToken).toBeTruthy();
+
+      // /internal/screenshot rejects missing or invalid tokens
+      const unauthShot = await cp.app.request('/internal/screenshot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route: '/', viewport: 'desktop' }),
+      });
+      expect(unauthShot.status).toBe(401);
+
+      // /internal/screenshot rejects path traversal escaping session prefix
+      const traversalShot = await cp.app.request('/internal/screenshot', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${wsToken}`,
+        },
+        body: JSON.stringify({ route: '/../../../etc/passwd', viewport: 'desktop' }),
+      });
+      expect(traversalShot.status).toBe(400);
+
+      // /internal/screenshot streams PNG and deduplicates base prefix if included
+      const validShot = await cp.app.request('/internal/screenshot', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${wsToken}`,
+        },
+        body: JSON.stringify({ route: '/thecrossing.website/im-new', viewport: 'mobile' }),
+      });
+      expect(validShot.status).toBe(200);
+      expect(validShot.headers.get('content-type')).toBe('image/png');
+      expect(validShot.headers.get('x-screenshot-width')).toBe('390');
+      const pngBytes = Buffer.from(await validShot.arrayBuffer());
+      expect(pngBytes[0]).toBe(0x89);
+      expect(capturedUrls).toEqual([
+        `http://127.0.0.1:49998/p/${session.id}/thecrossing.website/im-new`,
+      ]);
 
       // Teammate signs in
       const login2 = await cp.app.request('/api/auth/dev-login', {
@@ -100,6 +173,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       expect(dupData.session.isOwner).toBe(true);
       expect(dupData.session.canEdit).toBe(true);
     } finally {
+      await fakeScreenshotService.close();
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });

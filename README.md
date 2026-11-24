@@ -6,8 +6,8 @@ A hosted, chat-forward web editor for GitHub-hosted **Astro** websites. Non-tech
 
 - [`packages/shared`](packages/shared): Shared Zod schemas, TypeScript DTOs, `postMessage` bridge contracts, and WebSocket events.
 - [`packages/astro-dev-edit`](packages/astro-dev-edit): Dev-only Astro integration (`@astrojs/compiler` AST classifier, `url()`-aware serializer, Shadow DOM inline bubble menu, `/__editor/*` middleware).
-- [`packages/workspace-runner`](packages/workspace-runner): Per-session Hono + `ws` runner managing `astro dev` (with `/p/:sessionId/*` base override), `@earendil-works/pi-durable` SQLite runtime, `sharp` image processing, Playwright `screenshot_page`, auto-checkpoints, and verification.
-- [`packages/control-plane`](packages/control-plane): Gateway & orchestrator handling Google OAuth, email/domain allowlist, daily USD spend proxy for Anthropic, Docker/Local `WorkspaceDriver`, `/p/:sessionId/*` HTTP + Vite HMR WS proxy, and GitHub PR + auto-merge + Pages deploy polling.
+- [`packages/workspace-runner`](packages/workspace-runner): Per-session Hono + `ws` runner managing `astro dev` (with `/p/:sessionId/*` base override), `@earendil-works/pi-durable` SQLite runtime, `sharp` image processing, `screenshot_page` (via control-plane), auto-checkpoints, and verification.
+- [`packages/control-plane`](packages/control-plane): Gateway & orchestrator handling Google OAuth, email/domain allowlist, daily USD spend proxy for Anthropic, shared Playwright Chromium screenshot service, Docker/Local `WorkspaceDriver`, `/p/:sessionId/*` HTTP + Vite HMR WS proxy, and GitHub PR + auto-merge + Pages deploy polling.
 - [`packages/web`](packages/web): Minimalist Notion/Webflow-style light React + Tailwind v4 web editor UI.
 
 ## Quick Start (Local Development)
@@ -25,8 +25,8 @@ pnpm test:e2e   # Self-contained Playwright + Astro E2E suite using local fakes 
 ## Docker Setup & Deployment
 
 Halley separates its runtime into two container images for security and resource efficiency:
-- **`halley-control-plane`** (`docker/control-plane.Dockerfile`): Lightweight always-on gateway holding your API keys (`ANTHROPIC_API_KEY`, GitHub credentials, Google OAuth), SQLite state (`/data`), spend-capped LLM proxy, and preview/HMR proxy.
-- **`halley-workspace`** (`docker/workspace.Dockerfile`): Ephemeral per-session sandbox (Node 22 + `astro dev` + durable Pi agent + `sharp` + Playwright Chromium, running as unprivileged `pwuser`). Spawned on demand via `/var/run/docker.sock` and stopped automatically when idle.
+- **`halley-control-plane`** (`docker/control-plane.Dockerfile`): Always-on gateway holding your API keys (`ANTHROPIC_API_KEY`, GitHub credentials, Google OAuth), SQLite state (`/data`), spend-capped LLM proxy, shared warm Playwright Chromium screenshot service (with 1-hour idle auto-close), and preview/HMR proxy.
+- **`halley-workspace`** (`docker/workspace.Dockerfile`): Slim ephemeral per-session sandbox (Node 22 + `astro dev` + durable Pi agent + `sharp`, running as unprivileged `node`). Spawned on demand via `/var/run/docker.sock` and stopped automatically when idle.
 
 `control-plane` automatically:
 1. **Pulls `WORKSPACE_IMAGE`** from Docker Hub on the first session if it isn't cached locally yet.

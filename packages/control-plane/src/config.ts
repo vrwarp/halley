@@ -30,6 +30,7 @@ export interface HalleyConfig {
   workspaceDockerNetwork: string;
   controlPlaneInternalUrl: string;
   workspaceIdleTimeoutMs: number;
+  browserIdleTimeoutMs: number;
   archiveRetentionDays: number;
   warmPoolSize: number;
   devLoginEnabled: boolean;
@@ -86,6 +87,7 @@ export function loadConfig(): HalleyConfig {
     controlPlaneInternalUrl:
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),
+    browserIdleTimeoutMs: Number(process.env.HALLEY_BROWSER_IDLE_TIMEOUT_MS || 60 * 60_000),
     archiveRetentionDays: Number(process.env.ARCHIVE_RETENTION_DAYS || 7),
     warmPoolSize,
     devLoginEnabled: process.env.HALLEY_DEV_LOGIN === 'true',

@@ -37,7 +37,7 @@ jobs:
         run: pnpm test
 
       - name: Install Playwright Chromium for E2E
-        run: pnpm --filter @halley/workspace-runner exec playwright install chromium --with-deps
+        run: pnpm --filter @halley/control-plane exec playwright install chromium --with-deps
 
       - name: Run E2E tests (with fakes)
         run: pnpm test:e2e

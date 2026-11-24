@@ -39,7 +39,6 @@ import type {
   StagedAttachment,
   TranscriptEntryDto,
 } from '@halley/shared';
-import { chromium } from 'playwright';
 import sharp from 'sharp';
 import { runAllVerificationChecks } from './verify.js';
 import type { UploadManager } from './uploads.js';
@@ -285,35 +284,48 @@ export class HalleyPiRuntime {
       }),
       execute: async (args) => {
         const cleanRoute = args.route.startsWith('/') ? args.route : `/${args.route}`;
-        const base = opts.previewBase === '/' ? '' : opts.previewBase.replace(/\/$/, '');
-        const url = `http://127.0.0.1:${opts.astroPort}${base}${cleanRoute}`;
         const size = args.viewport === 'mobile' ? { width: 390, height: 844 } : { width: 1440, height: 900 };
+        const endpoint = `${opts.controlPlaneInternalUrl.replace(/\/$/, '')}/internal/screenshot`;
 
-        const browser = await chromium.launch({
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${opts.workspaceToken}`,
+          },
+          body: JSON.stringify({
+            route: cleanRoute,
+            viewport: args.viewport,
+          }),
         });
-        try {
-          const page = await browser.newPage({ viewport: size });
-          await page.goto(url, { waitUntil: 'networkidle', timeout: 25_000 });
-          await page.waitForTimeout(400);
-          const png = await page.screenshot({ type: 'png', fullPage: false });
+
+        if (!res.ok) {
+          const errText = await res.text().catch(() => res.statusText);
           return {
             output: [
               {
                 type: 'text',
-                text: `Captured ${args.viewport} (${size.width}x${size.height}) screenshot of ${cleanRoute}`,
-              },
-              {
-                type: 'image',
-                data: png.toString('base64'),
-                mimeType: 'image/png',
+                text: `Screenshot failed (${res.status}): ${errText}`,
               },
             ],
+            isError: true,
           };
-        } finally {
-          await browser.close();
         }
+
+        const png = Buffer.from(await res.arrayBuffer());
+        return {
+          output: [
+            {
+              type: 'text',
+              text: `Captured ${args.viewport} (${size.width}x${size.height}) screenshot of ${cleanRoute}`,
+            },
+            {
+              type: 'image',
+              data: png.toString('base64'),
+              mimeType: 'image/png',
+            },
+          ],
+        };
       },
     });
 
