@@ -4,35 +4,41 @@ import type { Context } from 'hono';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb } from '../db.js';
 
-// Per-million-token pricing (USD) for Anthropic models
+// Per-million-token pricing (USD) for Anthropic models, aligned with @earendil-works/pi-ai
 export const MODEL_RATES: Record<
   string,
   { input: number; output: number; cacheWrite: number; cacheRead: number }
 > = {
-  'claude-sonnet-5-5': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
-  'claude-sonnet-5': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
+  'claude-haiku-5-5': { input: 0.1, output: 0.5, cacheWrite: 0.125, cacheRead: 0.01 },
+  'claude-haiku-5': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
+  'claude-haiku-4-5': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
+  'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
+  'claude-sonnet-5-5': { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.1 },
+  'claude-sonnet-5': { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 },
+  'claude-sonnet-4-6': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
   'claude-sonnet-4-5': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
+  'claude-sonnet-4-5-20250929': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
   'claude-sonnet-4-20250514': { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.3 },
-  // Current Opus 4.5 / 4.6 pricing ($5 input / $25 output per MTok)
+  'claude-opus-5-5': { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
+  'claude-opus-5': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
+  'claude-opus-4-8': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
+  'claude-opus-4-7': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   'claude-opus-4-6': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   'claude-opus-4-5': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   'claude-opus-4-5-20251101': { input: 5, output: 25, cacheWrite: 6.25, cacheRead: 0.5 },
   // Legacy Opus 4 / 4.1 pricing
   'claude-opus-4-1': { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.5 },
   'claude-opus-4-20250514': { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.5 },
-  'claude-haiku-5': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
-  'claude-haiku-4-5': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
-  'claude-haiku-4-5-20251001': { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.1 },
 };
 
 export function getModelRate(model: string) {
   return (
     MODEL_RATES[model] ??
     (model.includes('opus')
-      ? MODEL_RATES['claude-opus-4-6']!
+      ? MODEL_RATES['claude-opus-5-5']!
       : model.includes('haiku')
-        ? MODEL_RATES['claude-haiku-4-5']!
-        : MODEL_RATES['claude-sonnet-4-5']!)
+        ? MODEL_RATES['claude-haiku-5-5']!
+        : MODEL_RATES['claude-sonnet-5-5']!)
   );
 }
 
@@ -338,12 +344,14 @@ export function createLlmProxyHandler(
               };
             };
             if (evt.type === 'message_start' && evt.message?.usage) {
-              inputTokens += evt.message.usage.input_tokens ?? 0;
-              outputTokens += evt.message.usage.output_tokens ?? 0;
-              cacheWrite += evt.message.usage.cache_creation_input_tokens ?? 0;
-              cacheRead += evt.message.usage.cache_read_input_tokens ?? 0;
+              inputTokens = evt.message.usage.input_tokens ?? inputTokens;
+              outputTokens = evt.message.usage.output_tokens ?? outputTokens;
+              cacheWrite = evt.message.usage.cache_creation_input_tokens ?? cacheWrite;
+              cacheRead = evt.message.usage.cache_read_input_tokens ?? cacheRead;
             } else if (evt.type === 'message_delta' && evt.usage) {
-              outputTokens += evt.usage.output_tokens ?? 0;
+              if (typeof evt.usage.output_tokens === 'number') {
+                outputTokens = evt.usage.output_tokens;
+              }
             }
 
             // In-flight ceiling guard: abort stream if run exceeds its ceiling

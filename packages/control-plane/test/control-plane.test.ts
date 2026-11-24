@@ -594,4 +594,15 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('computes claude-haiku-5-5 spend in alignment with pi-ai pricing', async () => {
+    const { computeCostUsd } = await import('../src/proxy/llm-proxy.js');
+    const cost = computeCostUsd('claude-haiku-5-5', {
+      input_tokens: 54,
+      output_tokens: 24423,
+      cache_read_input_tokens: 1022962,
+      cache_creation_input_tokens: 119789,
+    });
+    expect(cost).toBeCloseTo(0.037420145, 6);
+  });
 });

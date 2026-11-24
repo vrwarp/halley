@@ -55,6 +55,9 @@ const ASTRO_PORT = Number(process.env.ASTRO_PORT || 4321);
 const CONTROL_PLANE_INTERNAL_URL =
   process.env.CONTROL_PLANE_INTERNAL_URL || 'http://127.0.0.1:3000';
 const WORKSPACE_TOKEN = process.env.WORKSPACE_TOKEN || 'dev-token';
+// Scrub WORKSPACE_TOKEN from process.env immediately so child processes
+// (astro dev SSR code, agent bash commands, verification scripts) never inherit it.
+delete process.env.WORKSPACE_TOKEN;
 const MODEL_ID = process.env.HALLEY_MODEL_ID || 'haiku-latest';
 const THINKING_LEVEL = (process.env.HALLEY_THINKING_LEVEL || 'high') as
   | 'off'

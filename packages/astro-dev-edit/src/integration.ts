@@ -39,6 +39,65 @@ function resolveRelFile(repoRoot: string, rawFile: string): string {
   return path.relative(path.resolve(repoRoot), abs).split(path.sep).join('/');
 }
 
+const TAILWIND_SCAN_FILE_RE = /\.(?:astro|mdx?|tsx?|jsx?|html|vue|svelte|json)$/i;
+
+interface ViteModuleGraphLike {
+  idToModuleMap?: Map<string, unknown>;
+  invalidateModule?: (mod: unknown) => void;
+}
+
+interface ViteServerLike {
+  moduleGraph?: ViteModuleGraphLike;
+  environments?: Record<string, { moduleGraph?: ViteModuleGraphLike } | undefined>;
+}
+
+/**
+ * Invalidates compiled `.css` modules in Vite's module graph (including Vite 6+
+ * SSR/client environments) whenever a template or content file is added/changed/deleted.
+ * Works around `@tailwindcss/vite`'s literal `addWatchFile("./**\/*")` not triggering
+ * CSS re-scans for newly created `.astro` files in `astro dev`.
+ */
+export function invalidateCssModulesForFile(
+  server: ViteServerLike,
+  repoRoot: string,
+  filePath: string,
+): number {
+  const abs = path.isAbsolute(filePath)
+    ? path.resolve(filePath)
+    : path.resolve(repoRoot, filePath);
+  const rel = path.relative(path.resolve(repoRoot), abs).split(path.sep).join('/');
+  if (
+    !rel ||
+    rel.startsWith('..') ||
+    rel.startsWith('node_modules/') ||
+    rel.startsWith('.git/') ||
+    rel.startsWith('dist/') ||
+    !TAILWIND_SCAN_FILE_RE.test(rel)
+  ) {
+    return 0;
+  }
+
+  let invalidated = 0;
+  const seen = new Set<unknown>();
+  const invalidateGraph = (graph?: ViteModuleGraphLike) => {
+    if (!graph?.idToModuleMap || typeof graph.invalidateModule !== 'function') return;
+    for (const [id, mod] of graph.idToModuleMap.entries()) {
+      if (!id.includes('.css') || seen.has(mod)) continue;
+      seen.add(mod);
+      graph.invalidateModule(mod);
+      invalidated += 1;
+    }
+  };
+
+  invalidateGraph(server.moduleGraph);
+  if (server.environments) {
+    for (const env of Object.values(server.environments)) {
+      invalidateGraph(env?.moduleGraph);
+    }
+  }
+  return invalidated;
+}
+
 export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
   const fileLock = options.fileLock ?? new PerFileMutex();
   const normalizedPreviewBase =
@@ -57,6 +116,13 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
         );
       },
       'astro:server:setup': ({ server }) => {
+        const onFsEvent = (changedFile: string) => {
+          invalidateCssModulesForFile(server as unknown as ViteServerLike, options.repoRoot, changedFile);
+        };
+        server.watcher.on('add', onFsEvent);
+        server.watcher.on('change', onFsEvent);
+        server.watcher.on('unlink', onFsEvent);
+
         server.middlewares.use(async (req, res, next) => {
           const urlPath = (req.url ?? '').split('?')[0] ?? '';
           const stripped =

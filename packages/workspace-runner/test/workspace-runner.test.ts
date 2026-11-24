@@ -222,4 +222,36 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('strips ANSI codes and compacts passing run_checks output while preserving full failing output', async () => {
+    const { formatCompactCheckSummary, stripAnsi } = await import('../src/verify.js');
+    expect(stripAnsi('\u001b[32m✓ Completed\u001b[39m')).toBe('✓ Completed');
+
+    const summary = formatCompactCheckSummary([
+      {
+        name: 'Production build',
+        command: 'npm run build',
+        passed: true,
+        durationMs: 9500,
+        output: [
+          '\u001b[2m08:50:01\u001b[22m ▶ src/pages/poetry.astro',
+          '\u001b[2m08:50:01\u001b[22m   └─ /poetry/index.html (+5ms)',
+          '08:50:02 [build] 95 page(s) built in 6.21s',
+          '  Indexed 89 pages',
+        ].join('\n'),
+      },
+      {
+        name: 'Verify (seo)',
+        command: 'npm run verify:seo',
+        passed: false,
+        durationMs: 400,
+        output: '\u001b[31mMissing meta description on /poetry\u001b[39m\nLine 2 detail',
+      },
+    ]);
+
+    expect(summary).toContain('[PASS] Production build (9500ms) — 08:50:02 [build] 95 page(s) built in 6.21s · Indexed 89 pages');
+    expect(summary).not.toContain('/poetry/index.html');
+    expect(summary).toContain('[FAIL] Verify (seo) (400ms)\nMissing meta description on /poetry\nLine 2 detail');
+  });
 });
+
