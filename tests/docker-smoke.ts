@@ -326,9 +326,12 @@ async function main() {
     if (!shotRes.ok) {
       throw new Error(`POST /internal/screenshot failed (${shotRes.status}): ${await shotRes.text()}`);
     }
+    if (shotRes.headers.get('content-type') !== 'image/jpeg') {
+      throw new Error(`Expected image/jpeg from /internal/screenshot, got ${shotRes.headers.get('content-type')}`);
+    }
     const shotBytes = Buffer.from(await shotRes.arrayBuffer());
-    if (shotBytes.length < 100 || shotBytes[0] !== 0x89 || shotBytes[1] !== 0x50 || shotBytes[2] !== 0x4e || shotBytes[3] !== 0x47) {
-      throw new Error(`Expected valid PNG bytes from /internal/screenshot, got ${shotBytes.length} bytes`);
+    if (shotBytes.length < 100 || shotBytes[0] !== 0xff || shotBytes[1] !== 0xd8 || shotBytes[2] !== 0xff) {
+      throw new Error(`Expected valid JPEG bytes from /internal/screenshot, got ${shotBytes.length} bytes`);
     }
 
     console.log('[docker-smoke] SUCCESS — Docker-in-Docker orchestration verified end-to-end!');
