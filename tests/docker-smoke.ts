@@ -300,6 +300,37 @@ async function main() {
       throw new Error(`Expected p at 7:7 to be editable-static, got: ${JSON.stringify(inspectJson)}`);
     }
 
+    console.log('[docker-smoke] 9. Verifying shared Chromium POST /internal/screenshot in control-plane against workspace container…');
+    const wsEnvLines = (
+      await run('docker', [
+        'inspect',
+        `halley-ws-${sessionId.slice(0, 12)}`,
+        '--format',
+        '{{range .Config.Env}}{{println .}}{{end}}',
+      ])
+    ).split(/\r?\n/);
+    const wsTokenLine = wsEnvLines.find((l) => l.startsWith('WORKSPACE_TOKEN='));
+    const wsToken = wsTokenLine ? wsTokenLine.slice('WORKSPACE_TOKEN='.length) : '';
+    if (!wsToken) {
+      throw new Error('Failed to extract WORKSPACE_TOKEN from workspace container env');
+    }
+
+    const shotRes = await fetch(`${cpUrl}/internal/screenshot`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${wsToken}`,
+      },
+      body: JSON.stringify({ route: '/', viewport: 'desktop' }),
+    });
+    if (!shotRes.ok) {
+      throw new Error(`POST /internal/screenshot failed (${shotRes.status}): ${await shotRes.text()}`);
+    }
+    const shotBytes = Buffer.from(await shotRes.arrayBuffer());
+    if (shotBytes.length < 100 || shotBytes[0] !== 0x89 || shotBytes[1] !== 0x50 || shotBytes[2] !== 0x4e || shotBytes[3] !== 0x47) {
+      throw new Error(`Expected valid PNG bytes from /internal/screenshot, got ${shotBytes.length} bytes`);
+    }
+
     console.log('[docker-smoke] SUCCESS — Docker-in-Docker orchestration verified end-to-end!');
   } finally {
     anthropicServer?.close();

@@ -19,6 +19,7 @@ import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js'
 import { createPreviewProxy } from './proxy/preview-proxy.js';
 import { startSessionReaper } from './reaper.js';
 import { PublishService } from './routes/publish.js';
+import { ScreenshotService, type ScreenshotViewport } from './screenshot-service.js';
 
 type Env = {
   Variables: {
@@ -36,7 +37,11 @@ function slugify(text: string): string {
   );
 }
 
-export function createControlPlane(config: HalleyConfig, customDriver?: WorkspaceDriver) {
+export function createControlPlane(
+  config: HalleyConfig,
+  customDriver?: WorkspaceDriver,
+  customScreenshotService?: ScreenshotService,
+) {
   const db = new ControlPlaneDb(path.join(config.dataDir, 'control-plane.sqlite'), config);
   const auth = new AuthService(config, db);
   const github = new GitHubService(config);
@@ -77,6 +82,12 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     },
   );
 
+  const screenshotService =
+    customScreenshotService ??
+    new ScreenshotService({
+      idleTimeoutMs: config.browserIdleTimeoutMs,
+    });
+
   const app = new Hono<Env>();
 
   // Health & Doctor preflight diagnostics
@@ -105,6 +116,78 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
       broadcastToSession(sessionId, { type: 'spend_status', ...spend });
     }),
   );
+
+  // Shared Headless Chromium Screenshot Service (authenticated via WORKSPACE_TOKEN)
+  app.post('/internal/screenshot', async (c) => {
+    const authHeader = c.req.header('authorization') || '';
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!rawToken) {
+      return c.json({ error: 'Missing workspace token' }, 401);
+    }
+
+    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    if (!session) {
+      return c.json({ error: 'Invalid workspace token' }, 401);
+    }
+
+    db.updateSession(session.id, { last_active_at: new Date().toISOString() });
+
+    let astroUrl = session.astro_url;
+    let originalBase = session.astro_base || '/';
+    if (!astroUrl) {
+      try {
+        const ep = await driver.ensureRunning(session);
+        astroUrl = ep.astroUrl;
+        originalBase = ep.astroBase || '/';
+      } catch {
+        return c.json({ error: 'Workspace preview server is not running' }, 503);
+      }
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      route?: unknown;
+      viewport?: unknown;
+    };
+    const rawRoute = typeof body.route === 'string' ? body.route.trim() : '/';
+    const viewport: ScreenshotViewport = body.viewport === 'mobile' ? 'mobile' : 'desktop';
+    let cleanRoute = rawRoute.startsWith('/') ? rawRoute : `/${rawRoute}`;
+
+    const astroOrigin = new URL(astroUrl);
+    const baseSuffix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
+    if (baseSuffix && (cleanRoute === baseSuffix || cleanRoute.startsWith(`${baseSuffix}/`))) {
+      cleanRoute = cleanRoute.slice(baseSuffix.length) || '/';
+    }
+
+    const sessionPrefix = `/p/${session.id}`;
+    const previewPath = `${sessionPrefix}${baseSuffix}${cleanRoute}`;
+    const targetUrl = new URL(previewPath, astroOrigin);
+    if (
+      targetUrl.origin !== astroOrigin.origin ||
+      (targetUrl.pathname !== sessionPrefix && !targetUrl.pathname.startsWith(`${sessionPrefix}/`))
+    ) {
+      return c.json({ error: 'Invalid route' }, 400);
+    }
+
+    try {
+      const result = await screenshotService.capture({
+        url: targetUrl.toString(),
+        viewport,
+      });
+      return new Response(new Uint8Array(result.png), {
+        status: 200,
+        headers: {
+          'Content-Type': 'image/png',
+          'X-Screenshot-Width': String(result.width),
+          'X-Screenshot-Height': String(result.height),
+        },
+      });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Screenshot capture failed' },
+        500,
+      );
+    }
+  });
 
   // Auth routes
   app.get('/api/auth/me', (c) => {
@@ -677,7 +760,7 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     });
   };
 
-  return { app, db, driver, auth, github, publishService, handleWsUpgrade };
+  return { app, db, driver, auth, github, publishService, screenshotService, handleWsUpgrade };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
@@ -712,9 +795,10 @@ if (isMain) {
     if (shuttingDown) return;
     shuttingDown = true;
     stopReaper();
-    void Promise.resolve(cp.driver.stopWarmPool?.())
-      .catch(() => {})
-      .finally(() => process.exit(0));
+    void Promise.allSettled([
+      Promise.resolve(cp.driver.stopWarmPool?.()),
+      cp.screenshotService.close(),
+    ]).finally(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

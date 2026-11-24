@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const execFileAsync = promisify(execFile);
-const require = createRequire(path.resolve('packages/workspace-runner/package.json'));
+const require = createRequire(path.resolve('packages/control-plane/package.json'));
 const { chromium } = require('playwright') as typeof import('playwright');
 
 async function getFreePort(): Promise<number> {
@@ -391,6 +391,38 @@ import { url } from '../lib/url';
         return;
       }
 
+      if (lower.includes('screenshot')) {
+        if (!isToolResult) {
+          sendAnthropicSse(res, [
+            {
+              type: 'tool_use',
+              id: 'toolu_shot_desktop',
+              name: 'screenshot_page',
+              input: { route: '/im-new', viewport: 'desktop' },
+            },
+            {
+              type: 'tool_use',
+              id: 'toolu_shot_mobile',
+              name: 'screenshot_page',
+              input: { route: '/im-new', viewport: 'mobile' },
+            },
+          ]);
+          return;
+        }
+        const hadError =
+          Array.isArray(lastContent) &&
+          lastContent.some((b: { is_error?: boolean }) => Boolean(b.is_error));
+        sendAnthropicSse(res, [
+          {
+            type: 'text',
+            text: hadError
+              ? 'Screenshot tool returned an error!'
+              : 'Captured both desktop and mobile screenshots cleanly via shared browser!',
+          },
+        ]);
+        return;
+      }
+
       if (lower.includes('check')) {
         if (!isToolResult) {
           sendAnthropicSse(res, [
@@ -705,6 +737,11 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       );
       await chatInput.press('Enter');
       await page.waitForSelector('text=Thanksgiving Potluck event', { timeout: 30_000 });
+
+      // 5b. Pi Turn: Capture parallel desktop & mobile screenshots via shared control-plane Chromium
+      await chatInput.fill('Take a screenshot of /im-new');
+      await chatInput.press('Enter');
+      await page.waitForSelector('text=shared browser!', { timeout: 30_000 });
 
       // 6. Pi Turn 3: Run checks
       await chatInput.fill('Run checks on the site');
