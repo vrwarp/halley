@@ -1,5 +1,8 @@
+import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { discoverSiteRoutes, PerFileMutex } from '@halley/astro-dev-edit';
 import {
   ChatClientMessageSchema,
@@ -23,11 +26,13 @@ import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import { runAllVerificationChecks } from './verify.js';
 
+const execFileAsync = promisify(execFile);
+
 const REPO_ROOT = process.env.HALLEY_WORKSPACE_DIR || '/workspace';
 const STATE_DIR = process.env.HALLEY_STATE_DIR || '/halley-state';
 const SESSION_ID = process.env.HALLEY_SESSION_ID || 'local';
 const BASE_BRANCH = process.env.HALLEY_BASE_BRANCH || 'main';
-const BASE_SHA = process.env.HALLEY_BASE_SHA || '';
+let baseSha = process.env.HALLEY_BASE_SHA || '';
 const RUNNER_PORT = Number(process.env.RUNNER_PORT || 4100);
 const ASTRO_PORT = Number(process.env.ASTRO_PORT || 4321);
 const CONTROL_PLANE_INTERNAL_URL =
@@ -50,6 +55,44 @@ const gitIdentity: GitIdentity = {
   editorName: process.env.HALLEY_EDITOR_NAME || 'Halley Editor',
   editorEmail: process.env.HALLEY_EDITOR_EMAIL || 'editor@example.com',
 };
+
+const SESSION_META_PATH = path.join(STATE_DIR, 'session-meta.json');
+
+interface PersistedSessionMeta {
+  editorName?: string;
+  editorEmail?: string;
+  persona?: 'non-technical' | 'developer';
+  baseSha?: string;
+  readOnly?: boolean;
+}
+
+async function loadPersistedSessionMeta(): Promise<void> {
+  try {
+    const raw = await fs.readFile(SESSION_META_PATH, 'utf8');
+    const meta = JSON.parse(raw) as PersistedSessionMeta;
+    if (meta.editorName) gitIdentity.editorName = meta.editorName;
+    if (meta.editorEmail) gitIdentity.editorEmail = meta.editorEmail;
+    if (meta.persona === 'developer' || meta.persona === 'non-technical') {
+      persona = meta.persona;
+    }
+    if (meta.baseSha) baseSha = meta.baseSha;
+    if (typeof meta.readOnly === 'boolean') readOnly = meta.readOnly;
+  } catch {
+    // no persisted meta yet
+  }
+}
+
+async function savePersistedSessionMeta(): Promise<void> {
+  await fs.mkdir(STATE_DIR, { recursive: true });
+  const meta: PersistedSessionMeta = {
+    editorName: gitIdentity.editorName,
+    editorEmail: gitIdentity.editorEmail,
+    persona,
+    baseSha,
+    readOnly,
+  };
+  await fs.writeFile(SESSION_META_PATH, JSON.stringify(meta, null, 2), 'utf8');
+}
 
 const fileLock = new PerFileMutex();
 const uploadManager = new UploadManager(path.join(STATE_DIR, 'uploads'));
@@ -100,8 +143,11 @@ const astroManager = new AstroDevManager({
 let piRuntime: HalleyPiRuntime | null = null;
 
 async function main() {
+  await loadPersistedSessionMeta();
+  console.log('[halley-boot] starting_preview');
   const { originalBase, previewBase } = await astroManager.start();
 
+  console.log('[halley-boot] starting_ai');
   piRuntime = new HalleyPiRuntime({
     repoRoot: REPO_ROOT,
     stateDir: STATE_DIR,
@@ -152,18 +198,103 @@ async function main() {
       originalBase,
       previewBase,
       readOnly,
+      baseSha,
     });
+  });
+
+  /**
+   * Binds a pre-warmed standby workspace container to a real user session.
+   * Updates git branch (optionally fast-forwarding from the local bare mirror if baseBranch moved),
+   * sets editor identity/persona, and persists session-meta.json for future sleep/wake cycles.
+   */
+  app.post('/internal/claim', async (c) => {
+    const body = (await c.req.json()) as {
+      workingBranch: string;
+      baseBranch?: string;
+      editorName?: string;
+      editorEmail?: string;
+      persona?: 'non-technical' | 'developer';
+      readOnly?: boolean;
+      syncFromMirror?: boolean;
+      mirrorPath?: string;
+    };
+
+    const targetBaseBranch = body.baseBranch || BASE_BRANCH;
+    const mirrorPath = body.mirrorPath || process.env.HALLEY_MIRROR_PATH || '/halley-mirror/repo.git';
+
+    if (body.syncFromMirror) {
+      const hasMirror = await fs
+        .access(path.join(mirrorPath, 'HEAD'))
+        .then(() => true)
+        .catch(() => false);
+      if (hasMirror) {
+        const oldHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT }))
+          .stdout.trim();
+        await execFileAsync(
+          'git',
+          ['fetch', mirrorPath, `+refs/heads/${targetBaseBranch}:refs/remotes/origin/${targetBaseBranch}`],
+          { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024 },
+        );
+        const lockDiff = await execFileAsync(
+          'git',
+          ['diff', '--name-only', oldHead, `origin/${targetBaseBranch}`, '--', 'package-lock.json', 'pnpm-lock.yaml'],
+          { cwd: REPO_ROOT },
+        ).catch(() => ({ stdout: '' }));
+
+        await execFileAsync(
+          'git',
+          ['checkout', '-B', body.workingBranch, `origin/${targetBaseBranch}`],
+          { cwd: REPO_ROOT },
+        );
+
+        const changedLocks = lockDiff.stdout.trim();
+        if (changedLocks) {
+          if (changedLocks.includes('package-lock.json')) {
+            await execFileAsync(
+              'npm',
+              ['ci', '--cache', '/halley-pkg-cache/npm', '--prefer-offline', '--ignore-scripts'],
+              { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024 },
+            );
+          } else if (changedLocks.includes('pnpm-lock.yaml')) {
+            await execFileAsync(
+              'pnpm',
+              ['install', '--store-dir', '/halley-pkg-cache/pnpm', '--frozen-lockfile'],
+              { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024 },
+            );
+          }
+        }
+      } else {
+        await execFileAsync('git', ['checkout', '-B', body.workingBranch], { cwd: REPO_ROOT });
+      }
+    } else {
+      await execFileAsync('git', ['checkout', '-B', body.workingBranch], { cwd: REPO_ROOT });
+    }
+
+    baseSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
+    if (body.editorName) gitIdentity.editorName = body.editorName;
+    if (body.editorEmail) gitIdentity.editorEmail = body.editorEmail;
+    if (body.persona === 'developer' || body.persona === 'non-technical') {
+      persona = body.persona;
+    }
+    if (typeof body.readOnly === 'boolean') {
+      readOnly = body.readOnly;
+    }
+    await savePersistedSessionMeta();
+
+    return c.json({ ok: true, baseSha, originalBase, previewBase });
   });
 
   app.post('/internal/read-only', async (c) => {
     const body = (await c.req.json()) as { readOnly: boolean };
     readOnly = Boolean(body.readOnly);
+    await savePersistedSessionMeta().catch(() => {});
     return c.json({ ok: true, readOnly });
   });
 
   app.post('/internal/persona', async (c) => {
     const body = (await c.req.json()) as { persona?: string };
     persona = body.persona === 'developer' ? 'developer' : 'non-technical';
+    await savePersistedSessionMeta().catch(() => {});
     return c.json({ ok: true, persona });
   });
 
@@ -181,7 +312,7 @@ async function main() {
   app.get('/internal/git/changes', async (c) => {
     const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
     const changes = await getGitChanges(REPO_ROOT, baseRef);
-    const checkpoints = await listCheckpoints(REPO_ROOT, BASE_SHA);
+    const checkpoints = await listCheckpoints(REPO_ROOT, baseSha);
     return c.json({ changes, checkpoints });
   });
 

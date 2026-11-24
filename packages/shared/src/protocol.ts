@@ -37,6 +37,32 @@ export const SessionStatusSchema = z.enum([
 ]);
 export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 
+export const BootStageSchema = z.enum([
+  'queued',
+  'claiming_warm',
+  'syncing_repo',
+  'checking_image',
+  'pulling_image',
+  'creating_container',
+  'starting_container',
+  'cloning_repo',
+  'installing_deps',
+  'starting_preview',
+  'starting_ai',
+  'ready',
+  'error',
+]);
+export type BootStage = z.infer<typeof BootStageSchema>;
+
+export interface BootProgressDto {
+  stage: BootStage;
+  message: string;
+  detail?: string;
+  startedAt: string;
+  updatedAt: string;
+  warmHit?: boolean;
+}
+
 export const PublishStateSchema = z.enum([
   'idle',
   'verifying',
@@ -187,6 +213,10 @@ export type ChatServerMessage =
       capped: boolean;
     }
   | {
+      type: 'boot_progress';
+      progress: BootProgressDto;
+    }
+  | {
       type: 'error';
       message: string;
     };
@@ -237,6 +267,7 @@ export interface EditorSessionDto {
   workingBranch: string;
   baseSha: string;
   status: SessionStatus;
+  bootProgress?: BootProgressDto | null;
   publishState: PublishState;
   publishError: string | null;
   prNumber: number | null;

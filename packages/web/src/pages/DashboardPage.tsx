@@ -2,6 +2,7 @@ import type { EditorSessionDto, SpendStatusDto, UserDto } from '@halley/shared';
 import {
   CheckCircle2,
   Copy,
+  Loader2,
   LogOut,
   Plus,
   Settings,
@@ -51,6 +52,20 @@ function statusBadge(s: EditorSessionDto) {
     return (
       <span className="inline-flex items-center rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-700 border border-amber-200">
         Publishing…
+      </span>
+    );
+  }
+  if (s.status === 'starting') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 border border-amber-200">
+        <Loader2 className="h-3 w-3 animate-spin" /> Starting…
+      </span>
+    );
+  }
+  if (s.status === 'error') {
+    return (
+      <span className="inline-flex items-center rounded-full bg-red-50 px-2.5 py-0.5 text-xs font-medium text-red-700 border border-red-200">
+        Start failed
       </span>
     );
   }

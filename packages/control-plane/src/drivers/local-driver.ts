@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import type { BootProgressDto, BootStage } from '@halley/shared';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { GitHubService } from '../github/client.js';
@@ -10,6 +11,7 @@ import {
   ensureBareMirror,
   runGit,
   withGitAskPass,
+  type BootProgressListener,
   type WorkspaceDriver,
   type WorkspaceEndpoint,
 } from './workspace-driver.js';
@@ -36,6 +38,8 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
   private procs = new Map<string, ChildProcess>();
   private booting = new Map<string, Promise<WorkspaceEndpoint>>();
   private sessionTokens = new Map<string, string>();
+  private bootProgress = new Map<string, BootProgressDto>();
+  private bootProgressListener: BootProgressListener | null = null;
 
   constructor(
     private config: HalleyConfig,
@@ -45,6 +49,33 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
 
   setRawWorkspaceToken(sessionId: string, token: string): void {
     this.sessionTokens.set(sessionId, token);
+  }
+
+  setBootProgressListener(listener: BootProgressListener): void {
+    this.bootProgressListener = listener;
+  }
+
+  getBootProgress(sessionId: string): BootProgressDto | null {
+    return this.bootProgress.get(sessionId) ?? null;
+  }
+
+  private emitProgress(
+    sessionId: string,
+    stage: BootStage,
+    message: string,
+    detail?: string,
+  ): void {
+    const prev = this.bootProgress.get(sessionId);
+    const now = new Date().toISOString();
+    const progress: BootProgressDto = {
+      stage,
+      message,
+      detail,
+      startedAt: prev?.startedAt ?? now,
+      updatedAt: now,
+    };
+    this.bootProgress.set(sessionId, progress);
+    this.bootProgressListener?.(sessionId, progress);
   }
 
   private sessionDir(sessionId: string): string {
@@ -72,67 +103,73 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
   }
 
   private async bootSession(session: SessionRecord): Promise<WorkspaceEndpoint> {
-    const baseDir = this.sessionDir(session.id);
-    const workspaceDir = path.join(baseDir, 'workspace');
-    const stateDir = path.join(baseDir, 'state');
-    await fs.mkdir(stateDir, { recursive: true });
+    try {
+      const baseDir = this.sessionDir(session.id);
+      const workspaceDir = path.join(baseDir, 'workspace');
+      const stateDir = path.join(baseDir, 'state');
+      await fs.mkdir(stateDir, { recursive: true });
 
-    const repoReady = await fs
-      .access(path.join(workspaceDir, '.git'))
-      .then(() => true)
-      .catch(() => false);
-
-    let baseSha = session.base_sha;
-    if (!repoReady) {
-      const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
-      const token = this.config.devLocalRepo ? undefined : await this.github.getAccessToken().catch(() => undefined);
-      await ensureBareMirror(mirrorDir, session.repo, token, this.config.devLocalRepo || undefined);
-
-      await fs.mkdir(baseDir, { recursive: true });
-      await runGit(baseDir, ['clone', mirrorDir, 'workspace']);
-      if (this.config.devLocalRepo) {
-        await runGit(workspaceDir, ['remote', 'set-url', 'origin', this.config.devLocalRepo]);
-      } else {
-        await runGit(workspaceDir, [
-          'remote',
-          'set-url',
-          'origin',
-          `https://github.com/${session.repo}.git`,
-        ]);
-      }
-      await runGit(workspaceDir, ['checkout', '-B', session.working_branch, session.base_branch]);
-      baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
-
-      // Install dependencies (fast if devLocalRepo has node_modules or npm cache)
-      const hasModules = await fs
-        .access(path.join(workspaceDir, 'node_modules'))
+      const repoReady = await fs
+        .access(path.join(workspaceDir, '.git'))
         .then(() => true)
         .catch(() => false);
-      if (!hasModules) {
+
+      let baseSha = session.base_sha;
+      if (!repoReady) {
+        this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
+        const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
+        const token = this.config.devLocalRepo ? undefined : await this.github.getAccessToken().catch(() => undefined);
+        await ensureBareMirror(mirrorDir, session.repo, token, this.config.devLocalRepo || undefined);
+
+        this.emitProgress(session.id, 'cloning_repo', 'Cloning website files…');
+        await fs.mkdir(baseDir, { recursive: true });
+        await runGit(baseDir, ['clone', mirrorDir, 'workspace']);
         if (this.config.devLocalRepo) {
-          const srcModules = path.join(this.config.devLocalRepo, 'node_modules');
-          const hasSrcModules = await fs.access(srcModules).then(() => true).catch(() => false);
-          if (hasSrcModules) {
-            await fs.symlink(srcModules, path.join(workspaceDir, 'node_modules'));
-          }
+          await runGit(workspaceDir, ['remote', 'set-url', 'origin', this.config.devLocalRepo]);
         } else {
-          const hasPkgLock = await fs.access(path.join(workspaceDir, 'package-lock.json')).then(() => true).catch(() => false);
-          const hasPnpmLock = await fs.access(path.join(workspaceDir, 'pnpm-lock.yaml')).then(() => true).catch(() => false);
-          const { execFile } = await import('node:child_process');
-          const { promisify } = await import('node:util');
-          const execFileAsync = promisify(execFile);
-          if (hasPkgLock) {
-            await execFileAsync('npm', ['ci', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
-          } else if (hasPnpmLock) {
-            await execFileAsync('pnpm', ['install', '--frozen-lockfile'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+          await runGit(workspaceDir, [
+            'remote',
+            'set-url',
+            'origin',
+            `https://github.com/${session.repo}.git`,
+          ]);
+        }
+        await runGit(workspaceDir, ['checkout', '-B', session.working_branch, session.base_branch]);
+        baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
+
+        // Install dependencies (fast if devLocalRepo has node_modules or npm cache)
+        const hasModules = await fs
+          .access(path.join(workspaceDir, 'node_modules'))
+          .then(() => true)
+          .catch(() => false);
+        if (!hasModules) {
+          this.emitProgress(session.id, 'installing_deps', 'Installing project packages…');
+          if (this.config.devLocalRepo) {
+            const srcModules = path.join(this.config.devLocalRepo, 'node_modules');
+            const hasSrcModules = await fs.access(srcModules).then(() => true).catch(() => false);
+            if (hasSrcModules) {
+              await fs.symlink(srcModules, path.join(workspaceDir, 'node_modules'));
+            }
           } else {
-            await execFileAsync('npm', ['install', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+            const hasPkgLock = await fs.access(path.join(workspaceDir, 'package-lock.json')).then(() => true).catch(() => false);
+            const hasPnpmLock = await fs.access(path.join(workspaceDir, 'pnpm-lock.yaml')).then(() => true).catch(() => false);
+            const { execFile } = await import('node:child_process');
+            const { promisify } = await import('node:util');
+            const execFileAsync = promisify(execFile);
+            if (hasPkgLock) {
+              await execFileAsync('npm', ['ci', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+            } else if (hasPnpmLock) {
+              await execFileAsync('pnpm', ['install', '--frozen-lockfile'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+            } else {
+              await execFileAsync('npm', ['install', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+            }
           }
         }
+      } else if (!baseSha) {
+        baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
       }
-    } else if (!baseSha) {
-      baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
-    }
+
+      this.emitProgress(session.id, 'starting_preview', 'Starting Astro live preview…');
 
     const runnerPort = await getFreePort();
     const astroPort = await getFreePort();
@@ -212,10 +249,21 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
       last_active_at: new Date().toISOString(),
     });
 
+    this.emitProgress(session.id, 'ready', 'Workspace ready!');
     return { runnerUrl, astroUrl, astroBase, baseSha };
+    } catch (err) {
+      this.emitProgress(
+        session.id,
+        'error',
+        'Workspace failed to start',
+        err instanceof Error ? err.message : String(err),
+      );
+      throw err;
+    }
   }
 
   async stop(session: SessionRecord): Promise<void> {
+    this.bootProgress.delete(session.id);
     const proc = this.procs.get(session.id);
     if (proc && proc.exitCode === null) {
       proc.kill('SIGTERM');

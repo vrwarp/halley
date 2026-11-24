@@ -9,12 +9,14 @@ mkdir -p "${STATE_DIR}"
 git config --global --add safe.directory '*'
 
 if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
+  echo "[halley-boot] cloning_repo"
   git clone "${HALLEY_MIRROR_PATH:-/halley-mirror}" "${WORKSPACE_DIR}"
   cd "${WORKSPACE_DIR}"
   git remote set-url origin "https://github.com/${HALLEY_REPO}.git"
-  git checkout -B "${HALLEY_WORKING_BRANCH}" "${HALLEY_BASE_BRANCH}"
+  git checkout -B "${HALLEY_WORKING_BRANCH:-halley/standby}" "${HALLEY_BASE_BRANCH}"
   export HALLEY_BASE_SHA="$(git rev-parse HEAD)"
 
+  echo "[halley-boot] installing_deps"
   if [ -f package-lock.json ]; then
     npm ci --cache /halley-pkg-cache/npm --prefer-offline --ignore-scripts
   elif [ -f pnpm-lock.yaml ]; then
@@ -32,4 +34,5 @@ fi
 export HALLEY_WORKSPACE_DIR="${WORKSPACE_DIR}"
 export HALLEY_STATE_DIR="${STATE_DIR}"
 
+echo "[halley-boot] starting_preview"
 exec node /app/packages/workspace-runner/dist/index.js
