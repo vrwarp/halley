@@ -30,6 +30,7 @@ import {
   ImagePlus,
   Loader2,
   Monitor,
+  MoreHorizontal,
   MousePointer,
   PenLine,
   Plus,
@@ -49,6 +50,13 @@ import { flyToChip } from '../components/attachFlight.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { ConflictCards } from '../components/ConflictCards.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
+import {
+  defaultBubblePos,
+  MobileChatBubble,
+  type BubblePos,
+} from '../components/MobileChatBubble.js';
+import { MobileChatCard, type MobileNotice } from '../components/MobileChatCard.js';
+import { MobileFullSheet } from '../components/MobileFullSheet.js';
 import { NewPageCard, pageStatusText } from '../components/NewPageCard.js';
 import { NewPageModal } from '../components/NewPageModal.js';
 import { PageToolbarControls } from '../components/PageToolbarControls.js';
@@ -163,8 +171,15 @@ export function EditorPage({
     coEditors: Array<{ ownerName: string; title: string }>;
   } | null>(null);
 
+  const [isMobile, setIsMobile] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches,
+  );
   const [mode, setMode] = useState<PreviewMode>('browse');
-  const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
+  const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>(() =>
+    typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches
+      ? 'mobile'
+      : 'desktop',
+  );
   const [currentRoute, setCurrentRoute] = useState('/');
   const [siteRoutes, setSiteRoutes] = useState<SiteRouteEntryDto[]>([]);
   const [showPageSwitcher, setShowPageSwitcher] = useState(false);
@@ -175,6 +190,18 @@ export function EditorPage({
   const [showHistory, setShowHistory] = useState(false);
   const [showPublish, setShowPublish] = useState(initialOpenPublish);
   const [showDebug, setShowDebug] = useState(false);
+
+  // Mobile-specific UI state
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const [mobileBubblePos, setMobileBubblePos] = useState<BubblePos>(() => defaultBubblePos());
+  const [previewSelectionActive, setPreviewSelectionActive] = useState(false);
+  const [mobileCompletionToast, setMobileCompletionToast] = useState<string | null>(null);
+  const [mobileSheet, setMobileSheet] = useState<
+    null | 'history' | 'review' | 'pages' | 'menu' | 'checkpoints'
+  >(null);
+  const [showUndoPubModal, setShowUndoPubModal] = useState(false);
+  const [undoPubReason, setUndoPubReason] = useState('');
+  const [undoPubBusy, setUndoPubBusy] = useState(false);
 
   const [input, setInput] = useState('');
   const [chips, setChips] = useState<ElementContext[]>([]);
@@ -200,9 +227,28 @@ export function EditorPage({
   const chipRowRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mobileChipRowRef = useRef<HTMLDivElement>(null);
+  const mobileComposerRef = useRef<HTMLDivElement>(null);
+  const mobileTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const completionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingFlightRef = useRef<{ chipKey: string; from: PreviewRect | null; label: string } | null>(null);
   const pendingHighlightKeyRef = useRef<string | null>(null);
   const [flightNonce, setFlightNonce] = useState(0);
+
+  // Sync phone layout breakpoint (< 640px) and keep editorContext.viewport accurate on phones
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 639px)');
+    const onChange = () => {
+      const mobile = mq.matches;
+      setIsMobile(mobile);
+      if (mobile) {
+        setViewport('mobile');
+      }
+    };
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   const reloadPreview = (force = false) => {
     const now = Date.now();
@@ -536,9 +582,76 @@ export function EditorPage({
           reloadPreview();
         }
       });
+
+      // On phones, if the chat card is closed when Halley finishes, show a 4s one-line toast next to the bubble.
+      if (isMobile && !mobileChatOpen) {
+        const lastReply = [...entries]
+          .reverse()
+          .find((e) => e.role === 'assistant' && !e.isIntermediate && e.text.trim());
+        const firstLine = (lastReply?.text ?? '')
+          .split('\n')
+          .map((l) => l.replace(/[*_`#>-]/g, '').trim())
+          .find(Boolean);
+        const toastText = firstLine
+          ? firstLine.length > 48
+            ? `${firstLine.slice(0, 47)}…`
+            : firstLine
+          : 'Finished updating';
+        setMobileCompletionToast(toastText);
+        if (completionToastTimerRef.current) clearTimeout(completionToastTimerRef.current);
+        completionToastTimerRef.current = setTimeout(() => {
+          setMobileCompletionToast(null);
+        }, 4200);
+      }
     }
     prevBusyRef.current = live.busy;
-  }, [live.busy, live.activeTools, entries.length, wsConnected]);
+  }, [live.busy, live.activeTools, entries.length, wsConnected, isMobile, mobileChatOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (completionToastTimerRef.current) clearTimeout(completionToastTimerRef.current);
+    };
+  }, []);
+
+  // Resync session, transcript, and WebSocket when returning from backgrounding the mobile browser
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== 'visible') return;
+      void loadSessionMeta();
+      void api
+        .getTranscript(sessionId)
+        .then((t) => {
+          setEntries(t.entries);
+          setLive(t.live);
+          if (t.pageRequests) {
+            const next: Record<string, PageRequestMetadata> = {};
+            for (const pr of t.pageRequests) next[pr.pageRequestId] = pr;
+            setPageRequestsMap(next);
+          }
+        })
+        .catch(() => {});
+      if (
+        !crashLoopHaltedRef.current &&
+        (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)
+      ) {
+        setWsReconnectNonce((n) => n + 1);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [sessionId]);
+
+  // Fallback dismissal if user taps the iframe before halley:ready registers our pointerdown listener
+  useEffect(() => {
+    if (!isMobile || !mobileChatOpen) return;
+    const onBlur = () => {
+      if (document.activeElement === iframeRef.current) {
+        setMobileChatOpen(false);
+      }
+    };
+    window.addEventListener('blur', onBlur);
+    return () => window.removeEventListener('blur', onBlur);
+  }, [isMobile, mobileChatOpen]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -547,10 +660,10 @@ export function EditorPage({
   useEffect(() => {
     if (!session) return;
     iframeRef.current?.contentWindow?.postMessage(
-      { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona },
+      { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona, touchLayout: isMobile },
       '*',
     );
-  }, [mode, session?.canEdit, persona]);
+  }, [mode, session?.canEdit, persona, isMobile]);
 
   // Numbered markers in the preview for attached elements on the *current* route
   // (keeps global chip numbers consistent even across multi-page selections).
@@ -577,19 +690,20 @@ export function EditorPage({
   useLayoutEffect(() => {
     const pending = pendingFlightRef.current;
     if (!pending) return;
-    pendingFlightRef.current = null;
-    const chipEl = chipRowRef.current?.querySelector<HTMLElement>(
+    const activeChipRow = isMobile ? mobileChipRowRef.current : chipRowRef.current;
+    const chipEl = activeChipRow?.querySelector<HTMLElement>(
       `[data-chip-key="${CSS.escape(pending.chipKey)}"]`,
     );
     if (!chipEl) return;
+    pendingFlightRef.current = null;
     flyToChip({
       from: pending.from,
       chipEl,
-      composerEl: composerRef.current,
+      composerEl: isMobile ? mobileComposerRef.current : composerRef.current,
       label: pending.label,
-      onLanded: () => textareaRef.current?.focus(),
+      onLanded: () => (isMobile ? mobileTextareaRef.current : textareaRef.current)?.focus(),
     });
-  }, [flightNonce]);
+  }, [flightNonce, isMobile, mobileChatOpen]);
 
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
@@ -600,9 +714,16 @@ export function EditorPage({
           pendingRouteRef.current = null;
         }
         setCurrentRoute(data.route);
+        setPreviewSelectionActive(false);
         if (session) {
           iframeRef.current?.contentWindow?.postMessage(
-            { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona },
+            {
+              type: 'halley:set-mode',
+              mode,
+              readOnly: !session.canEdit,
+              persona,
+              touchLayout: isMobile,
+            },
             '*',
           );
         }
@@ -620,6 +741,12 @@ export function EditorPage({
           pendingRouteRef.current = null;
         }
         setCurrentRoute(data.route);
+      } else if (data.type === 'halley:selection-changed') {
+        setPreviewSelectionActive(Boolean(data.active));
+      } else if (data.type === 'halley:preview-pointerdown') {
+        if (isMobile) {
+          setMobileChatOpen(false);
+        }
       } else if (data.type === 'halley:element-context') {
         // Only sent when the user explicitly presses "Ask Halley…" in the preview.
         const ctx = data.context;
@@ -636,6 +763,10 @@ export function EditorPage({
         }
         pendingFlightRef.current = { chipKey, from, label: chipLabelOf(ctx, persona) };
         setChips((prev) => (prev.some((c) => chipKeyOf(c) === chipKey) ? prev : [...prev, ctx]));
+        if (isMobile) {
+          setMobileChatOpen(true);
+          setMobileCompletionToast(null);
+        }
         setFlightNonce((n) => n + 1);
       } else if (data.type === 'halley:patch-saved') {
         void loadSessionMeta();
@@ -643,7 +774,7 @@ export function EditorPage({
     };
     window.addEventListener('message', onMsg);
     return () => window.removeEventListener('message', onMsg);
-  }, [mode, session, persona]);
+  }, [mode, session, persona, isMobile]);
 
   const dispatchClientMessage = (payload: Record<string, unknown>) => {
     const ws = wsRef.current;
@@ -665,6 +796,7 @@ export function EditorPage({
     }
     setCurrentRoute(clean);
     setShowPageSwitcher(false);
+    setMobileSheet(null);
   };
   const navigatePreviewRef = useRef(navigatePreview);
   navigatePreviewRef.current = navigatePreview;
@@ -687,7 +819,7 @@ export function EditorPage({
   }, [currentRoute, pageRequestsMap]);
 
   const handleRetryPageRequest = async (pageRequestId: string) => {
-    const res = await api.retryPageRequest(sessionId, pageRequestId);
+    const res = await api.retryPageRequest(sessionId, pageRequestId, viewport);
     if (res.pageRequest) {
       setPageRequestsMap((prev) => ({ ...prev, [res.pageRequest!.pageRequestId]: res.pageRequest! }));
     }
@@ -779,7 +911,7 @@ export function EditorPage({
 
   if (!session) {
     return (
-      <div className="flex h-screen flex-col items-center justify-center gap-3 bg-[#FAF9F7] text-sm text-stone-500">
+      <div className="flex h-dvh flex-col items-center justify-center gap-3 bg-[#FAF9F7] text-sm text-stone-500">
         <Loader2 className="h-5 w-5 animate-spin text-amber-600" />
         <span>Loading workspace…</span>
       </div>
@@ -793,10 +925,187 @@ export function EditorPage({
   const baseSuffix = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
   const previewSrc = `/p/${session.id}${baseSuffix}/`;
   const spendPct = Math.min(100, (spend.spentTodayUsd / Math.max(0.01, spend.dailyCapUsd + spend.extraGrantedUsd)) * 100);
+  const failedPageRequest = Object.values(pageRequestsMap).find(
+    (pr) => pr.status === 'failed' || pr.status === 'capped',
+  );
+  const needsMobileAttention = Boolean(
+    syncReview?.status === 'needs_choices' ||
+      upstreamNotice?.heldOverlap ||
+      failedPageRequest,
+  );
+  const mobileNotice: MobileNotice | null = (() => {
+    if (syncReview && (syncReview.status === 'needs_choices' || syncReview.records.length > 0)) {
+      return {
+        text:
+          syncReview.status === 'needs_choices'
+            ? 'Live site conflict needs your choice'
+            : syncReview.summary,
+        actionLabel: 'Review',
+        onAction: () => {
+          setMobileChatOpen(false);
+          setMobileSheet('review');
+        },
+        tone: 'amber',
+      };
+    }
+    if (upstreamNotice?.heldOverlap) {
+      return {
+        text: `Live site update overlaps ${upstreamNotice.heldOverlap} file${upstreamNotice.heldOverlap === 1 ? '' : 's'}`,
+        actionLabel: syncing ? 'Syncing…' : 'Review',
+        onAction: () => void handleManualSync(),
+        tone: 'amber',
+      };
+    }
+    if (upstreamNotice?.behind) {
+      return {
+        text: `Live site has ${upstreamNotice.newerCount} newer update${upstreamNotice.newerCount === 1 ? '' : 's'}`,
+        actionLabel: syncing ? 'Updating…' : 'Get latest',
+        onAction: () => void handleManualSync(),
+        tone: 'amber',
+      };
+    }
+    if (failedPageRequest) {
+      return {
+        text: `Page "${failedPageRequest.title}" needs attention`,
+        actionLabel: 'Review',
+        onAction: () => {
+          setMobileChatOpen(false);
+          setMobileSheet('review');
+        },
+        tone: 'amber',
+      };
+    }
+    if (syncToast) {
+      return {
+        text: syncToast,
+        actionLabel: 'Dismiss',
+        onAction: () => setSyncToast(null),
+        tone: 'teal',
+      };
+    }
+    return null;
+  })();
+
+  const handleConfirmUndoPublication = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!session.mergedSha || !undoPubReason.trim() || undoPubBusy) return;
+    setUndoPubBusy(true);
+    try {
+      const { session: rev } = await api.revertPublication({
+        sessionId: session.id,
+        sha: session.mergedSha,
+        reason: undoPubReason.trim(),
+        title: session.title,
+      });
+      setShowUndoPubModal(false);
+      setUndoPubReason('');
+      onOpenSession(rev.id, { openPublish: true });
+    } finally {
+      setUndoPubBusy(false);
+    }
+  };
 
   return (
-    <div className="flex h-screen flex-col bg-[#FAF9F7]">
-      {/* Top Bar */}
+    <div className="flex h-dvh flex-col bg-[#FAF9F7]">
+      {isMobile ? (
+      /* Mobile Top Bar (< 640px): single compact 48px row */
+      <header
+        className="flex min-h-[48px] shrink-0 items-center justify-between gap-1.5 border-b border-[#E7E5E4] bg-white px-2"
+        style={{ paddingTop: 'env(safe-area-inset-top)' }}
+      >
+        <button
+          type="button"
+          onClick={onBack}
+          aria-label="Back to edits"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-stone-600 hover:bg-stone-100"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </button>
+
+        <button
+          type="button"
+          onClick={async () => {
+            setMobileChatOpen(false);
+            setMobileSheet('pages');
+            try {
+              const rt = await api.getRoutes(sessionId);
+              setSiteRoutes(rt.routes);
+            } catch {
+              // ignore
+            }
+          }}
+          aria-label="Switch page"
+          className="inline-flex min-h-[36px] min-w-0 flex-1 items-center justify-between gap-1 rounded-lg border border-stone-200 bg-[#FAF9F7] px-2.5 py-1 font-mono text-xs text-stone-800"
+        >
+          <span className="truncate">{currentRoute}</span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-stone-400" />
+        </button>
+
+        {session.canEdit && !isWorkspaceBooting && (
+          <div className="inline-flex shrink-0 rounded-lg border border-stone-200 bg-white p-0.5 text-[11px]">
+            {(
+              [
+                { id: 'browse', label: 'Browse', Icon: MousePointer },
+                { id: 'edit', label: 'Edit', Icon: PenLine },
+              ] as const
+            ).map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setMode(id)}
+                className={`inline-flex min-h-[32px] items-center gap-1 rounded-md px-2 py-1 font-medium transition ${
+                  mode === id ? 'bg-stone-900 text-white' : 'text-stone-600'
+                }`}
+              >
+                <Icon className="h-3 w-3" />
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {session.canEdit ? (
+          <button
+            type="button"
+            onClick={() => {
+              setMobileChatOpen(false);
+              setShowPublish(true);
+            }}
+            className="inline-flex min-h-[36px] shrink-0 items-center gap-1 rounded-lg bg-stone-900 px-2.5 py-1.5 text-xs font-semibold text-white"
+          >
+            {session.publishState === 'published' ? (
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+            ) : (
+              <>Publish{changedCount > 0 ? ` · ${changedCount}` : ''}</>
+            )}
+          </button>
+        ) : session.status === 'published' || session.status === 'merged' ? (
+          <button
+            type="button"
+            onClick={async () => {
+              const { session: cont } = await api.duplicateSession(session.id);
+              onOpenSession(cont.id);
+            }}
+            className="inline-flex min-h-[36px] shrink-0 items-center gap-1 rounded-lg bg-stone-900 px-2.5 py-1.5 text-xs font-semibold text-white"
+          >
+            Continue
+          </button>
+        ) : null}
+
+        <button
+          type="button"
+          onClick={() => {
+            setMobileChatOpen(false);
+            setMobileSheet('menu');
+          }}
+          aria-label="More actions"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-stone-600 hover:bg-stone-100"
+        >
+          <MoreHorizontal className="h-5 w-5" />
+        </button>
+      </header>
+      ) : (
+      /* Desktop Top Bar (>= 640px) */
       <header className="flex h-[52px] shrink-0 items-center justify-between border-b border-[#E7E5E4] bg-white px-4">
         <div className="flex items-center gap-3 min-w-0">
           <button
@@ -836,16 +1145,9 @@ export function EditorPage({
               {session.mergedSha && (
                 <button
                   type="button"
-                  onClick={async () => {
-                    const reason = prompt('Reason for undoing this publication:');
-                    if (!reason?.trim()) return;
-                    const { session: rev } = await api.revertPublication({
-                      sessionId: session.id,
-                      sha: session.mergedSha!,
-                      reason: reason.trim(),
-                      title: session.title,
-                    });
-                    onOpenSession(rev.id, { openPublish: true });
+                  onClick={() => {
+                    setUndoPubReason('');
+                    setShowUndoPubModal(true);
                   }}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:border-red-300 hover:text-red-700"
                 >
@@ -905,7 +1207,7 @@ export function EditorPage({
             className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50 hover:text-stone-900"
           >
             <Bug className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Debug</span>
+            <span className="hidden md:inline">Debug</span>
           </button>
 
           {session.canEdit && (
@@ -918,7 +1220,7 @@ export function EditorPage({
                 className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-40"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
-                <span className="hidden sm:inline">{syncing ? 'Updating…' : 'Get latest'}</span>
+                <span className="hidden md:inline">{syncing ? 'Updating…' : 'Get latest'}</span>
               </button>
 
               <button
@@ -928,7 +1230,7 @@ export function EditorPage({
                   onOpenSession(dup.id);
                 }}
                 title="Branch off a copy of this draft"
-                className="hidden sm:inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50"
+                className="hidden lg:inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50"
               >
                 <GitBranch className="h-3.5 w-3.5" />
                 Branch off
@@ -1014,6 +1316,7 @@ export function EditorPage({
           )}
         </div>
       </header>
+      )}
 
       {/* Workspace Loading or Split Workspace */}
       {isWorkspaceBooting ? (
@@ -1025,7 +1328,7 @@ export function EditorPage({
         />
       ) : (
       <div className="flex flex-1 min-h-0">
-        {/* Left Chat Sidebar */}
+        {/* Left Chat Sidebar (desktop >= 640px) */}
         <aside
           onDragOver={(e) => {
             e.preventDefault();
@@ -1037,7 +1340,7 @@ export function EditorPage({
             setDragOver(false);
             void handleFiles(e.dataTransfer.files);
           }}
-          className={`flex w-[400px] shrink-0 flex-col border-r border-[#E7E5E4] bg-white transition ${
+          className={`hidden sm:flex sm:w-[300px] md:w-[340px] lg:w-[400px] shrink-0 flex-col border-r border-[#E7E5E4] bg-white transition ${
             dragOver ? 'ring-2 ring-inset ring-amber-500 bg-amber-50/30' : ''
           }`}
         >
@@ -1619,7 +1922,7 @@ export function EditorPage({
 
         {/* Right Preview Stage */}
         <main className="flex flex-1 flex-col min-w-0 bg-[#F3F1EE]">
-          <div className="flex h-11 shrink-0 items-center justify-between border-b border-[#E7E5E4] bg-[#FAF9F7] px-4">
+          <div className="hidden h-11 shrink-0 items-center justify-between border-b border-[#E7E5E4] bg-[#FAF9F7] px-4 sm:flex">
             <div className="relative flex items-center gap-1.5">
               <button
                 type="button"
@@ -1706,6 +2009,7 @@ export function EditorPage({
                 currentRoute={currentRoute}
                 currentRouteEntry={siteRoutes.find((r) => r.route === currentRoute)}
                 canEdit={session.canEdit}
+                viewport={viewport}
                 onVisibilityChanged={async () => {
                   await loadSessionMeta();
                   reloadPreview(true);
@@ -1788,12 +2092,17 @@ export function EditorPage({
             </div>
           </div>
 
-          <div className="flex flex-1 items-center justify-center overflow-auto p-4">
+          <div className="flex flex-1 items-center justify-center overflow-auto p-0 sm:p-4">
             <div
-              className="relative h-full overflow-hidden rounded-xl border border-[#E7E5E4] bg-white shadow-sm transition-all duration-200"
+              className="relative h-full overflow-hidden bg-white transition-all duration-200 sm:rounded-xl sm:border sm:border-[#E7E5E4] sm:shadow-sm"
               style={{
-                width:
-                  viewport === 'mobile' ? '390px' : viewport === 'tablet' ? '768px' : '100%',
+                width: isMobile
+                  ? '100%'
+                  : viewport === 'mobile'
+                    ? '390px'
+                    : viewport === 'tablet'
+                      ? '768px'
+                      : '100%',
               }}
             >
               <iframe
@@ -1809,6 +2118,631 @@ export function EditorPage({
           </div>
         </main>
       </div>
+      )}
+
+      {/* Mobile Floating Chat Bubble + Compact Card (< 640px) */}
+      {isMobile && !isWorkspaceBooting && !mobileChatOpen && !previewSelectionActive && !mobileSheet && !showPublish && !showNewPageModal && !showDebug && (
+        <MobileChatBubble
+          pos={mobileBubblePos}
+          onChangePos={setMobileBubblePos}
+          onTap={() => {
+            setMobileCompletionToast(null);
+            setMobileChatOpen(true);
+          }}
+          busy={live.busy}
+          chipCount={chips.length}
+          needsAttention={needsMobileAttention}
+          entryPulse={entries.length === 0 && !live.busy}
+          completionToast={mobileCompletionToast}
+          onTapToast={() => {
+            setMobileCompletionToast(null);
+            setMobileChatOpen(true);
+          }}
+        />
+      )}
+
+      {isMobile && !isWorkspaceBooting && mobileChatOpen && (
+        <MobileChatCard
+          bubblePos={mobileBubblePos}
+          canEdit={session.canEdit}
+          currentRoute={currentRoute}
+          astroBase={session.astroBase}
+          knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+          persona={persona}
+          spend={spend}
+          entries={entries}
+          live={live}
+          input={input}
+          onChangeInput={setInput}
+          chips={chips}
+          onRemoveChip={(key) => {
+            highlightInPreview(null);
+            setChips((prev) => prev.filter((x) => chipKeyOf(x) !== key));
+          }}
+          onClearChips={() => setChips([])}
+          onFocusChip={(c) => {
+            setMobileChatOpen(false);
+            focusChipInPreview(c);
+          }}
+          attachments={attachments}
+          onRemoveAttachment={(stagedId) =>
+            setAttachments((prev) => prev.filter((x) => x.stagedId !== stagedId))
+          }
+          uploading={uploading}
+          onTriggerPhotoUpload={() => fileInputRef.current?.click()}
+          onSend={(whenBusy, overrideText) => sendPrompt(whenBusy, overrideText)}
+          onAbort={() => wsRef.current?.send(JSON.stringify({ type: 'abort' }))}
+          onOpenNewPage={() => {
+            setMobileChatOpen(false);
+            openNewPageWizard();
+          }}
+          onNavigateRouteAndClose={(route) => {
+            setMobileChatOpen(false);
+            navigatePreview(route);
+          }}
+          onShowHistory={() => {
+            setMobileChatOpen(false);
+            setMobileSheet('history');
+          }}
+          onClose={() => setMobileChatOpen(false)}
+          notice={mobileNotice}
+          friendlyToolLabel={friendlyToolLabel}
+          chipRowRef={mobileChipRowRef}
+          composerRef={mobileComposerRef}
+          textareaRef={mobileTextareaRef}
+        />
+      )}
+
+      {/* Mobile Full-Screen Sheets */}
+      {isMobile && mobileSheet === 'history' && (
+        <MobileFullSheet
+          title="Conversation History"
+          subtitle={session.title}
+          onClose={() => setMobileSheet(null)}
+        >
+          <div className="space-y-4">
+            {priorThread && priorThread.entries.length > 0 && (
+              <div className="space-y-3 opacity-75">
+                {priorThread.entries.map((entry) => {
+                  if (entry.role === 'user') {
+                    const parsed = parseUserMessageDisplay(entry.text);
+                    return (
+                      <div key={`m-prior-${entry.id}`} className="flex flex-col items-end">
+                        <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-stone-700 px-3.5 py-2 text-xs text-white whitespace-pre-wrap">
+                          {parsed.body}
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (entry.role === 'assistant') {
+                    return (
+                      <div
+                        key={`m-prior-${entry.id}`}
+                        className="rounded-xl bg-stone-50 px-3 py-2 text-xs text-stone-700"
+                      >
+                        <ChatMessageContent
+                          text={entry.text}
+                          onNavigateRoute={(r) => {
+                            setMobileSheet(null);
+                            navigatePreview(r);
+                          }}
+                        />
+                      </div>
+                    );
+                  }
+                  return null;
+                })}
+                <div className="flex items-center gap-2 py-1 text-[11px] font-medium text-stone-500">
+                  <div className="h-px flex-1 bg-stone-200" />
+                  <span>Continued from &ldquo;{priorThread.parentTitle}&rdquo;</span>
+                  <div className="h-px flex-1 bg-stone-200" />
+                </div>
+              </div>
+            )}
+
+            {entries.length === 0 && Object.keys(pageRequestsMap).length === 0 ? (
+              <p className="py-8 text-center text-xs text-stone-500">No messages yet.</p>
+            ) : (
+              groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
+                if (block.kind === 'steps') {
+                  const isOpen = expandedTool === `m-${block.id}`;
+                  const toolSteps = block.items.filter((i) => i.role === 'tool');
+                  const stepCount = toolSteps.length || block.items.length;
+                  return (
+                    <div
+                      key={`m-${block.id}`}
+                      className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-2 text-xs"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setExpandedTool(isOpen ? null : `m-${block.id}`)}
+                        className="flex w-full items-center justify-between text-stone-600"
+                      >
+                        <span className="font-medium">
+                          {stepCount === 1
+                            ? friendlyToolLabel(toolSteps[0]?.toolName)
+                            : `Completed ${stepCount} steps`}
+                        </span>
+                        <ChevronDown className={`h-3.5 w-3.5 transition ${isOpen ? 'rotate-180' : ''}`} />
+                      </button>
+                      {isOpen && (
+                        <div className="mt-2 space-y-1.5 border-t border-stone-200/70 pt-2 text-[11px] text-stone-500">
+                          {block.items.map((step) =>
+                            step.role === 'tool' ? (
+                              <div key={step.id} className="font-medium text-stone-600">
+                                {friendlyToolLabel(step.toolName)}
+                              </div>
+                            ) : (
+                              <p key={step.id}>{step.text}</p>
+                            ),
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
+                const entry = block.entry;
+                if (entry.role === 'user') {
+                  if (entry.pageRequest) {
+                    const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
+                    return (
+                      <NewPageCard
+                        key={`m-${entry.id}`}
+                        pageRequest={livePr}
+                        persona={persona}
+                        canEdit={session.canEdit}
+                        spendCapped={spend.capped}
+                        onNavigateRoute={(r) => {
+                          setMobileSheet(null);
+                          navigatePreview(r);
+                        }}
+                        onRetry={handleRetryPageRequest}
+                        onDelete={handleDeletePage}
+                      />
+                    );
+                  }
+                  const parsed = parseUserMessageDisplay(entry.text);
+                  return (
+                    <div key={`m-${entry.id}`} className="flex flex-col items-end gap-1">
+                      {parsed.badges.length > 0 && (
+                        <div className="flex max-w-[85%] flex-wrap justify-end gap-1">
+                          {parsed.badges.map((b, idx) => (
+                            <span
+                              key={idx}
+                              className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-900"
+                            >
+                              {b}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-stone-900 px-3.5 py-2.5 text-sm text-white whitespace-pre-wrap">
+                        {parsed.body}
+                      </div>
+                    </div>
+                  );
+                }
+                if (entry.role === 'tool') {
+                  return (
+                    <div
+                      key={`m-${entry.id}`}
+                      className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-1.5 text-xs text-stone-600"
+                    >
+                      {friendlyToolLabel(entry.toolName)}
+                    </div>
+                  );
+                }
+                return (
+                  <div key={`m-${entry.id}`}>
+                    <ChatMessageContent
+                      text={entry.text}
+                      onNavigateRoute={(r) => {
+                        setMobileSheet(null);
+                        navigatePreview(r);
+                      }}
+                      knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                      astroBase={session.astroBase}
+                    />
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </MobileFullSheet>
+      )}
+
+      {isMobile && mobileSheet === 'review' && (
+        <MobileFullSheet
+          title="Review Updates"
+          subtitle="Resolve live site updates or page issues"
+          onClose={() => setMobileSheet(null)}
+        >
+          <div className="space-y-4">
+            {syncReview && (
+              <ConflictCards
+                sessionId={session.id}
+                review={syncReview}
+                onUpdated={(next) => {
+                  setSyncReview(next);
+                  reloadPreview(true);
+                  void loadSessionMeta();
+                }}
+                onUndone={() => {
+                  setSyncReview(null);
+                  setSyncToast('Update undone.');
+                  setMobileSheet(null);
+                  reloadPreview(true);
+                  void loadSessionMeta();
+                }}
+              />
+            )}
+            {Object.values(pageRequestsMap)
+              .filter((pr) => pr.status === 'failed' || pr.status === 'capped')
+              .map((pr) => (
+                <NewPageCard
+                  key={`review-${pr.pageRequestId}`}
+                  pageRequest={pr}
+                  persona={persona}
+                  canEdit={session.canEdit}
+                  spendCapped={spend.capped}
+                  onNavigateRoute={(r) => {
+                    setMobileSheet(null);
+                    navigatePreview(r);
+                  }}
+                  onRetry={handleRetryPageRequest}
+                  onDelete={handleDeletePage}
+                />
+              ))}
+          </div>
+        </MobileFullSheet>
+      )}
+
+      {isMobile && mobileSheet === 'pages' && (
+        <MobileFullSheet
+          title="Switch Page"
+          subtitle={`Currently on ${currentRoute}`}
+          onClose={() => setMobileSheet(null)}
+          footer={
+            session.canEdit ? (
+              <button
+                type="button"
+                onClick={() => {
+                  const filtered = siteRoutes.filter((r) =>
+                    r.route.toLowerCase().includes(routeQuery.toLowerCase()),
+                  );
+                  const prefill = filtered.length === 0 ? routeQuery.trim() : '';
+                  setRouteQuery('');
+                  setMobileSheet(null);
+                  openNewPageWizard(prefill);
+                }}
+                className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-stone-900 px-4 py-2.5 text-sm font-semibold text-white"
+              >
+                <FilePlus className="h-4 w-4" />
+                New page…
+              </button>
+            ) : undefined
+          }
+        >
+          <div className="space-y-3">
+            <input
+              type="text"
+              value={routeQuery}
+              onChange={(e) => setRouteQuery(e.target.value)}
+              placeholder="Filter pages…"
+              className="w-full rounded-xl border border-stone-300 bg-[#FAF9F7] px-3.5 py-2.5 text-sm outline-none focus:border-amber-600 focus:bg-white"
+            />
+            <div className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">
+              {siteRoutes
+                .filter((r) => r.route.toLowerCase().includes(routeQuery.toLowerCase()))
+                .map((r) => (
+                  <button
+                    key={r.route}
+                    type="button"
+                    onClick={() => navigatePreview(r.route)}
+                    className={`flex min-h-[44px] w-full items-center justify-between px-3.5 py-2.5 text-left text-sm ${
+                      currentRoute === r.route ? 'bg-amber-50/60 font-semibold text-amber-900' : 'text-stone-800'
+                    }`}
+                  >
+                    <span className="truncate font-mono text-xs">{r.route}</span>
+                    {r.unlisted && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-medium text-stone-500">
+                        <EyeOff className="h-2.5 w-2.5" /> Unlisted
+                      </span>
+                    )}
+                  </button>
+                ))}
+              {siteRoutes.length === 0 && (
+                <p className="px-3.5 py-4 text-xs text-stone-400">Loading pages…</p>
+              )}
+            </div>
+          </div>
+        </MobileFullSheet>
+      )}
+
+      {isMobile && mobileSheet === 'menu' && (
+        <MobileFullSheet
+          title={session.title}
+          subtitle={`Page: ${currentRoute}`}
+          onClose={() => setMobileSheet(null)}
+        >
+          <div className="space-y-4">
+            {session.canEdit && currentRoute !== '/' && (
+              <div className="rounded-xl border border-stone-200 bg-[#FAF9F7] p-3">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-stone-500">
+                  Current Page
+                </p>
+                <PageToolbarControls
+                  sessionId={session.id}
+                  currentRoute={currentRoute}
+                  currentRouteEntry={siteRoutes.find((r) => r.route === currentRoute)}
+                  canEdit={session.canEdit}
+                  viewport={viewport}
+                  inlineMobile
+                  onVisibilityChanged={async () => {
+                    await loadSessionMeta();
+                    reloadPreview(true);
+                    setMobileSheet(null);
+                  }}
+                  onRenamed={async (newRoute) => {
+                    await loadSessionMeta();
+                    navigatePreview(newRoute);
+                  }}
+                />
+              </div>
+            )}
+
+            <div className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">
+              {session.canEdit && (
+                <>
+                  <button
+                    type="button"
+                    disabled={checkpoints.length < 1}
+                    onClick={async () => {
+                      setMobileSheet(null);
+                      await handleUndoLast();
+                    }}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800 disabled:opacity-40"
+                  >
+                    <Undo2 className="h-4 w-4 text-stone-500" />
+                    Undo last change
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMobileSheet('checkpoints')}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+                  >
+                    <History className="h-4 w-4 text-stone-500" />
+                    Checkpoint history ({checkpoints.length})
+                  </button>
+                  <button
+                    type="button"
+                    disabled={syncing || live.busy}
+                    onClick={async () => {
+                      setMobileSheet(null);
+                      await handleManualSync();
+                    }}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800 disabled:opacity-40"
+                  >
+                    <RefreshCw className={`h-4 w-4 text-stone-500 ${syncing ? 'animate-spin' : ''}`} />
+                    {syncing ? 'Updating from live site…' : 'Get latest from live site'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMobileSheet(null);
+                      openNewPageWizard();
+                    }}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+                  >
+                    <FilePlus className="h-4 w-4 text-amber-700" />
+                    New page…
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setMobileSheet(null);
+                      const { session: dup } = await api.duplicateSession(session.id);
+                      onOpenSession(dup.id);
+                    }}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+                  >
+                    <GitBranch className="h-4 w-4 text-stone-500" />
+                    Branch off copy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const next = persona === 'non-technical' ? 'developer' : 'non-technical';
+                      setPersona(next);
+                      await api.updatePreferences(next).catch(() => {});
+                    }}
+                    className="flex min-h-[48px] w-full items-center justify-between px-4 text-left text-sm font-medium text-stone-800"
+                  >
+                    <span>Halley tone</span>
+                    <span className="text-xs text-stone-500">
+                      {persona === 'non-technical' ? 'Plain-English' : 'Technical'}
+                    </span>
+                  </button>
+                </>
+              )}
+
+              {(session.status === 'published' || session.status === 'merged') && session.mergedSha && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMobileSheet(null);
+                    setUndoPubReason('');
+                    setShowUndoPubModal(true);
+                  }}
+                  className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-red-700"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                  Undo publication
+                </button>
+              )}
+
+              {session.status === 'merged' && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setMobileSheet(null);
+                    await api.retryDeploy(session.id);
+                    await loadSessionMeta();
+                  }}
+                  className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-amber-900"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  Retry deploy check
+                </button>
+              )}
+
+              {!session.canEdit && session.status !== 'published' && session.status !== 'merged' && (
+                <>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setMobileSheet(null);
+                      const { session: dup } = await api.duplicateSession(session.id);
+                      onOpenSession(dup.id);
+                    }}
+                    className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+                  >
+                    <Copy className="h-4 w-4 text-stone-500" />
+                    Duplicate into my edit
+                  </button>
+                  {user.isAdmin && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setMobileSheet(null);
+                        await api.takeoverSession(session.id);
+                        await loadSessionMeta();
+                      }}
+                      className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-semibold text-stone-900"
+                    >
+                      Take over draft
+                    </button>
+                  )}
+                </>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileSheet(null);
+                  reloadPreview(true);
+                }}
+                className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+              >
+                <RefreshCw className="h-4 w-4 text-stone-500" />
+                Reload preview
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileSheet(null);
+                  setShowDebug(true);
+                }}
+                className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-600"
+              >
+                <Bug className="h-4 w-4 text-stone-500" />
+                Agent debug trace
+              </button>
+            </div>
+          </div>
+        </MobileFullSheet>
+      )}
+
+      {isMobile && mobileSheet === 'checkpoints' && (
+        <MobileFullSheet
+          title="Checkpoint History"
+          subtitle="Restore an earlier save point"
+          onClose={() => setMobileSheet(null)}
+        >
+          {checkpoints.length === 0 ? (
+            <p className="py-8 text-center text-xs text-stone-500">No checkpoints yet.</p>
+          ) : (
+            <div className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">
+              {checkpoints.map((c, idx) => (
+                <div key={c.sha} className="px-4 py-3 text-xs">
+                  {c.isSyncBoundary && (
+                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-teal-700">
+                      Updated from live site · {new Date(c.timestamp).toLocaleDateString()}
+                    </p>
+                  )}
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="font-medium text-stone-900">{c.summary}</p>
+                      <p className="mt-0.5 text-[11px] text-stone-400">
+                        {new Date(c.timestamp).toLocaleTimeString()}
+                      </p>
+                    </div>
+                    {idx > 0 && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setMobileSheet(null);
+                          await handleRestoreCheckpoint(c.sha);
+                        }}
+                        className="min-h-[36px] shrink-0 rounded-lg border border-stone-200 px-3 py-1.5 text-xs font-medium text-stone-700"
+                      >
+                        Restore
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </MobileFullSheet>
+      )}
+
+      {showUndoPubModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[2px]">
+          <form
+            onSubmit={handleConfirmUndoPublication}
+            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-5 shadow-xl space-y-4 sm:p-6"
+          >
+            <div>
+              <h3 className="text-base font-semibold text-stone-900">
+                Undo &ldquo;{session.title}&rdquo;?
+              </h3>
+              <p className="mt-1 text-xs text-stone-500">
+                Prepare an undo draft on top of the latest live site so you can review before publishing.
+              </p>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-stone-700">
+                Reason for undoing (required)
+              </label>
+              <input
+                type="text"
+                required
+                value={undoPubReason}
+                onChange={(e) => setUndoPubReason(e.target.value)}
+                placeholder='e.g. "Wrong service time listed"'
+                className="w-full rounded-xl border border-stone-300 px-3.5 py-2 text-sm focus:border-stone-900 focus:outline-none"
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowUndoPubModal(false)}
+                className="min-h-[40px] rounded-lg px-3.5 py-2 text-xs font-medium text-stone-600 hover:bg-stone-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!undoPubReason.trim() || undoPubBusy}
+                className="min-h-[40px] rounded-lg bg-stone-900 px-4 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+              >
+                {undoPubBusy ? 'Preparing undo…' : 'Review & undo'}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
 
       {showNewPageModal && (

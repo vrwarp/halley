@@ -224,4 +224,96 @@ describe('ScreenshotService', () => {
       await svc.close();
     }
   });
+
+  it('captures mobile and desktop Live vs Draft review screenshots clipped to 2400px with per-viewport shots', async () => {
+    const visitedUrls: string[] = [];
+    const contextViewports: Array<{ width: number; height: number }> = [];
+    const screenshotCalls: Array<Record<string, unknown>> = [];
+
+    const svc = new ScreenshotService({
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      launchBrowser: async () =>
+        Object.assign(new EventEmitter(), {
+          isConnected: () => true,
+          newContext: async (opts: { viewport: { width: number; height: number } }) => {
+            contextViewports.push(opts.viewport);
+            return {
+              newPage: async () => ({
+                goto: async (url: string) => {
+                  visitedUrls.push(url);
+                  return { status: () => 200 };
+                },
+                waitForTimeout: async () => {},
+                title: async () => 'Events',
+                evaluate: async (fnOrExpr: unknown) => {
+                  if (typeof fnOrExpr === 'string') return 3200; // exceeds 2400px clip cap
+                  return [
+                    {
+                      x: 10,
+                      y: 50,
+                      width: 80,
+                      height: 10,
+                      kind: 'draft',
+                      file: 'src/pages/events.astro',
+                    },
+                  ];
+                },
+                screenshot: async (opts: Record<string, unknown>) => {
+                  screenshotCalls.push(opts);
+                  return Buffer.from('review-jpg');
+                },
+              }),
+              close: async () => {},
+            };
+          },
+          close: async () => {},
+        }) as unknown as Browser,
+    });
+
+    try {
+      const mobilePages = await svc.captureLiveVsDraftPages({
+        routes: ['/events'],
+        draftFiles: ['src/pages/events.astro'],
+        mergedFromLiveFiles: [],
+        draftBaseUrl: 'http://ws-1:4321/p/s1',
+        liveBaseUrl: 'https://example.org',
+        liveTimestamp: '11:30 AM',
+        viewport: 'mobile',
+      });
+
+      expect(mobilePages).toHaveLength(1);
+      expect(contextViewports[0]).toEqual({ width: 390, height: 844 });
+      expect(visitedUrls).toEqual(['http://ws-1:4321/p/s1/events', 'https://example.org/events']);
+      expect(screenshotCalls[0]).toEqual({
+        type: 'jpeg',
+        quality: 80,
+        fullPage: true,
+        clip: { x: 0, y: 0, width: 390, height: 2400 },
+      });
+      expect(mobilePages[0]!.viewport).toBe('mobile');
+      expect(mobilePages[0]!.shots?.mobile?.width).toBe(390);
+      expect(mobilePages[0]!.shots?.mobile?.height).toBe(2400);
+      expect(mobilePages[0]!.shots?.mobile?.draftScreenshotDataUrl).toContain('data:image/jpeg;base64,');
+      expect(mobilePages[0]!.shots?.mobile?.liveScreenshotDataUrl).toContain('data:image/jpeg;base64,');
+      expect(mobilePages[0]!.shots?.mobile?.highlights).toHaveLength(1);
+
+      const desktopPages = await svc.captureLiveVsDraftPages({
+        routes: ['/events'],
+        draftFiles: ['src/pages/events.astro'],
+        mergedFromLiveFiles: [],
+        draftBaseUrl: 'http://ws-1:4321/p/s1',
+        liveBaseUrl: null,
+        liveTimestamp: '11:30 AM',
+        viewport: 'desktop',
+      });
+
+      expect(desktopPages).toHaveLength(1);
+      expect(contextViewports[1]).toEqual({ width: 1280, height: 800 });
+      expect(desktopPages[0]!.shots?.desktop?.draftScreenshotDataUrl).toContain('data:image/jpeg;base64,');
+      expect(desktopPages[0]!.shots?.desktop?.liveScreenshotDataUrl).toBeUndefined();
+    } finally {
+      await svc.close();
+    }
+  });
 });

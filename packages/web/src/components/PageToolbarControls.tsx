@@ -13,6 +13,8 @@ interface Props {
   currentRoute: string;
   currentRouteEntry?: SiteRouteEntryDto;
   canEdit: boolean;
+  viewport?: 'desktop' | 'tablet' | 'mobile';
+  inlineMobile?: boolean;
   onVisibilityChanged: (route: string, unlisted: boolean) => Promise<void>;
   onRenamed: (newRoute: string) => Promise<void>;
 }
@@ -22,6 +24,8 @@ export function PageToolbarControls({
   currentRoute,
   currentRouteEntry,
   canEdit,
+  viewport,
+  inlineMobile = false,
   onVisibilityChanged,
   onRenamed,
 }: Props) {
@@ -101,7 +105,7 @@ export function PageToolbarControls({
     setError(null);
     try {
       const nextUnlisted = !isUnlisted;
-      await api.setPageVisibility(sessionId, currentRoute, nextUnlisted);
+      await api.setPageVisibility(sessionId, currentRoute, nextUnlisted, viewport);
       setOpenPopover(null);
       await onVisibilityChanged(currentRoute, nextUnlisted);
     } catch (err) {
@@ -128,43 +132,53 @@ export function PageToolbarControls({
   };
 
   return (
-    <div className="relative flex items-center gap-1">
-      {/* 1. Change hidden / unlisted status */}
-      <button
-        type="button"
-        onClick={() => {
-          setError(null);
-          setOpenPopover((v) => (v === 'visibility' ? null : 'visibility'));
-        }}
-        title={isUnlisted ? 'Page is unlisted — click to change visibility' : 'Page is public — click to hide/unlist'}
-        className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-          isUnlisted
-            ? 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
-            : 'border-stone-200 bg-white text-stone-600 hover:border-stone-300 hover:text-stone-900'
-        }`}
-      >
-        {isUnlisted ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-        <span className="hidden md:inline">{isUnlisted ? 'Unlisted' : 'Public'}</span>
-      </button>
+    <div className={inlineMobile ? 'space-y-2.5' : 'relative flex items-center gap-1'}>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {/* 1. Change hidden / unlisted status */}
+        <button
+          type="button"
+          onClick={() => {
+            setError(null);
+            setOpenPopover((v) => (v === 'visibility' ? null : 'visibility'));
+          }}
+          title={isUnlisted ? 'Page is unlisted — click to change visibility' : 'Page is public — click to hide/unlist'}
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+            isUnlisted
+              ? 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
+              : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300 hover:text-stone-900'
+          } ${inlineMobile ? 'min-h-[38px]' : 'px-2 py-1 text-[11px]'}`}
+        >
+          {isUnlisted ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          <span className={inlineMobile ? '' : 'hidden md:inline'}>
+            {isUnlisted ? 'Unlisted' : 'Public'}
+          </span>
+        </button>
 
-      {/* 2. Change page URL / path */}
-      <button
-        type="button"
-        onClick={() => void openRenamePopover()}
-        title="Change page URL"
-        aria-label="Change page URL"
-        className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-          openPopover === 'rename'
-            ? 'border-amber-400 bg-amber-50 text-amber-900'
-            : 'border-stone-200 bg-white text-stone-600 hover:border-stone-300 hover:text-stone-900'
-        }`}
-      >
-        <Pencil className="h-3 w-3" />
-        <span className="hidden lg:inline">Rename URL</span>
-      </button>
+        {/* 2. Change page URL / path */}
+        <button
+          type="button"
+          onClick={() => void openRenamePopover()}
+          title="Change page URL"
+          aria-label="Change page URL"
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+            openPopover === 'rename'
+              ? 'border-amber-400 bg-amber-50 text-amber-900'
+              : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300 hover:text-stone-900'
+          } ${inlineMobile ? 'min-h-[38px]' : 'px-2 py-1 text-[11px]'}`}
+        >
+          <Pencil className="h-3.5 w-3.5" />
+          <span className={inlineMobile ? '' : 'hidden lg:inline'}>Rename URL</span>
+        </button>
+      </div>
 
       {openPopover === 'visibility' && (
-        <div className="absolute left-0 top-9 z-40 w-72 rounded-xl border border-stone-200 bg-white p-3 shadow-lg space-y-2.5">
+        <div
+          className={
+            inlineMobile
+              ? 'rounded-xl border border-stone-200 bg-white p-3 space-y-2.5'
+              : 'absolute left-0 top-9 z-40 w-72 rounded-xl border border-stone-200 bg-white p-3 shadow-lg space-y-2.5'
+          }
+        >
           <div>
             <p className="text-xs font-semibold text-stone-900">
               {isUnlisted ? 'This page is currently unlisted' : 'This page is currently public'}
@@ -181,7 +195,7 @@ export function PageToolbarControls({
               type="button"
               disabled={busy}
               onClick={() => setOpenPopover(null)}
-              className="rounded-lg px-2.5 py-1 text-xs text-stone-500 hover:bg-stone-100"
+              className="rounded-lg px-2.5 py-1.5 text-xs text-stone-500 hover:bg-stone-100"
             >
               Cancel
             </button>
@@ -189,7 +203,7 @@ export function PageToolbarControls({
               type="button"
               disabled={busy}
               onClick={() => void handleToggleVisibility()}
-              className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-3 py-1 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+              className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
             >
               {busy && <Loader2 className="h-3 w-3 animate-spin" />}
               {isUnlisted ? 'Make public' : 'Make unlisted'}
@@ -201,7 +215,11 @@ export function PageToolbarControls({
       {openPopover === 'rename' && (
         <form
           onSubmit={handleRenameSubmit}
-          className="absolute left-0 top-9 z-40 w-80 rounded-xl border border-stone-200 bg-white p-3 shadow-lg space-y-2.5"
+          className={
+            inlineMobile
+              ? 'rounded-xl border border-stone-200 bg-white p-3 space-y-2.5'
+              : 'absolute left-0 top-9 z-40 w-80 rounded-xl border border-stone-200 bg-white p-3 shadow-lg space-y-2.5'
+          }
         >
           <p className="text-xs font-semibold text-stone-900">Change page URL</p>
           <div className="space-y-2">
@@ -251,14 +269,14 @@ export function PageToolbarControls({
               type="button"
               disabled={busy}
               onClick={() => setOpenPopover(null)}
-              className="rounded-lg px-2.5 py-1 text-xs text-stone-500 hover:bg-stone-100"
+              className="rounded-lg px-2.5 py-1.5 text-xs text-stone-500 hover:bg-stone-100"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={!validation?.valid || busy}
-              className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-3 py-1 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+              className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
             >
               {busy && <Loader2 className="h-3 w-3 animate-spin" />}
               Update URL

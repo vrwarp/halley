@@ -14,6 +14,7 @@ const VERIFY_PHASES = [
 
 export function PreviewVerifyingOverlay({ reason }: Props) {
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [showMobileDetails, setShowMobileDetails] = useState(false);
 
   useEffect(() => {
     const started = Date.now();
@@ -30,20 +31,24 @@ export function PreviewVerifyingOverlay({ reason }: Props) {
     <div
       role="status"
       aria-live="polite"
-      className="absolute inset-0 z-20 flex items-center justify-center bg-[#FAF9F7]/92 px-6 backdrop-blur-[3px] transition-opacity duration-300"
+      className="absolute inset-0 z-20 flex items-center justify-center bg-[#FAF9F7]/92 px-4 backdrop-blur-[3px] transition-opacity duration-300 sm:px-6"
     >
-      <div className="w-full max-w-sm rounded-2xl border border-[#E7E5E4] bg-white/95 p-7 text-center shadow-sm">
-        <div className="relative mx-auto flex h-14 w-14 items-center justify-center">
+      <div className="w-full max-w-sm rounded-2xl border border-[#E7E5E4] bg-white/95 p-5 text-center shadow-sm sm:p-7">
+        <div className="relative mx-auto flex h-12 w-12 items-center justify-center sm:h-14 sm:w-14">
           <div className="absolute inset-0 rounded-full bg-amber-500/10 animate-ping" style={{ animationDuration: '2.4s' }} />
           <div className="absolute inset-0 rounded-full border-2 border-stone-200" />
           <div className="absolute inset-0 animate-spin rounded-full border-2 border-transparent border-t-amber-600" />
           <ShieldCheck className="h-5 w-5 text-amber-700" />
         </div>
 
-        <h2 className="mt-5 font-serif text-xl text-stone-900">
-          {reason || 'Running pre-publish checks…'}
+        <h2 className="mt-4 font-serif text-lg text-stone-900 sm:mt-5 sm:text-xl">
+          <span className="sm:hidden">Checking build…</span>
+          <span className="hidden sm:inline">{reason || 'Running pre-publish checks…'}</span>
         </h2>
-        <p className="mt-1.5 text-xs leading-relaxed text-stone-500">
+        <p className="mt-1 text-xs font-medium text-stone-600 sm:hidden">
+          {VERIFY_PHASES[activePhase]} · <span className="font-mono text-stone-400">{elapsedSec}s</span>
+        </p>
+        <p className="mt-1.5 hidden text-xs leading-relaxed text-stone-500 sm:block">
           Live preview is briefly paused so the production build gets full memory. It will return automatically.
         </p>
 
@@ -54,7 +59,21 @@ export function PreviewVerifyingOverlay({ reason }: Props) {
           />
         </div>
 
-        <ol className="mt-5 space-y-2 border-t border-stone-100 pt-4 text-left">
+        <div className="mt-3 sm:hidden">
+          <button
+            type="button"
+            onClick={() => setShowMobileDetails((v) => !v)}
+            className="text-[11px] font-medium text-stone-500 underline"
+          >
+            {showMobileDetails ? 'Hide details' : 'Details'}
+          </button>
+        </div>
+
+        <ol
+          className={`mt-4 space-y-2 border-t border-stone-100 pt-4 text-left sm:mt-5 ${
+            showMobileDetails ? 'block' : 'hidden sm:block'
+          }`}
+        >
           {VERIFY_PHASES.map((label, idx) => {
             const done = idx < activePhase;
             const active = idx === activePhase;
@@ -83,7 +102,7 @@ export function PreviewVerifyingOverlay({ reason }: Props) {
           })}
         </ol>
 
-        <p className="mt-4 font-mono text-[11px] text-stone-400">
+        <p className="mt-4 hidden font-mono text-[11px] text-stone-400 sm:block">
           Elapsed {elapsedSec}s
         </p>
       </div>

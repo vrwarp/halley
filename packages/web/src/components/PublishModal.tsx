@@ -29,12 +29,16 @@ interface Props {
   onChangedFilesUpdated: () => Promise<void>;
 }
 
-const STEPS: Array<{ key: string; label: string }> = [
-  { key: 'verifying', label: 'Checking links, SEO & page build' },
-  { key: 'rebasing', label: 'Syncing with current live website' },
-  { key: 'waiting_ci', label: 'Verifying on GitHub' },
-  { key: 'deploying_pages', label: 'Live on GitHub ✓ — deploying to website (~1 min)' },
-  { key: 'published', label: 'Published to Live Site ✓' },
+const STEPS: Array<{ key: string; label: string; shortLabel: string }> = [
+  { key: 'verifying', label: 'Checking links, SEO & page build', shortLabel: 'Checking build' },
+  { key: 'rebasing', label: 'Syncing with current live website', shortLabel: 'Syncing live site' },
+  { key: 'waiting_ci', label: 'Verifying on GitHub', shortLabel: 'Verifying on GitHub' },
+  {
+    key: 'deploying_pages',
+    label: 'Live on GitHub ✓ — deploying to website (~1 min)',
+    shortLabel: 'Deploying (~1 min)',
+  },
+  { key: 'published', label: 'Published to Live Site ✓', shortLabel: 'Published ✓' },
 ];
 
 export function PublishModal({
@@ -46,15 +50,24 @@ export function PublishModal({
   onStartNewEdit,
   onChangedFilesUpdated,
 }: Props) {
+  const isPhone = typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches;
   const [title, setTitle] = useState(session.title);
   const [cards, setCards] = useState<ChangeCardDto[]>([]);
-  const [pages, setPages] = useState<VisualDiffPageDto[]>([]);
+  const [activeViewport, setActiveViewport] = useState<'mobile' | 'desktop'>(
+    isPhone ? 'mobile' : 'desktop',
+  );
+  const [pagesByViewport, setPagesByViewport] = useState<
+    Partial<Record<'mobile' | 'desktop', VisualDiffPageDto[]>>
+  >({});
+  const [screenshotsEnabled, setScreenshotsEnabled] = useState(isPhone);
   const [mergeReview, setMergeReview] = useState<MergeReviewStateDto | null>(null);
   const [excludedPaths, setExcludedPaths] = useState<Record<string, boolean>>({});
   const [loadingChanges, setLoadingChanges] = useState(true);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
+  const [showMobileProgressSteps, setShowMobileProgressSteps] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [publishElapsedSec, setPublishElapsedSec] = useState(0);
 
   const state = publishProgress?.state ?? session.publishState;
   const prUrl = publishProgress?.prUrl ?? session.prUrl;
@@ -62,18 +75,34 @@ export function PublishModal({
   const checks: VerificationCheckResult[] = publishProgress?.checks ?? [];
   const isUndoMode = session.kind === 'revert';
 
-  const loadReview = async (withScreenshots = false) => {
-    if (withScreenshots) setLoadingScreenshots(true);
+  const fetchScreenshotsFor = async (vp: 'mobile' | 'desktop') => {
+    setLoadingScreenshots(true);
+    setScreenshotsEnabled(true);
     try {
-      const rev = await api.getReview(session.id, withScreenshots);
+      const rev = await api.getReview(session.id, true, vp);
       setCards(rev.cards);
-      if (rev.pages.length > 0) setPages(rev.pages);
       if (rev.mergeReview) setMergeReview(rev.mergeReview);
+      setPagesByViewport((prev) => ({ ...prev, [vp]: rev.pages }));
     } catch {
       // ignore
     } finally {
-      setLoadingChanges(false);
       setLoadingScreenshots(false);
+    }
+  };
+
+  const loadReview = async (opts?: { invalidateScreenshots?: boolean }) => {
+    try {
+      const rev = await api.getReview(session.id, false, activeViewport);
+      setCards(rev.cards);
+      if (rev.mergeReview) setMergeReview(rev.mergeReview);
+      if (opts?.invalidateScreenshots) {
+        setPagesByViewport({});
+      }
+      return rev;
+    } catch {
+      return null;
+    } finally {
+      setLoadingChanges(false);
     }
   };
 
@@ -92,8 +121,11 @@ export function PublishModal({
           // Non-fatal in offline/dev mode
         }
       }
-      if (active) {
-        await loadReview(false);
+      if (!active) return;
+      await loadReview();
+      // Auto-load mobile screenshots non-blockingly on phones; desktop stays opt-in
+      if (active && isPhone) {
+        void fetchScreenshotsFor('mobile');
       }
     })();
     return () => {
@@ -103,7 +135,11 @@ export function PublishModal({
 
   useEffect(() => {
     if (state === 'failed_conflict') {
-      void loadReview(false);
+      void loadReview({ invalidateScreenshots: true }).then(() => {
+        if (screenshotsEnabled || isPhone) {
+          void fetchScreenshotsFor(activeViewport);
+        }
+      });
     }
   }, [state]);
 
@@ -140,8 +176,18 @@ export function PublishModal({
 
   const handleRevertFile = async (filePath: string) => {
     await api.revertFile(session.id, filePath);
-    await loadReview(false);
+    await loadReview({ invalidateScreenshots: true });
     await onChangedFilesUpdated();
+    if (screenshotsEnabled || isPhone) {
+      void fetchScreenshotsFor(activeViewport);
+    }
+  };
+
+  const handleSelectViewport = (vp: 'mobile' | 'desktop') => {
+    setActiveViewport(vp);
+    if (!pagesByViewport[vp]) {
+      void fetchScreenshotsFor(vp);
+    }
   };
 
   const isInFlight =
@@ -151,6 +197,18 @@ export function PublishModal({
     );
   const isFailed = ['failed_checks', 'failed_conflict', 'failed_ci'].includes(state);
   const isPublished = state === 'published';
+
+  useEffect(() => {
+    if (!isInFlight) {
+      setPublishElapsedSec(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => {
+      setPublishElapsedSec(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isInFlight]);
 
   const activeStepIdx = (() => {
     if (state === 'verifying') return 0;
@@ -162,11 +220,19 @@ export function PublishModal({
   })();
 
   const changes = includedCards;
+  const activePages = pagesByViewport[activeViewport] ?? [];
+  const activeStepDef = STEPS[Math.max(0, Math.min(STEPS.length - 1, activeStepIdx))];
+  const progressPct = isPublished
+    ? 100
+    : Math.min(95, Math.max(12, Math.round(((Math.max(0, activeStepIdx) + 0.5) / STEPS.length) * 100)));
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[2px]">
-      <div className="w-full max-w-3xl rounded-2xl border border-[#E7E5E4] bg-white shadow-xl">
-        <div className="flex items-center justify-between border-b border-stone-100 px-6 py-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 sm:p-4 backdrop-blur-[2px]">
+      <div className="flex h-dvh w-full flex-col bg-white sm:h-auto sm:max-h-[92vh] sm:max-w-3xl sm:rounded-2xl sm:border sm:border-[#E7E5E4] sm:shadow-xl">
+        <div
+          className="flex shrink-0 items-center justify-between border-b border-stone-100 px-4 py-3 sm:px-6 sm:py-4"
+          style={{ paddingTop: 'max(0.75rem, env(safe-area-inset-top))' }}
+        >
           <h2 className="text-base font-semibold text-stone-900">
             {isPublished
               ? 'Published to Live Site'
@@ -174,16 +240,19 @@ export function PublishModal({
                 ? 'Review & Undo Publication'
                 : 'Review & Publish Changes'}
           </h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          {!isInFlight && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close publish modal"
+              className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
         </div>
 
-        <div className="max-h-[78vh] overflow-y-auto px-6 py-5 space-y-5">
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5 sm:max-h-[78vh] sm:px-6 sm:py-5">
           {!isInFlight && !isPublished && (
             <>
               <div>
@@ -208,23 +277,31 @@ export function PublishModal({
                     review={mergeReview}
                     onUpdated={(next) => {
                       setMergeReview(next);
-                      void loadReview(false);
+                      void loadReview({ invalidateScreenshots: true }).then(() => {
+                        if (screenshotsEnabled || isPhone) {
+                          void fetchScreenshotsFor(activeViewport);
+                        }
+                      });
                     }}
                     onUndone={() => {
                       setMergeReview(null);
-                      void loadReview(false);
+                      void loadReview({ invalidateScreenshots: true }).then(() => {
+                        if (screenshotsEnabled || isPhone) {
+                          void fetchScreenshotsFor(activeViewport);
+                        }
+                      });
                     }}
                   />
                 )}
 
               {loadingChanges ? (
                 <p className="flex items-center gap-2 text-xs text-stone-400">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Syncing with live site & loading visual review…
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Syncing with live site &amp; loading changes…
                 </p>
               ) : (
                 <VisualReview
                   cards={cards}
-                  pages={pages}
+                  pages={activePages}
                   isUndoMode={isUndoMode}
                   defaultShowTechnical={persona === 'developer'}
                   excludedPaths={excludedPaths}
@@ -232,33 +309,73 @@ export function PublishModal({
                     setExcludedPaths((prev) => ({ ...prev, [filePath]: !inc }))
                   }
                   onRevertFile={(filePath) => void handleRevertFile(filePath)}
-                  onRequestScreenshots={() => void loadReview(true)}
+                  onRequestScreenshots={() => void fetchScreenshotsFor(activeViewport)}
                   loadingScreenshots={loadingScreenshots}
+                  screenshotViewport={activeViewport}
+                  onSelectScreenshotViewport={handleSelectViewport}
+                  screenshotsEnabled={screenshotsEnabled}
                 />
               )}
             </>
           )}
 
           {(isInFlight || isPublished) && (
-            <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4">
-              {STEPS.map((step, idx) => {
-                const done = isPublished || idx < activeStepIdx;
-                const active = !isPublished && idx === activeStepIdx;
-                return (
-                  <div key={step.key} className="flex items-center gap-3 text-sm">
-                    {done ? (
+            <div className="rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 space-y-3">
+              {/* Terse mobile progress header */}
+              <div className="sm:hidden space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                    {isPublished ? (
                       <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    ) : active ? (
-                      <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
                     ) : (
-                      <div className="h-4 w-4 shrink-0 rounded-full border border-stone-300 bg-white" />
+                      <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
                     )}
-                    <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
-                      {step.label}
-                    </span>
+                    <span>{activeStepDef?.shortLabel ?? 'Publishing…'}</span>
                   </div>
-                );
-              })}
+                  {!isPublished && (
+                    <span className="font-mono text-xs text-stone-400">
+                      {Math.max(1, activeStepIdx + 1)}/{STEPS.length} · {publishElapsedSec}s
+                    </span>
+                  )}
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-stone-200">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      isPublished ? 'bg-emerald-600' : 'bg-amber-600'
+                    }`}
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowMobileProgressSteps((v) => !v)}
+                  className="text-[11px] font-medium text-stone-500 underline"
+                >
+                  {showMobileProgressSteps ? 'Hide details' : 'Details'}
+                </button>
+              </div>
+
+              {/* Full step list (always visible on sm+, collapsible on mobile) */}
+              <div className={`space-y-3 ${showMobileProgressSteps ? 'block pt-2 border-t border-stone-200 sm:pt-0 sm:border-t-0' : 'hidden sm:block'}`}>
+                {STEPS.map((step, idx) => {
+                  const done = isPublished || idx < activeStepIdx;
+                  const active = !isPublished && idx === activeStepIdx;
+                  return (
+                    <div key={step.key} className="flex items-center gap-3 text-sm">
+                      {done ? (
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                      ) : active ? (
+                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
+                      ) : (
+                        <div className="h-4 w-4 shrink-0 rounded-full border border-stone-300 bg-white" />
+                      )}
+                      <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
+                        {step.label}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -299,7 +416,7 @@ export function PublishModal({
                   await onAskHalleyToFix(errorMsg || 'Publish checks failed', logs);
                   onClose();
                 }}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800"
+                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800"
               >
                 <Sparkles className="h-3.5 w-3.5" />
                 Ask Halley to fix
@@ -317,8 +434,8 @@ export function PublishModal({
                 {showDetails ? 'Hide technical details' : 'Technical details'}
               </button>
               {showDetails && (
-                <div className="mt-2 flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                  <span>Branch: {session.workingBranch}</span>
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                  <span className="truncate">Branch: {session.workingBranch}</span>
                   <span>·</span>
                   <a
                     href={prUrl}
@@ -334,29 +451,34 @@ export function PublishModal({
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2.5 border-t border-stone-100 px-6 py-4">
+        <div
+          className="flex shrink-0 items-center justify-end gap-2.5 border-t border-stone-100 bg-white px-4 py-3 sm:px-6 sm:py-4"
+          style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}
+        >
           {isPublished ? (
             <button
               type="button"
               onClick={onStartNewEdit}
-              className="rounded-xl bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+              className="min-h-[42px] rounded-xl bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
             >
               Start new edit
             </button>
           ) : (
             <>
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded-xl px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100"
-              >
-                Close
-              </button>
+              {!isInFlight && (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="min-h-[42px] rounded-xl px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100"
+                >
+                  Close
+                </button>
+              )}
               <button
                 type="button"
                 disabled={isInFlight || changes.length === 0 || hasPendingChoices}
                 onClick={handlePublish}
-                className="rounded-xl bg-stone-900 px-5 py-2 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
+                className="min-h-[42px] rounded-xl bg-stone-900 px-5 py-2 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
               >
                 {isInFlight
                   ? 'Publishing…'

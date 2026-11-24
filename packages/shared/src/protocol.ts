@@ -55,6 +55,7 @@ export type PostMessageToPreview =
       mode: PreviewMode;
       readOnly: boolean;
       persona?: 'non-technical' | 'developer';
+      touchLayout?: boolean;
     }
   | { type: 'halley:lock'; locked: boolean; reason?: string }
   | { type: 'halley:reload'; force?: boolean }
@@ -72,7 +73,11 @@ export type PostMessageFromPreview =
   | { type: 'halley:element-context'; context: ElementContext; rect?: PreviewRect }
   | { type: 'halley:patch-saved'; file: string; loc: string; summary: string }
   | { type: 'halley:route-changed'; route: string; fullPath: string; title: string }
-  | { type: 'halley:edit-error'; message: string };
+  | { type: 'halley:edit-error'; message: string }
+  /** Sent whenever an element selection opens or closes in the preview (used to hide mobile chat bubble). */
+  | { type: 'halley:selection-changed'; active: boolean }
+  /** Sent on pointerdown/touchstart inside the preview iframe so mobile floating chat card can dismiss cleanly. */
+  | { type: 'halley:preview-pointerdown' };
 
 export const SessionStatusSchema = z.enum([
   'starting',
@@ -535,6 +540,14 @@ export interface VisualDiffHighlightDto {
   file?: string;
 }
 
+export interface VisualDiffViewportShotDto {
+  liveScreenshotDataUrl?: string;
+  draftScreenshotDataUrl?: string;
+  highlights: VisualDiffHighlightDto[];
+  width?: number;
+  height?: number;
+}
+
 export interface VisualDiffPageDto {
   route: string;
   title: string;
@@ -543,6 +556,11 @@ export interface VisualDiffPageDto {
   mobileLiveScreenshotDataUrl?: string;
   mobileDraftScreenshotDataUrl?: string;
   highlights: VisualDiffHighlightDto[];
+  shots?: {
+    desktop?: VisualDiffViewportShotDto;
+    mobile?: VisualDiffViewportShotDto;
+  };
+  viewport?: 'desktop' | 'mobile';
   liveTimestamp: string;
 }
 

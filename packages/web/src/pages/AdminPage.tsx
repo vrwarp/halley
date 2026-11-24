@@ -160,9 +160,9 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
 
           <div className="mt-4 divide-y divide-stone-100 rounded-xl border border-stone-200">
             {todaySpend.map((u) => (
-              <div key={u.userId} className="flex items-center justify-between px-4 py-3 text-sm">
-                <div>
-                  <p className="font-medium text-stone-900">
+              <div key={u.userId} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm">
+                <div className="min-w-0">
+                  <p className="font-medium text-stone-900 break-words">
                     {u.name} <span className="text-xs text-stone-400">({u.email})</span>
                   </p>
                   <p className="text-xs text-stone-500">
@@ -175,7 +175,7 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
                     await api.grantExtra(u.userId, 10);
                     await load();
                   }}
-                  className="rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-50"
+                  className="min-h-[38px] shrink-0 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-50"
                 >
                   Grant +$10 today
                 </button>
@@ -198,24 +198,24 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
         </section>
 
         {/* All Sessions */}
-        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-6">
+        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-4 sm:p-6">
           <h2 className="text-base font-semibold text-stone-900">All Sessions ({sessions.length})</h2>
           <div className="mt-4 divide-y divide-stone-100 rounded-xl border border-stone-200">
             {sessions.map((s) => (
-              <div key={s.id} className="flex items-center justify-between px-4 py-3 text-sm">
-                <div>
+              <div key={s.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm">
+                <div className="min-w-0">
                   <button
                     type="button"
                     onClick={() => onOpenSession(s.id)}
-                    className="font-medium text-stone-900 hover:text-amber-700"
+                    className="text-left font-medium text-stone-900 hover:text-amber-700"
                   >
                     {s.title}
                   </button>
-                  <p className="text-xs text-stone-500">
+                  <p className="text-xs text-stone-500 break-all">
                     {s.ownerName} · {s.status} · {s.workingBranch}
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex shrink-0 items-center gap-2">
                   {s.status === 'running' && (
                     <button
                       type="button"
@@ -223,7 +223,7 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
                         await api.sleepSession(s.id);
                         await load();
                       }}
-                      className="rounded-lg border border-stone-200 px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
+                      className="min-h-[36px] rounded-lg border border-stone-200 px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
                     >
                       Sleep
                     </button>
@@ -234,9 +234,9 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
                       await api.deleteSession(s.id);
                       await load();
                     }}
-                    className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-red-600"
+                    className="flex h-9 w-9 items-center justify-center rounded text-stone-400 hover:bg-stone-100 hover:text-red-600"
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <Trash2 className="h-4 w-4" />
                   </button>
                 </div>
               </div>

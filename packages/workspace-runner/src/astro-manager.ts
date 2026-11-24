@@ -22,6 +22,27 @@ export async function detectAstroBase(repoRoot: string): Promise<string> {
   return '/';
 }
 
+export async function detectAstroSiteUrl(repoRoot: string): Promise<string | null> {
+  for (const name of ['astro.config.mjs', 'astro.config.ts', 'astro.config.js']) {
+    try {
+      const content = await fs.readFile(path.join(repoRoot, name), 'utf8');
+      const siteMatch = content.match(/\bsite\s*:\s*['"](https?:\/\/[^'"]+)['"]/);
+      if (!siteMatch?.[1]) continue;
+      const site = siteMatch[1].replace(/\/+$/, '');
+      const baseMatch = content.match(/\bbase\s*:\s*['"]([^'"]+)['"]/);
+      let base = '';
+      if (baseMatch?.[1]) {
+        const b = baseMatch[1].startsWith('/') ? baseMatch[1] : `/${baseMatch[1]}`;
+        base = b === '/' ? '' : b.replace(/\/+$/, '');
+      }
+      return `${site}${base}`;
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
 export function computePreviewBase(sessionId: string, originalBase: string): string {
   const suffix = originalBase === '/' ? '' : originalBase;
   return `/p/${sessionId}${suffix}`;

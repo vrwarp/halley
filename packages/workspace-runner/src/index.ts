@@ -14,7 +14,7 @@ import {
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { AstroDevManager } from './astro-manager.js';
+import { AstroDevManager, detectAstroSiteUrl } from './astro-manager.js';
 import {
   createCheckpoint,
   ensureGitRerere,
@@ -365,10 +365,13 @@ async function main() {
       const result = await pageService.createPage(body, { capped, isBusy });
 
       if (!capped && piRuntime) {
+        const reqViewport = (body.editorContext as { viewport?: 'desktop' | 'tablet' | 'mobile' } | undefined)
+          ?.viewport;
         await piRuntime.submitPageCreationRequest(
           result.pageRequest,
           result.instructions,
           isBusy ? 'followUp' : undefined,
+          reqViewport,
         );
       }
 
@@ -400,7 +403,10 @@ async function main() {
   app.post('/internal/pages/:pageRequestId/retry', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     const id = c.req.param('pageRequestId')!;
-    const body = (await c.req.json().catch(() => ({}))) as { capped?: boolean };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      capped?: boolean;
+      viewport?: 'desktop' | 'tablet' | 'mobile';
+    };
     const existing = pageService.getPageRequest(id);
     if (!existing) return c.json({ error: 'Page request not found' }, 404);
     if (body.capped) {
@@ -414,6 +420,7 @@ async function main() {
         updated,
         existing.instructions,
         isBusy ? 'followUp' : undefined,
+        body.viewport,
       );
     }
     return c.json({ ok: true, pageRequest: updated });
@@ -436,14 +443,19 @@ async function main() {
 
   app.post('/internal/pages/visibility', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    const body = (await c.req.json()) as { route: string; unlisted: boolean; capped?: boolean };
+    const body = (await c.req.json()) as {
+      route: string;
+      unlisted: boolean;
+      capped?: boolean;
+      viewport?: 'desktop' | 'tablet' | 'mobile';
+    };
     try {
       const res = await pageService.setPageVisibility(body.route, Boolean(body.unlisted));
       if (res.followUpPrompt && !body.capped && piRuntime) {
         await piRuntime.submitUserInput({
           requestId: `visibility-${Date.now()}`,
           text: res.followUpPrompt,
-          editorContext: { currentRoute: res.route, viewport: 'desktop', mode: 'browse' },
+          editorContext: { currentRoute: res.route, viewport: body.viewport, mode: 'browse' },
           whenBusy: piRuntime.isBusy() ? 'followUp' : undefined,
         });
       }
@@ -1101,6 +1113,8 @@ async function main() {
             .catch(() => [] as string[])
         : [];
 
+    const liveSiteUrl = await detectAstroSiteUrl(REPO_ROOT);
+
     return c.json({
       cards,
       pages: [],
@@ -1108,6 +1122,7 @@ async function main() {
       mergedFromLiveFiles,
       astroReady: astroManager.getStatus().ready,
       previewBase,
+      liveSiteUrl,
       mergeReview: activeMergeState,
       baseSha,
       prevBaseSha: prevBaseSha || null,

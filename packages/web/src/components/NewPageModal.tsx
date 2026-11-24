@@ -205,7 +205,7 @@ export function NewPageModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/40 p-4 backdrop-blur-[1px]"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/40 sm:p-4 backdrop-blur-[1px]"
       onClick={(e) => {
         if (e.target === e.currentTarget && !submitting) onClose();
       }}
@@ -214,9 +214,12 @@ export function NewPageModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-page-modal-title"
-        className="w-full max-w-lg overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xl"
+        className="flex h-dvh w-full flex-col overflow-hidden bg-white sm:h-auto sm:max-h-[92vh] sm:max-w-lg sm:rounded-2xl sm:border sm:border-stone-200 sm:shadow-2xl"
       >
-        <div className="flex items-center justify-between border-b border-stone-100 px-5 py-3.5">
+        <div
+          className="flex shrink-0 items-center justify-between border-b border-stone-100 px-4 py-3 sm:px-5 sm:py-3.5"
+          style={{ paddingTop: 'max(0.75rem, env(safe-area-inset-top))' }}
+        >
           <div className="flex items-center gap-2">
             <FilePlus className="h-4 w-4 text-amber-700" />
             <h2 id="new-page-modal-title" className="text-sm font-semibold text-stone-900">
@@ -227,14 +230,14 @@ export function NewPageModal({
             type="button"
             onClick={onClose}
             disabled={submitting}
-            className="rounded-lg p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
             aria-label="Close"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="max-h-[82vh] overflow-y-auto px-5 py-4 space-y-4">
+        <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto px-4 py-4 space-y-4 sm:max-h-[82vh] sm:px-5">
           {/* Title */}
           <div>
             <label className="block text-xs font-medium text-stone-700 mb-1" htmlFor="new-page-title">

@@ -790,4 +790,114 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       await browser.close();
     }
   });
+
+  it('supports phone-sized (390x844, touch) editor: 2-step tap-to-edit, Ask Halley compact card, and auto-loaded mobile publish screenshots', async () => {
+    const baseUrl = `http://127.0.0.1:${cpPort}`;
+    const shotsDir = process.env.HALLEY_CAPTURE_MOBILE_SHOTS_DIR;
+    if (shotsDir) {
+      await fs.mkdir(shotsDir, { recursive: true });
+    }
+    const browser = await chromium.launch({ headless: true });
+
+    let page: import('playwright').Page | null = null;
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        hasTouch: true,
+        isMobile: true,
+      });
+      page = await context.newPage();
+
+      // 1. Sign in on mobile and create a new draft
+      await page.goto(baseUrl, { waitUntil: 'networkidle' });
+      await page.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
+      await page.click('button:has-text("Dev Sign In")');
+      await page.waitForSelector('input[placeholder*="Easter service times"]');
+
+      await page.fill('input[placeholder*="Easter service times"]', 'Mobile E2E Edit');
+      await page.click('button:has-text("New edit")');
+
+      // Wait for preview iframe to boot
+      await page.waitForSelector('iframe', { timeout: 60_000 });
+      const frameLocator = page.frameLocator('iframe');
+      await frameLocator.locator('h1:has-text("Welcome to our community")').waitFor({ timeout: 60_000 });
+
+      // Verify phone layout: full-bleed preview, floating chat bubble visible, no desktop sidebar
+      const bubbleBtn = page.locator('button[aria-label="Open Halley chat"]');
+      await bubbleBtn.waitFor({ state: 'visible', timeout: 10_000 });
+      const asideVisible = await page.locator('aside').isVisible();
+      expect(asideVisible).toBe(false);
+      if (shotsDir) {
+        await page.screenshot({ path: path.join(shotsDir, '01-mobile-editor-bubble.png') });
+      }
+
+      // 2. Switch to Edit mode -> Tap 1 selects paragraph without opening contentEditable
+      await page.click('button:has-text("Edit")');
+      const pEl = frameLocator.locator('p').first();
+      await pEl.click();
+
+      // Fixed bottom touch toolbar appears inside shadow DOM with "Edit text", and bubble hides
+      const editTextBtn = frameLocator.locator('button[data-act="edit"]');
+      await editTextBtn.waitFor({ state: 'visible', timeout: 10_000 });
+      expect(await pEl.getAttribute('contenteditable')).not.toBe('true');
+      await bubbleBtn.waitFor({ state: 'hidden', timeout: 5_000 });
+      if (shotsDir) {
+        await page.screenshot({ path: path.join(shotsDir, '02-mobile-touch-select-bar.png') });
+      }
+
+      // 3. Tap 2 ("Edit text") enters contentEditable, edits text, taps Done -> saves
+      await editTextBtn.click();
+      await page.waitForTimeout(150);
+      expect(await pEl.getAttribute('contenteditable')).toBe('true');
+      await pEl.evaluate((el) => {
+        el.textContent = 'Join us every Sunday morning at 10am — mobile edit saved!';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await frameLocator.locator('button[data-act="done"]').click();
+      await page.waitForTimeout(800);
+      await bubbleBtn.waitFor({ state: 'visible', timeout: 5_000 });
+
+      // 4. Select heading -> tap "Ask Halley…" -> compact floating chat card opens with attached chip
+      await frameLocator.locator('h1').first().click();
+      await frameLocator.locator('button[data-act="ask"]').click();
+
+      const chatDialog = page.locator('[role="dialog"][aria-label="Halley chat"]');
+      await chatDialog.waitFor({ state: 'visible', timeout: 10_000 });
+      await chatDialog.locator('[data-chip-key]').first().waitFor({ state: 'visible', timeout: 5_000 });
+      if (shotsDir) {
+        await page.screenshot({ path: path.join(shotsDir, '03-mobile-compact-chat-card.png') });
+      }
+
+      // Send a prompt from the compact card and wait for Halley's reply
+      const mobileTextarea = chatDialog.locator('textarea');
+      await mobileTextarea.fill('Run checks on the site');
+      await chatDialog.locator('button[aria-label="Send message"]').click();
+      await chatDialog.locator('text=passed all site checks').waitFor({ timeout: 30_000 });
+
+      // Tapping inside the preview closes the compact card
+      await frameLocator.locator('h1').first().click();
+      await chatDialog.waitFor({ state: 'hidden', timeout: 5_000 });
+
+      // Close any element selection before opening Publish
+      const closeSelBtn = frameLocator.locator('button[data-act="close"]');
+      if (await closeSelBtn.isVisible().catch(() => false)) {
+        await closeSelBtn.click();
+      }
+
+      // 5. Open Publish -> change cards render immediately & mobile screenshots auto-load
+      await page.click('button:has-text("Publish")');
+      await page.waitForSelector('text=Review & Publish Changes', { timeout: 10_000 });
+      // Auto-loaded mobile Draft screenshot appears with Mobile | Desktop toggle
+      await page.locator('img[alt^="Draft "]').first().waitFor({ state: 'visible', timeout: 30_000 });
+      await page.waitForSelector('button:has-text("Desktop")', { timeout: 5_000 });
+      if (shotsDir) {
+        await page.screenshot({ path: path.join(shotsDir, '04-mobile-publish-review.png') });
+      }
+    } catch (err) {
+      console.error('=== MOBILE E2E CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      throw err;
+    } finally {
+      await browser.close();
+    }
+  });
 });

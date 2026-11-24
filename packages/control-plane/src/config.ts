@@ -6,6 +6,8 @@ export interface HalleyConfig {
   dataDir: string;
   repo: string; // owner/name
   baseBranch: string;
+  /** Optional override for live site URL used in Live vs Draft screenshots ("none" disables auto-detected URL). */
+  liveSiteUrl: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   githubAppInstallationId: string;
@@ -68,6 +70,7 @@ export function loadConfig(): HalleyConfig {
     dataDir: path.resolve(process.env.DATA_DIR || './data'),
     repo: process.env.HALLEY_REPO || 'vrwarp/thecrossing.website',
     baseBranch: process.env.HALLEY_BASE_BRANCH || 'main',
+    liveSiteUrl: (process.env.HALLEY_LIVE_SITE_URL || '').trim().replace(/\/+$/, ''),
     githubAppId: process.env.GITHUB_APP_ID || '',
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
     githubAppInstallationId: process.env.GITHUB_APP_INSTALLATION_ID || '',
