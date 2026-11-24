@@ -114,64 +114,69 @@ function areChildrenStatic(nodes: AstNode[]): { static: boolean; reason: string 
 
 function findElementAtLoc(
   node: AstNode,
-  source: string,
-  targetLine: number,
-  targetCol: number,
+  buf: Buffer,
+  targetByteOffset: number,
 ): AstNode | null {
   for (const child of node.children ?? []) {
-    const found = findElementAtLoc(child, source, targetLine, targetCol);
+    const found = findElementAtLoc(child, buf, targetByteOffset);
     if (found) return found;
   }
   if ((node.type === 'element' || node.type === 'component') && node.position) {
-    const { line, column, offset } = node.position.start;
-    if (line === targetLine && Math.abs(column - targetCol) <= 2) {
+    const { offset } = node.position.start;
+    if (Math.abs(offset - targetByteOffset) <= 2) {
       return node;
     }
     // Astro 5 emits data-astro-source-loc at the closing `>` of the opening tag.
-    // Check if (targetLine, targetCol) falls within the opening tag span.
-    const gtOffset = findOpeningTagEndOffset(source, offset, node.position.end?.offset ?? source.length);
-    if (gtOffset !== null) {
-      const targetOffset = lineColToOffset(source, targetLine, targetCol);
-      if (targetOffset >= offset && targetOffset <= gtOffset + 1) {
-        return node;
-      }
+    // Check if targetByteOffset falls within the opening tag byte span.
+    const gtByteOffset = findOpeningTagEndByteOffset(
+      buf,
+      offset,
+      node.position.end?.offset ?? buf.length,
+    );
+    if (gtByteOffset !== null && targetByteOffset >= offset && targetByteOffset <= gtByteOffset + 1) {
+      return node;
     }
   }
   return null;
 }
 
-function lineColToOffset(source: string, line: number, col: number): number {
+/**
+ * Converts a 1-based line and 1-based UTF-8 byte column (as emitted by @astrojs/compiler)
+ * into a 0-based UTF-8 byte offset.
+ */
+function lineByteColToByteOffset(buf: Buffer, line: number, byteCol: number): number {
   let curLine = 1;
   let i = 0;
-  while (i < source.length && curLine < line) {
-    if (source[i] === '\n') curLine++;
+  while (i < buf.length && curLine < line) {
+    if (buf[i] === 0x0a) curLine++; // '\n'
     i++;
   }
-  return i + (col - 1);
+  return Math.min(buf.length, i + Math.max(0, byteCol - 1));
 }
 
-function findOpeningTagEndOffset(source: string, startOffset: number, endOffset: number): number | null {
+function findOpeningTagEndByteOffset(buf: Buffer, startOffset: number, endOffset: number): number | null {
   let i = startOffset;
   let inSingle = false;
   let inDouble = false;
   let inBacktick = false;
   let braceDepth = 0;
-  while (i < endOffset) {
-    const ch = source[i]!;
-    const prev = i > 0 ? source[i - 1] : '';
+  const max = Math.min(endOffset, buf.length);
+  while (i < max) {
+    const ch = buf[i]!;
+    const prev = i > 0 ? buf[i - 1]! : 0;
     if (inSingle) {
-      if (ch === "'" && prev !== '\\') inSingle = false;
+      if (ch === 0x27 && prev !== 0x5c) inSingle = false; // ' and \
     } else if (inDouble) {
-      if (ch === '"' && prev !== '\\') inDouble = false;
+      if (ch === 0x22 && prev !== 0x5c) inDouble = false; // " and \
     } else if (inBacktick) {
-      if (ch === '`' && prev !== '\\') inBacktick = false;
+      if (ch === 0x60 && prev !== 0x5c) inBacktick = false; // ` and \
     } else {
-      if (ch === "'") inSingle = true;
-      else if (ch === '"') inDouble = true;
-      else if (ch === '`') inBacktick = true;
-      else if (ch === '{') braceDepth++;
-      else if (ch === '}' && braceDepth > 0) braceDepth--;
-      else if (ch === '>' && braceDepth === 0) return i;
+      if (ch === 0x27) inSingle = true;
+      else if (ch === 0x22) inDouble = true;
+      else if (ch === 0x60) inBacktick = true;
+      else if (ch === 0x7b) braceDepth++; // {
+      else if (ch === 0x7d && braceDepth > 0) braceDepth--; // }
+      else if (ch === 0x3e && braceDepth === 0) return i; // >
     }
     i++;
   }
@@ -179,55 +184,36 @@ function findOpeningTagEndOffset(source: string, startOffset: number, endOffset:
 }
 
 /**
- * Finds the offset immediately after the opening tag `>` and immediately before `</tagName>`.
- * Returns null for self-closing/void tags.
+ * Finds the JS string index immediately after the opening tag `>` and immediately before `</tagName>`,
+ * converting from @astrojs/compiler's UTF-8 byte offsets so multi-byte characters (em-dashes, quotes,
+ * non-ASCII text) never shift spans. Returns null for self-closing/void tags.
  */
 function computeInnerSpan(
-  source: string,
+  buf: Buffer,
   node: AstNode,
 ): { innerStartOffset: number; innerEndOffset: number } | null {
   if (!node.position?.start || !node.position.end || !node.name) return null;
-  const startOffset = node.position.start.offset;
-  const endOffset = node.position.end.offset;
-  if (endOffset <= startOffset || endOffset > source.length) return null;
+  const startByte = node.position.start.offset;
+  const endByte = node.position.end.offset;
+  if (endByte <= startByte || endByte > buf.length) return null;
 
-  // Walk forward from startOffset to find the closing `>` of the opening tag,
-  // respecting quotes and `{...}` braces.
-  let i = startOffset;
-  let inSingle = false;
-  let inDouble = false;
-  let inBacktick = false;
-  let braceDepth = 0;
-
-  while (i < endOffset) {
-    const ch = source[i]!;
-    const prev = i > 0 ? source[i - 1] : '';
-    if (inSingle) {
-      if (ch === "'" && prev !== '\\') inSingle = false;
-    } else if (inDouble) {
-      if (ch === '"' && prev !== '\\') inDouble = false;
-    } else if (inBacktick) {
-      if (ch === '`' && prev !== '\\') inBacktick = false;
-    } else {
-      if (ch === "'") inSingle = true;
-      else if (ch === '"') inDouble = true;
-      else if (ch === '`') inBacktick = true;
-      else if (ch === '{') braceDepth++;
-      else if (ch === '}' && braceDepth > 0) braceDepth--;
-      else if (ch === '>' && braceDepth === 0) {
-        if (i > 0 && source[i - 1] === '/') {
-          return null; // Self-closing tag
-        }
-        const innerStartOffset = i + 1;
-        const closingTag = `</${node.name}`;
-        const closingIdx = source.lastIndexOf(closingTag, endOffset);
-        if (closingIdx < innerStartOffset) return null;
-        return { innerStartOffset, innerEndOffset: closingIdx };
-      }
-    }
-    i++;
+  const gtByte = findOpeningTagEndByteOffset(buf, startByte, endByte);
+  if (gtByte === null) return null;
+  if (gtByte > 0 && buf[gtByte - 1] === 0x2f) {
+    return null; // Self-closing `/>`
   }
-  return null;
+
+  const innerStartByte = gtByte + 1;
+  const elementUtf8 = buf.subarray(innerStartByte, endByte).toString('utf8');
+  const closingTag = `</${node.name}`;
+  const closingRelCharIdx = elementUtf8.lastIndexOf(closingTag);
+  if (closingRelCharIdx < 0) return null;
+
+  const prefixChars = buf.subarray(0, innerStartByte).toString('utf8').length;
+  return {
+    innerStartOffset: prefixChars,
+    innerEndOffset: prefixChars + closingRelCharIdx,
+  };
 }
 
 export async function inspectAstroElement(
@@ -237,9 +223,11 @@ export async function inspectAstroElement(
   const parsedLoc = parseLoc(loc);
   if (!parsedLoc) return null;
 
+  const buf = Buffer.from(source, 'utf8');
+  const targetByteOffset = lineByteColToByteOffset(buf, parsedLoc.line, parsedLoc.column);
   const result = await parse(source, { position: true });
   const root = result.ast as unknown as AstNode;
-  const node = findElementAtLoc(root, source, parsedLoc.line, parsedLoc.column);
+  const node = findElementAtLoc(root, buf, targetByteOffset);
   if (!node || !node.name) return null;
 
   // Component tags (uppercase) are always dynamic/agent-edited
@@ -256,7 +244,7 @@ export async function inspectAstroElement(
     };
   }
 
-  const span = computeInnerSpan(source, node);
+  const span = computeInnerSpan(buf, node);
   if (!span) {
     return {
       editability: 'dynamic',

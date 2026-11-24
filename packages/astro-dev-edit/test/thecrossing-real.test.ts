@@ -20,6 +20,16 @@ describe('real thecrossing.website templates', () => {
     const p = await inspectAstroElement(src, '83:11');
     expect(p?.editability).toBe('editable-static');
 
+    // Line 180 (after several multi-byte UTF-8 em/en dashes earlier in index.astro):
+    // <h2 class="mt-2 font-serif text-3xl italic text-stone-900 sm:text-5xl">A multi-generational family in the East Bay.</h2>
+    const lifeH2Start = await inspectAstroElement(src, '180:9');
+    expect(lifeH2Start?.editability).toBe('editable-static');
+    expect(lifeH2Start?.innerSource.trim()).toBe('A multi-generational family in the East Bay.');
+
+    const lifeH2End = await inspectAstroElement(src, '180:80');
+    expect(lifeH2End?.editability).toBe('editable-static');
+    expect(lifeH2End?.innerSource.trim()).toBe('A multi-generational family in the East Bay.');
+
     // Line 68: <BaseLayout title={SITE.name}>
     const comp = await inspectAstroElement(src, '68:1');
     expect(comp?.editability).toBe('dynamic');
