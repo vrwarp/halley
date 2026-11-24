@@ -61,7 +61,9 @@ export type PostMessageToPreview =
   /** Numbered markers for elements currently attached to the chat composer. */
   | { type: 'halley:pins'; pins: Array<{ key: string; n: number }> }
   /** Temporarily highlight an attached element (e.g. while hovering its chip). */
-  | { type: 'halley:highlight'; key: string | null };
+  | { type: 'halley:highlight'; key: string | null }
+  /** Update the live progress text inside a newly created page placeholder. */
+  | { type: 'halley:page-progress'; route: string; status: PageRequestStatus; message?: string };
 
 // Preview Iframe -> Parent
 export type PostMessageFromPreview =
@@ -213,6 +215,7 @@ export interface TranscriptEntryDto {
   toolOutput?: string;
   contextChips?: ElementContext[];
   attachments?: StagedAttachment[];
+  pageRequest?: PageRequestMetadata;
   createdAt?: number;
 }
 
@@ -264,6 +267,15 @@ export type ChatServerMessage =
   | {
       type: 'boot_progress';
       progress: BootProgressDto;
+    }
+  | {
+      type: 'page_request_state';
+      pageRequest: PageRequestMetadata;
+      autoNavigate?: boolean;
+    }
+  | {
+      type: 'page_requests_sync';
+      pageRequests: PageRequestMetadata[];
     }
   | {
       type: 'error';
@@ -396,7 +408,6 @@ export interface DebugTraceDto {
   live: LiveRunStateDto;
   entries: DebugTraceEntryDto[];
 }
-
 export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff';
 
 export type ConflictCategory =
@@ -544,5 +555,245 @@ export interface LiveHistoryEntryDto {
   canUndo: boolean;
   undoDisabledReason?: string;
   volumeExpired?: boolean;
+}
+
+export const HALLEY_PLACEHOLDER_ATTR = 'data-halley-placeholder';
+
+export const PageNavPlacementSchema = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('none') }),
+  z.object({ mode: z.literal('group'), group: z.string().min(1) }),
+]);
+export type PageNavPlacement = z.infer<typeof PageNavPlacementSchema>;
+
+export const PageRequestStatusSchema = z.enum([
+  'created',
+  'queued',
+  'writing',
+  'photo',
+  'menu',
+  'done',
+  'failed',
+  'capped',
+]);
+export type PageRequestStatus = z.infer<typeof PageRequestStatusSchema>;
+
+export const CreatePageRequestSchema = z.object({
+  title: z.string().trim().min(1, 'Page title is required').max(160),
+  slug: z.string().trim().min(1, 'URL slug is required').max(160),
+  section: z.string().trim().default('/'),
+  purpose: z.string().max(4000).optional(),
+  styleLikeRoute: z.string().optional(),
+  nav: PageNavPlacementSchema.default({ mode: 'none' }),
+  unlisted: z.boolean().default(false),
+  attachment: StagedAttachmentSchema.optional(),
+  editorContext: EditorContextSchema.optional(),
+});
+export type CreatePageRequest = z.infer<typeof CreatePageRequestSchema>;
+
+export const PageRequestMetadataSchema = z.object({
+  pageRequestId: z.string(),
+  title: z.string(),
+  route: z.string(),
+  file: z.string(),
+  section: z.string(),
+  purpose: z.string().optional(),
+  styleLikeRoute: z.string().optional(),
+  nav: PageNavPlacementSchema,
+  unlisted: z.boolean(),
+  attachment: StagedAttachmentSchema.optional(),
+  status: PageRequestStatusSchema,
+  error: z.string().optional(),
+  instructions: z.string().optional(),
+  createdAt: z.number().optional(),
+});
+export type PageRequestMetadata = z.infer<typeof PageRequestMetadataSchema>;
+
+export interface SiteRouteEntryDto {
+  route: string;
+  label: string;
+  file?: string;
+  section?: string;
+  unlisted?: boolean;
+  mtimeMs?: number;
+}
+
+export interface PageSectionOptionDto {
+  section: string;
+  label: string;
+  defaultStyleRoute?: string;
+}
+
+export interface PageCreationOptionsDto {
+  sections: PageSectionOptionDto[];
+  routes: SiteRouteEntryDto[];
+  dynamicPatterns: string[];
+  generatedRoutes: string[];
+  navGroups: string[];
+  capped: boolean;
+}
+
+export interface CreatePageResultDto {
+  ok: true;
+  route: string;
+  file: string;
+  pageRequest: PageRequestMetadata;
+  checkpoint?: CheckpointInfo | null;
+  changedFilesCount?: number;
+}
+
+/**
+ * Normalizes a single URL segment: strips diacritics/accents, lowercases,
+ * replaces non-alphanumeric runs with hyphens, and trims leading/trailing hyphens.
+ */
+export function slugifyRouteSegment(raw: string): string {
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+}
+
+/**
+ * Normalizes a slug that may contain slash-separated segments (e.g. "retreats/spring-2026").
+ */
+export function slugifyPagePath(raw: string): string {
+  return raw
+    .split('/')
+    .map((seg) => slugifyRouteSegment(seg))
+    .filter(Boolean)
+    .join('/');
+}
+
+const RESERVED_EXACT_ROUTES = new Set([
+  '/',
+  '/404',
+  '/500',
+  '/index',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/sitemap-index.xml',
+  '/favicon.ico',
+]);
+
+const RESERVED_PREFIXES = ['/api', '/p', '/assets', '/images', '/_astro', '/__editor', '/ws', '/internal'];
+
+function normalizeRoute(route: string): string {
+  const trimmed = route.trim().replace(/\/+$/, '');
+  if (!trimmed || trimmed === '/') return '/';
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function matchesDynamicPattern(route: string, pattern: string): boolean {
+  const rSegs = normalizeRoute(route).split('/').filter(Boolean);
+  const pSegs = normalizeRoute(pattern).split('/').filter(Boolean);
+  for (let i = 0; i < pSegs.length; i++) {
+    const p = pSegs[i]!;
+    if (p.startsWith('[...') && p.endsWith(']')) {
+      return rSegs.length >= i;
+    }
+    if (i >= rSegs.length) return false;
+    if (p.startsWith('[') && p.endsWith(']')) continue;
+    if (p.toLowerCase() !== rSegs[i]!.toLowerCase()) return false;
+  }
+  return rSegs.length === pSegs.length;
+}
+
+export interface ValidateNewPageRouteInput {
+  section: string;
+  slug: string;
+  existingRoutes: string[];
+  dynamicPatterns?: string[];
+  generatedRoutes?: string[];
+}
+
+export interface ValidateNewPageRouteResult {
+  valid: boolean;
+  route: string;
+  normalizedSlug: string;
+  error?: string;
+  collisionRoute?: string;
+}
+
+export function validateNewPageRoute(input: ValidateNewPageRouteInput): ValidateNewPageRouteResult {
+  const cleanSection = normalizeRoute(input.section || '/');
+  const cleanSlug = slugifyPagePath(input.slug || '');
+
+  if (!cleanSlug) {
+    return {
+      valid: false,
+      route: cleanSection === '/' ? '/' : `${cleanSection}/`,
+      normalizedSlug: '',
+      error: 'Enter a URL slug using letters or numbers.',
+    };
+  }
+
+  const route = cleanSection === '/' ? `/${cleanSlug}` : `${cleanSection}/${cleanSlug}`;
+  const lowerRoute = route.toLowerCase();
+
+  if (RESERVED_EXACT_ROUTES.has(lowerRoute)) {
+    return {
+      valid: false,
+      route,
+      normalizedSlug: cleanSlug,
+      error: `\`${route}\` is a reserved site path.`,
+    };
+  }
+
+  for (const prefix of RESERVED_PREFIXES) {
+    if (lowerRoute === prefix || lowerRoute.startsWith(`${prefix}/`)) {
+      return {
+        valid: false,
+        route,
+        normalizedSlug: cleanSlug,
+        error: `Paths under \`${prefix}\` are reserved.`,
+      };
+    }
+  }
+
+  for (const existing of input.existingRoutes) {
+    const norm = normalizeRoute(existing);
+    if (norm.toLowerCase() === lowerRoute) {
+      return {
+        valid: false,
+        route,
+        normalizedSlug: cleanSlug,
+        error: `A page already exists at ${norm}.`,
+        collisionRoute: norm,
+      };
+    }
+  }
+
+  for (const gen of input.generatedRoutes ?? []) {
+    const norm = normalizeRoute(gen);
+    if (norm.toLowerCase() === lowerRoute) {
+      return {
+        valid: false,
+        route,
+        normalizedSlug: cleanSlug,
+        error: `This URL is already used by a generated page (${norm}).`,
+        collisionRoute: norm,
+      };
+    }
+  }
+
+  for (const pattern of input.dynamicPatterns ?? []) {
+    if (matchesDynamicPattern(route, pattern)) {
+      return {
+        valid: false,
+        route,
+        normalizedSlug: cleanSlug,
+        error: `This URL conflicts with dynamic route \`${pattern}\`.`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    route,
+    normalizedSlug: cleanSlug,
+  };
 }
 

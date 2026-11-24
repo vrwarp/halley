@@ -729,6 +729,100 @@ export function createControlPlane(
     return c.json(await res.json(), res.status as 200);
   });
 
+  app.get('/api/sessions/:id/page-options', auth.requireAuth, async (c) => {
+    const user = c.get('user');
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const spend = db.getSpendStatus(user.id);
+    const ep = await driver.ensureRunning(s);
+    const res = await fetch(
+      `${ep.runnerUrl}/internal/page-options?capped=${spend.capped ? 'true' : 'false'}`,
+    );
+    return c.json(await res.json(), res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/pages', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const spend = db.getSpendStatus(check.user.id);
+    const ep = await driver.ensureRunning(check.session);
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const res = await fetch(`${ep.runnerUrl}/internal/pages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, capped: spend.capped }),
+    });
+    const data = (await res.json()) as { changedFilesCount?: number };
+    if (res.ok && typeof data.changedFilesCount === 'number') {
+      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
+    return c.json(data, res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/pages/:pageRequestId/retry', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const spend = db.getSpendStatus(check.user.id);
+    const ep = await driver.ensureRunning(check.session);
+    const pageRequestId = c.req.param('pageRequestId')!;
+    const res = await fetch(
+      `${ep.runnerUrl}/internal/pages/${encodeURIComponent(pageRequestId)}/retry`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ capped: spend.capped }),
+      },
+    );
+    return c.json(await res.json(), res.status as 200);
+  });
+
+  app.delete('/api/sessions/:id/pages', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const ep = await driver.ensureRunning(check.session);
+    const route = c.req.query('route') || '';
+    const res = await fetch(
+      `${ep.runnerUrl}/internal/pages?route=${encodeURIComponent(route)}`,
+      { method: 'DELETE' },
+    );
+    return c.json(await res.json(), res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/pages/visibility', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const spend = db.getSpendStatus(check.user.id);
+    const ep = await driver.ensureRunning(check.session);
+    const body = (await c.req.json()) as Record<string, unknown>;
+    const res = await fetch(`${ep.runnerUrl}/internal/pages/visibility`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, capped: spend.capped }),
+    });
+    const data = (await res.json()) as { changedFilesCount?: number };
+    if (res.ok && typeof data.changedFilesCount === 'number') {
+      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
+    return c.json(data, res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/pages/rename', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const ep = await driver.ensureRunning(check.session);
+    const body = await c.req.json();
+    const res = await fetch(`${ep.runnerUrl}/internal/pages/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json()) as { changedFilesCount?: number };
+    if (res.ok && typeof data.changedFilesCount === 'number') {
+      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
+    return c.json(data, res.status as 200);
+  });
+
   app.get('/api/sessions/:id/changes', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);

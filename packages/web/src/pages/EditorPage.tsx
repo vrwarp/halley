@@ -6,10 +6,12 @@ import type {
   ElementContext,
   LiveRunStateDto,
   MergeReviewStateDto,
+  PageRequestMetadata,
   PostMessageFromPreview,
   PreviewMode,
   PreviewRect,
   PublishProgressPayload,
+  SiteRouteEntryDto,
   SpendStatusDto,
   StagedAttachment,
   TranscriptEntryDto,
@@ -30,6 +32,7 @@ import {
   Monitor,
   MousePointer,
   PenLine,
+  Plus,
   RefreshCw,
   RotateCcw,
   Send,
@@ -46,6 +49,9 @@ import { flyToChip } from '../components/attachFlight.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { ConflictCards } from '../components/ConflictCards.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
+import { NewPageCard, pageStatusText } from '../components/NewPageCard.js';
+import { NewPageModal } from '../components/NewPageModal.js';
+import { PageToolbarControls } from '../components/PageToolbarControls.js';
 import { PublishModal } from '../components/PublishModal.js';
 import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
 
@@ -73,6 +79,8 @@ function friendlyToolLabel(name?: string): string {
     case 'edit':
     case 'write':
       return 'Updated file';
+    case 'create_page':
+      return 'Created starter page';
     case 'bash':
       return 'Ran command';
     case 'process_image':
@@ -121,12 +129,12 @@ export function EditorPage({
   const [mode, setMode] = useState<PreviewMode>('browse');
   const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [currentRoute, setCurrentRoute] = useState('/');
-  const [siteRoutes, setSiteRoutes] = useState<Array<{ route: string; label: string; unlisted?: boolean }>>([]);
+  const [siteRoutes, setSiteRoutes] = useState<SiteRouteEntryDto[]>([]);
   const [showPageSwitcher, setShowPageSwitcher] = useState(false);
   const [routeQuery, setRouteQuery] = useState('');
-  const [showNewPageForm, setShowNewPageForm] = useState(false);
-  const [newPagePath, setNewPagePath] = useState('');
-  const [newPageUnlisted, setNewPageUnlisted] = useState(false);
+  const [showNewPageModal, setShowNewPageModal] = useState(false);
+  const [newPageInitialTitle, setNewPageInitialTitle] = useState('');
+  const [pageRequestsMap, setPageRequestsMap] = useState<Record<string, PageRequestMetadata>>({});
   const [showHistory, setShowHistory] = useState(false);
   const [showPublish, setShowPublish] = useState(initialOpenPublish);
   const [showDebug, setShowDebug] = useState(false);
@@ -351,6 +359,31 @@ export function EditorPage({
             extraGrantedUsd: msg.extraGrantedUsd,
             capped: msg.capped,
           });
+        } else if (msg.type === 'page_request_state') {
+          const pr = msg.pageRequest;
+          setPageRequestsMap((prev) => ({ ...prev, [pr.pageRequestId]: pr }));
+          iframeRef.current?.contentWindow?.postMessage(
+            {
+              type: 'halley:page-progress',
+              route: pr.route,
+              status: pr.status,
+              message: pageStatusText(pr.status),
+            },
+            '*',
+          );
+          if (msg.autoNavigate) {
+            navigatePreviewRef.current(pr.route);
+            void api
+              .getRoutes(sessionId)
+              .then((rt) => setSiteRoutes(rt.routes))
+              .catch(() => {});
+          }
+        } else if (msg.type === 'page_requests_sync') {
+          const next: Record<string, PageRequestMetadata> = {};
+          for (const pr of msg.pageRequests) {
+            next[pr.pageRequestId] = pr;
+          }
+          setPageRequestsMap(next);
         }
       };
 
@@ -383,6 +416,11 @@ export function EditorPage({
         .then((t) => {
           setEntries(t.entries);
           setLive(t.live);
+          if (t.pageRequests) {
+            const next: Record<string, PageRequestMetadata> = {};
+            for (const pr of t.pageRequests) next[pr.pageRequestId] = pr;
+            setPageRequestsMap(next);
+          }
         })
         .catch(() => {});
     };
@@ -532,6 +570,46 @@ export function EditorPage({
     }
     setCurrentRoute(clean);
     setShowPageSwitcher(false);
+  };
+  const navigatePreviewRef = useRef(navigatePreview);
+  navigatePreviewRef.current = navigatePreview;
+
+  // Keep placeholder progress synced whenever the preview lands on a newly created page
+  useEffect(() => {
+    const active = Object.values(pageRequestsMap)
+      .filter((pr) => pr.route === currentRoute)
+      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
+    if (!active) return;
+    iframeRef.current?.contentWindow?.postMessage(
+      {
+        type: 'halley:page-progress',
+        route: active.route,
+        status: active.status,
+        message: pageStatusText(active.status),
+      },
+      '*',
+    );
+  }, [currentRoute, pageRequestsMap]);
+
+  const handleRetryPageRequest = async (pageRequestId: string) => {
+    const res = await api.retryPageRequest(sessionId, pageRequestId);
+    if (res.pageRequest) {
+      setPageRequestsMap((prev) => ({ ...prev, [res.pageRequest!.pageRequestId]: res.pageRequest! }));
+    }
+  };
+
+  const handleDeletePage = async (route: string) => {
+    await api.deletePage(sessionId, route);
+    if (currentRoute === route) {
+      navigatePreview('/');
+    }
+    await loadSessionMeta();
+  };
+
+  const openNewPageWizard = (initialTitle = '') => {
+    setNewPageInitialTitle(initialTitle);
+    setShowPageSwitcher(false);
+    setShowNewPageModal(true);
   };
 
   const focusChipInPreview = (c: ElementContext) => {
@@ -986,7 +1064,7 @@ export function EditorPage({
               </div>
             )}
 
-            {entries.length === 0 && !live.busy && (
+            {entries.length === 0 && Object.keys(pageRequestsMap).length === 0 && !live.busy && (
               <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
                 <div>
                   <p className="font-medium text-stone-900">Ready when you are.</p>
@@ -996,6 +1074,14 @@ export function EditorPage({
                 </div>
                 {session.canEdit && (
                   <div className="flex flex-wrap gap-1.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => openNewPageWizard()}
+                      className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50/70 px-2.5 py-1 text-left text-[11px] font-medium text-amber-900 transition hover:bg-amber-100"
+                    >
+                      <FilePlus className="h-3 w-3" />
+                      Add a new page
+                    </button>
                     {[
                       `What's on this page (${currentRoute})?`,
                       'Add a new upcoming event',
@@ -1017,6 +1103,21 @@ export function EditorPage({
 
             {entries.map((entry) => {
               if (entry.role === 'user') {
+                if (entry.pageRequest) {
+                  const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
+                  return (
+                    <NewPageCard
+                      key={entry.id}
+                      pageRequest={livePr}
+                      persona={persona}
+                      canEdit={session.canEdit}
+                      spendCapped={spend.capped}
+                      onNavigateRoute={navigatePreview}
+                      onRetry={handleRetryPageRequest}
+                      onDelete={handleDeletePage}
+                    />
+                  );
+                }
                 const parsed = parseUserMessageDisplay(entry.text);
                 return (
                   <div key={entry.id} className="flex flex-col items-end gap-1">
@@ -1069,6 +1170,27 @@ export function EditorPage({
                 </div>
               );
             })}
+
+            {(() => {
+              const renderedIds = new Set(
+                entries.map((e) => e.pageRequest?.pageRequestId).filter(Boolean) as string[],
+              );
+              const standalone = Object.values(pageRequestsMap)
+                .filter((pr) => !renderedIds.has(pr.pageRequestId))
+                .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+              return standalone.map((pr) => (
+                <NewPageCard
+                  key={`standalone-${pr.pageRequestId}`}
+                  pageRequest={pr}
+                  persona={persona}
+                  canEdit={session.canEdit}
+                  spendCapped={spend.capped}
+                  onNavigateRoute={navigatePreview}
+                  onRetry={handleRetryPageRequest}
+                  onDelete={handleDeletePage}
+                />
+              ));
+            })()}
 
             {live.activeTools.map((t) => (
               <div
@@ -1363,13 +1485,12 @@ export function EditorPage({
         {/* Right Preview Stage */}
         <main className="flex flex-1 flex-col min-w-0 bg-[#F3F1EE]">
           <div className="flex h-11 shrink-0 items-center justify-between border-b border-[#E7E5E4] bg-[#FAF9F7] px-4">
-            <div className="relative flex items-center gap-2">
+            <div className="relative flex items-center gap-1.5">
               <button
                 type="button"
                 onClick={async () => {
                   const next = !showPageSwitcher;
                   setShowPageSwitcher(next);
-                  setShowNewPageForm(false);
                   if (next) {
                     try {
                       const rt = await api.getRoutes(sessionId);
@@ -1422,78 +1543,54 @@ export function EditorPage({
 
                   {session.canEdit && (
                     <div className="mt-1.5 border-t border-stone-100 pt-1.5">
-                      {!showNewPageForm ? (
-                        <button
-                          type="button"
-                          onClick={() => setShowNewPageForm(true)}
-                          className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-amber-800 hover:bg-amber-50"
-                        >
-                          <FilePlus className="h-3.5 w-3.5" />
-                          New page (or unlisted page)…
-                        </button>
-                      ) : (
-                        <form
-                          onSubmit={(e) => {
-                            e.preventDefault();
-                            const slug = newPagePath.trim().replace(/^\/+/, '');
-                            if (!slug) return;
-                            const prompt = newPageUnlisted
-                              ? `Please create a new unlisted page at \`/${slug}\` (\`src/pages/${slug}.astro\`) using the site's layout and \`url()\`. Keep it unlisted: do NOT link it in navigation menus, mark it \`indexable={false}\` (noindex), and exclude it from the sitemap if \`astro.config.mjs\` uses a sitemap filter.`
-                              : `Please create a new page at \`/${slug}\` (\`src/pages/${slug}.astro\`) using the site's layout and \`url()\`.`;
-                            dispatchClientMessage({
-                              type: 'submit_input',
-                              requestId: crypto.randomUUID(),
-                              text: prompt,
-                              contextChips: [],
-                              attachments: [],
-                              editorContext: {
-                                currentRoute,
-                                viewport,
-                                mode,
-                              },
-                            });
-                            setNewPagePath('');
-                            setNewPageUnlisted(false);
-                            setShowNewPageForm(false);
-                            setShowPageSwitcher(false);
-                          }}
-                          className="space-y-2 p-1.5"
-                        >
-                          <input
-                            type="text"
-                            value={newPagePath}
-                            onChange={(e) => setNewPagePath(e.target.value)}
-                            placeholder="e.g., spring-retreat"
-                            className="w-full rounded-lg border border-stone-300 px-2.5 py-1.5 font-mono text-xs outline-none focus:border-amber-600"
-                          />
-                          <label className="flex items-center gap-2 text-[11px] text-stone-600">
-                            <input
-                              type="checkbox"
-                              checked={newPageUnlisted}
-                              onChange={(e) => setNewPageUnlisted(e.target.checked)}
-                            />
-                            Keep unlisted (hidden from menus &amp; search)
-                          </label>
-                          <div className="flex justify-end gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => setShowNewPageForm(false)}
-                              className="rounded px-2 py-1 text-xs text-stone-500 hover:bg-stone-100"
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              type="submit"
-                              className="rounded bg-stone-900 px-2.5 py-1 text-xs font-semibold text-white hover:bg-stone-800"
-                            >
-                              Create with Halley
-                            </button>
-                          </div>
-                        </form>
-                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const filtered = siteRoutes.filter((r) =>
+                            r.route.toLowerCase().includes(routeQuery.toLowerCase()),
+                          );
+                          const prefill = filtered.length === 0 ? routeQuery.trim() : '';
+                          setRouteQuery('');
+                          openNewPageWizard(prefill);
+                        }}
+                        className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-amber-800 hover:bg-amber-50"
+                      >
+                        <FilePlus className="h-3.5 w-3.5" />
+                        {routeQuery.trim() &&
+                        siteRoutes.filter((r) => r.route.toLowerCase().includes(routeQuery.toLowerCase())).length === 0
+                          ? `New page "${routeQuery.trim()}"…`
+                          : 'New page…'}
+                      </button>
                     </div>
                   )}
                 </div>
+              )}
+
+              <PageToolbarControls
+                sessionId={session.id}
+                currentRoute={currentRoute}
+                currentRouteEntry={siteRoutes.find((r) => r.route === currentRoute)}
+                canEdit={session.canEdit}
+                onVisibilityChanged={async () => {
+                  await loadSessionMeta();
+                  reloadPreview(true);
+                }}
+                onRenamed={async (newRoute) => {
+                  await loadSessionMeta();
+                  navigatePreview(newRoute);
+                }}
+              />
+
+              {session.canEdit && (
+                <button
+                  type="button"
+                  onClick={() => openNewPageWizard()}
+                  title="Create a new page"
+                  className="inline-flex items-center gap-1 rounded-md border border-stone-200 bg-white px-2 py-1 text-[11px] font-medium text-stone-700 hover:border-amber-400 hover:bg-amber-50 hover:text-amber-900"
+                >
+                  <Plus className="h-3 w-3" />
+                  <span>New page</span>
+                </button>
               )}
 
               <button
@@ -1574,6 +1671,28 @@ export function EditorPage({
           </div>
         </main>
       </div>
+      )}
+
+      {showNewPageModal && (
+        <NewPageModal
+          sessionId={session.id}
+          initialTitle={newPageInitialTitle}
+          currentRoute={currentRoute}
+          editorContext={{ currentRoute, viewport, mode }}
+          isBusy={live.busy}
+          spendCapped={spend.capped}
+          onClose={() => setShowNewPageModal(false)}
+          onCreated={(result) => {
+            setShowNewPageModal(false);
+            setPageRequestsMap((prev) => ({
+              ...prev,
+              [result.pageRequest.pageRequestId]: result.pageRequest,
+            }));
+            navigatePreview(result.route);
+            void loadSessionMeta();
+          }}
+          onOpenExistingRoute={(route) => navigatePreview(route)}
+        />
       )}
 
       {showPublish && (

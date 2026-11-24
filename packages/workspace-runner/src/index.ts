@@ -37,6 +37,7 @@ import {
   tryDeterministicResolve,
   type ConflictEvidencePack,
 } from './conflict-protocol.js';
+import { PageCreationService, PageValidationError } from './pages.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import { runAllVerificationChecks } from './verify.js';
@@ -163,6 +164,18 @@ async function main() {
   console.log('[halley-boot] starting_preview');
   const { originalBase, previewBase } = await astroManager.start();
 
+  const pageService = new PageCreationService({
+    repoRoot: REPO_ROOT,
+    stateDir: STATE_DIR,
+    baseBranch: BASE_BRANCH,
+    gitIdentity,
+    fileLock,
+    getAstroPort: () => ASTRO_PORT,
+    getPreviewBase: () => previewBase,
+    onBroadcast: (msg) => broadcast(msg),
+  });
+  await pageService.load();
+
   console.log('[halley-boot] starting_ai');
   piRuntime = new HalleyPiRuntime({
     repoRoot: REPO_ROOT,
@@ -177,6 +190,7 @@ async function main() {
     getPersona: () => persona,
     fileLock,
     uploadManager,
+    pageService,
     onLockChange: (locked, file) => {
       broadcast({ type: 'workspace_lock', locked, file });
     },
@@ -318,6 +332,146 @@ async function main() {
   app.get('/internal/routes', async (c) => {
     const routes = await discoverSiteRoutes(REPO_ROOT);
     return c.json({ routes });
+  });
+
+  app.get('/internal/page-options', async (c) => {
+    const capped = c.req.query('capped') === 'true';
+    const options = await pageService.getPageCreationOptions(capped);
+    return c.json(options);
+  });
+
+  app.post('/internal/pages', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    try {
+      const body = (await c.req.json()) as Record<string, unknown>;
+      const capped = Boolean(body.capped);
+      const isBusy = piRuntime?.isBusy() ?? false;
+      const result = await pageService.createPage(body, { capped, isBusy });
+
+      if (!capped && piRuntime) {
+        await piRuntime.submitPageCreationRequest(
+          result.pageRequest,
+          result.instructions,
+          isBusy ? 'followUp' : undefined,
+        );
+      }
+
+      return c.json(
+        {
+          ok: true,
+          route: result.route,
+          file: result.file,
+          pageRequest: result.pageRequest,
+          checkpoint: result.checkpoint,
+          changedFilesCount: result.changedFilesCount,
+        },
+        201,
+      );
+    } catch (err) {
+      if (err instanceof PageValidationError) {
+        return c.json(
+          { error: err.message, collisionRoute: err.collisionRoute },
+          err.statusCode,
+        );
+      }
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to create page' },
+        400,
+      );
+    }
+  });
+
+  app.post('/internal/pages/:pageRequestId/retry', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const id = c.req.param('pageRequestId')!;
+    const body = (await c.req.json().catch(() => ({}))) as { capped?: boolean };
+    const existing = pageService.getPageRequest(id);
+    if (!existing) return c.json({ error: 'Page request not found' }, 404);
+    if (body.capped) {
+      const updated = await pageService.updateStatus(id, 'capped');
+      return c.json({ ok: true, pageRequest: updated });
+    }
+    const isBusy = piRuntime?.isBusy() ?? false;
+    const updated = await pageService.updateStatus(id, isBusy ? 'queued' : 'writing');
+    if (piRuntime && updated && existing.instructions) {
+      await piRuntime.submitPageCreationRequest(
+        updated,
+        existing.instructions,
+        isBusy ? 'followUp' : undefined,
+      );
+    }
+    return c.json({ ok: true, pageRequest: updated });
+  });
+
+  app.delete('/internal/pages', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const route = c.req.query('route') || ((await c.req.json().catch(() => ({}))) as { route?: string }).route;
+    if (!route) return c.json({ error: 'Missing route' }, 400);
+    try {
+      const res = await pageService.deletePage(route);
+      return c.json(res);
+    } catch (err) {
+      if (err instanceof PageValidationError) {
+        return c.json({ error: err.message }, err.statusCode);
+      }
+      return c.json({ error: err instanceof Error ? err.message : 'Failed to delete page' }, 400);
+    }
+  });
+
+  app.post('/internal/pages/visibility', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const body = (await c.req.json()) as { route: string; unlisted: boolean; capped?: boolean };
+    try {
+      const res = await pageService.setPageVisibility(body.route, Boolean(body.unlisted));
+      if (res.followUpPrompt && !body.capped && piRuntime) {
+        await piRuntime.submitUserInput({
+          requestId: `visibility-${Date.now()}`,
+          text: res.followUpPrompt,
+          editorContext: { currentRoute: res.route, viewport: 'desktop', mode: 'browse' },
+          whenBusy: piRuntime.isBusy() ? 'followUp' : undefined,
+        });
+      }
+      return c.json({
+        ok: true,
+        route: res.route,
+        unlisted: res.unlisted,
+        file: res.file,
+        checkpoint: res.checkpoint,
+        changedFilesCount: res.changedFilesCount,
+      });
+    } catch (err) {
+      if (err instanceof PageValidationError) {
+        return c.json({ error: err.message }, err.statusCode);
+      }
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to update page visibility' },
+        400,
+      );
+    }
+  });
+
+  app.post('/internal/pages/rename', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const body = (await c.req.json()) as {
+      fromRoute: string;
+      toSection: string;
+      toSlug: string;
+    };
+    try {
+      const res = await pageService.renamePage(body);
+      return c.json(res);
+    } catch (err) {
+      if (err instanceof PageValidationError) {
+        return c.json(
+          { error: err.message, collisionRoute: err.collisionRoute },
+          err.statusCode,
+        );
+      }
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to change page URL' },
+        400,
+      );
+    }
   });
 
   app.post('/internal/git/notify-patched', async (c) => {
@@ -975,14 +1129,16 @@ async function main() {
   });
 
   app.get('/internal/transcript', (c) => {
-    return c.json(
-      latestTranscript ?? {
-        type: 'transcript_state',
-        entries: [],
-        live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
-        usageUsd: 0,
-      },
-    );
+    const base = latestTranscript ?? {
+      type: 'transcript_state',
+      entries: [],
+      live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
+      usageUsd: 0,
+    };
+    return c.json({
+      ...base,
+      pageRequests: pageService.listPageRequests(),
+    });
   });
 
   app.get('/internal/debug/trace', (c) => {
@@ -1015,6 +1171,12 @@ async function main() {
     if (latestTranscript) {
       ws.send(JSON.stringify(latestTranscript));
     }
+    ws.send(
+      JSON.stringify({
+        type: 'page_requests_sync',
+        pageRequests: pageService.listPageRequests(),
+      }),
+    );
     ws.on('message', async (raw) => {
       if (readOnly) {
         ws.send(JSON.stringify({ type: 'error', message: 'Session is read-only' }));

@@ -731,6 +731,11 @@ export function buildClientBridgeScript(previewBase: string): string {
         }
       }
       if (needsLoop()) startLoop(); else layout();
+    } else if (msg.type === 'halley:page-progress') {
+      const statusEl = document.querySelector('[data-halley-placeholder-status]');
+      if (statusEl && typeof msg.message === 'string' && msg.message.trim()) {
+        statusEl.textContent = msg.message;
+      }
     } else if (msg.type === 'halley:reload') {
       if (activeEl && !msg.force) return;
       try {
