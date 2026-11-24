@@ -23,6 +23,9 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
       extraGrantedUsd: number;
     }>
   >([]);
+  const [spendByPurpose, setSpendByPurpose] = useState<
+    Array<{ purpose: string; requestCount: number; costUsd: number }>
+  >([]);
   const [sessions, setSessions] = useState<EditorSessionDto[]>([]);
   const [kind, setKind] = useState<'email' | 'domain'>('email');
   const [val, setVal] = useState('');
@@ -32,6 +35,7 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
     setAllowlist(data.allowlist);
     setCapInput(String(data.dailyCapUsd));
     setTodaySpend(data.todaySpend);
+    setSpendByPurpose(data.spendByPurpose ?? []);
     setSessions(data.sessions);
   };
 
@@ -178,6 +182,19 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
               </div>
             ))}
           </div>
+          {spendByPurpose.length > 0 && (
+            <div className="mt-4 flex flex-wrap gap-2">
+              {spendByPurpose.map((p) => (
+                <span
+                  key={p.purpose}
+                  className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs text-stone-700"
+                >
+                  <strong className="capitalize">{p.purpose}</strong>: ${p.costUsd.toFixed(3)} (
+                  {p.requestCount} req{p.requestCount === 1 ? '' : 's'})
+                </span>
+              ))}
+            </div>
+          )}
         </section>
 
         {/* All Sessions */}

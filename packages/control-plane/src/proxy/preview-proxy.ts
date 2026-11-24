@@ -43,11 +43,13 @@ export function createPreviewProxy(
     const session = db.getSession(sessionId);
     if (!session) return c.text('Session not found', 404);
 
-    // Block inline edit patches if viewer is not owner/admin or session is published
+    // Block inline edit patches if viewer is not owner/admin or session is published/merged
     if (
       c.req.method === 'POST' &&
       c.req.path.endsWith('/__editor/patch') &&
-      ((session.owner_user_id !== user.id && !user.isAdmin) || session.status === 'published')
+      ((session.owner_user_id !== user.id && !user.isAdmin) ||
+        session.status === 'published' ||
+        session.status === 'merged')
     ) {
       return c.json({ error: 'Read-only preview' }, 403);
     }

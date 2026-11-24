@@ -76,6 +76,7 @@ export const SessionStatusSchema = z.enum([
   'starting',
   'running',
   'sleeping',
+  'merged',
   'published',
   'error',
 ]);
@@ -107,6 +108,9 @@ export interface BootProgressDto {
   warmHit?: boolean;
 }
 
+export const SessionKindSchema = z.enum(['edit', 'continuation', 'revert']);
+export type SessionKind = z.infer<typeof SessionKindSchema>;
+
 export const PublishStateSchema = z.enum([
   'idle',
   'verifying',
@@ -129,6 +133,7 @@ export const CheckpointInfoSchema = z.object({
   summary: z.string(),
   timestamp: z.string(),
   author: z.string(),
+  isSyncBoundary: z.boolean().optional(),
 });
 export type CheckpointInfo = z.infer<typeof CheckpointInfoSchema>;
 
@@ -300,6 +305,10 @@ export interface EditorSessionDto {
   id: string;
   title: string;
   slug: string;
+  kind: SessionKind;
+  parentSessionId: string | null;
+  revertsSha: string | null;
+  revertReason: string | null;
   ownerUserId: string;
   ownerName: string;
   ownerEmail: string;
@@ -310,16 +319,32 @@ export interface EditorSessionDto {
   baseBranch: string;
   workingBranch: string;
   baseSha: string;
+  prevBaseSha: string | null;
   status: SessionStatus;
   bootProgress?: BootProgressDto | null;
   publishState: PublishState;
   publishError: string | null;
   prNumber: number | null;
   prUrl: string | null;
+  mergedSha: string | null;
+  mergedAt: string | null;
+  archivedAt: string | null;
+  volumeExpired: boolean;
   astroBase: string;
   changedFilesCount: number;
   lastActiveAt: string;
   createdAt: string;
+}
+
+export interface SessionArchiveDto {
+  sessionId: string;
+  transcriptJson: string;
+  handoffSummary: string | null;
+  diffSummary: string;
+  mergedSha: string | null;
+  prUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SpendStatusDto {
@@ -370,5 +395,154 @@ export interface DebugTraceDto {
   usageByModel: Record<string, unknown>;
   live: LiveRunStateDto;
   entries: DebugTraceEntryDto[];
+}
+
+export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff';
+
+export type ConflictCategory =
+  | 'adjacent_disjoint'
+  | 'identical_intent'
+  | 'formatting_vs_content'
+  | 'refinement'
+  | 'moved_refactored'
+  | 'both_added'
+  | 'derived_file'
+  | 'delete_vs_modify'
+  | 'true_contradiction'
+  | 'binary_contradiction';
+
+export type ConflictConfidence = 'high' | 'medium' | 'low';
+
+export interface ConflictOptionDto {
+  id: string;
+  label: string;
+  description: string;
+  recommended?: boolean;
+  previewText?: string;
+  source: 'theirs' | 'ours' | 'combined' | 'custom';
+}
+
+export interface ConflictResolutionRecordDto {
+  id: string;
+  path: string;
+  category: ConflictCategory;
+  confidence: ConflictConfidence;
+  status: 'auto_resolved' | 'needs_review' | 'needs_choice' | 'chosen';
+  explanation: string;
+  evidenceUsed: string[];
+  affectedRoute?: string;
+  options?: ConflictOptionDto[];
+  chosenOptionId?: string;
+  customInstruction?: string;
+  oursPreview?: string;
+  theirsPreview?: string;
+  resolvedPreview?: string;
+  resolvedContent?: string;
+  modelUsed?: string;
+}
+
+export interface UpstreamCommitInfoDto {
+  sha: string;
+  shortSha: string;
+  author: string;
+  date: string;
+  subject: string;
+  files?: string[];
+  touchesProtected?: boolean;
+}
+
+export interface MergeReviewStateDto {
+  mergeId: string;
+  kind: 'sync' | 'publish' | 'revert';
+  status: 'clean' | 'needs_choices' | 'ready_for_review' | 'applied' | 'aborted';
+  preSyncSha: string;
+  prevBaseSha: string;
+  newBaseSha: string;
+  alreadyUpToDate?: boolean;
+  summary: string;
+  records: ConflictResolutionRecordDto[];
+  upstreamCommits: UpstreamCommitInfoDto[];
+  touchedUserFiles: string[];
+  firstPassUsageUsd?: number;
+  advancedAttempt?: {
+    records: ConflictResolutionRecordDto[];
+    usageUsd: number;
+    identicalToFirst: boolean;
+    stoppedAtCeiling?: boolean;
+    message?: string;
+  };
+}
+
+export interface EscalationEstimateDto {
+  estimatedInputTokens: number;
+  aboutUsd: number;
+  upToUsd: number;
+  hardCeilingUsd: number;
+  exceedsCeiling: boolean;
+  remainingBudgetUsd: number;
+  canAfford: boolean;
+  modelLabel: string;
+  conflictCount: number;
+}
+
+export interface ChangeCardDto {
+  id: string;
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked';
+  title: string;
+  route?: string;
+  summary: string;
+  attribution: string;
+  conflictBadge?: 'auto_resolved' | 'needs_review' | 'chosen';
+  overwriteWarning?: string;
+  isImage?: boolean;
+  beforePreview?: string;
+  afterPreview?: string;
+  wordDiff?: Array<{ type: 'equal' | 'add' | 'del'; value: string }>;
+  jsonFields?: Array<{ field: string; before: string; after: string }>;
+  diff: string;
+  included: boolean;
+}
+
+export interface VisualDiffHighlightDto {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  kind: 'draft' | 'merged_from_live';
+  warning?: string;
+  file?: string;
+}
+
+export interface VisualDiffPageDto {
+  route: string;
+  title: string;
+  liveScreenshotDataUrl?: string;
+  draftScreenshotDataUrl?: string;
+  mobileLiveScreenshotDataUrl?: string;
+  mobileDraftScreenshotDataUrl?: string;
+  highlights: VisualDiffHighlightDto[];
+  liveTimestamp: string;
+}
+
+export interface LiveHistoryEntryDto {
+  id: string;
+  source: 'halley' | 'github';
+  sha: string;
+  shortSha: string;
+  title: string;
+  authorName: string;
+  timestamp: string;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  sessionId?: string | null;
+  sessionKind?: SessionKind;
+  parentSessionId?: string | null;
+  revertsSha?: string | null;
+  revertReason?: string | null;
+  revertedBy?: { sessionId: string; authorName: string; timestamp: string; reason: string | null } | null;
+  canUndo: boolean;
+  undoDisabledReason?: string;
+  volumeExpired?: boolean;
 }
 

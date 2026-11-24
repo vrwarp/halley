@@ -1,25 +1,27 @@
 import type {
+  ChangeCardDto,
   EditorSessionDto,
-  GitFileChange,
+  MergeReviewStateDto,
   PublishProgressPayload,
   VerificationCheckResult,
+  VisualDiffPageDto,
 } from '@halley/shared';
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   ExternalLink,
   Loader2,
-  RotateCcw,
   Sparkles,
   X,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { ConflictCards } from './ConflictCards.js';
+import { VisualReview } from './VisualReview.js';
 
 interface Props {
   session: EditorSessionDto;
+  persona?: 'non-technical' | 'developer';
   publishProgress: PublishProgressPayload | null;
   onClose: () => void;
   onAskHalleyToFix: (summary: string, logs?: string) => Promise<void>;
@@ -37,6 +39,7 @@ const STEPS: Array<{ key: string; label: string }> = [
 
 export function PublishModal({
   session,
+  persona = 'non-technical',
   publishProgress,
   onClose,
   onAskHalleyToFix,
@@ -44,9 +47,12 @@ export function PublishModal({
   onChangedFilesUpdated,
 }: Props) {
   const [title, setTitle] = useState(session.title);
-  const [changes, setChanges] = useState<GitFileChange[]>([]);
+  const [cards, setCards] = useState<ChangeCardDto[]>([]);
+  const [pages, setPages] = useState<VisualDiffPageDto[]>([]);
+  const [mergeReview, setMergeReview] = useState<MergeReviewStateDto | null>(null);
+  const [excludedPaths, setExcludedPaths] = useState<Record<string, boolean>>({});
   const [loadingChanges, setLoadingChanges] = useState(true);
-  const [expandedDiff, setExpandedDiff] = useState<string | null>(null);
+  const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -54,27 +60,78 @@ export function PublishModal({
   const prUrl = publishProgress?.prUrl ?? session.prUrl;
   const errorMsg = publishProgress?.error ?? session.publishError;
   const checks: VerificationCheckResult[] = publishProgress?.checks ?? [];
+  const isUndoMode = session.kind === 'revert';
+
+  const loadReview = async (withScreenshots = false) => {
+    if (withScreenshots) setLoadingScreenshots(true);
+    try {
+      const rev = await api.getReview(session.id, withScreenshots);
+      setCards(rev.cards);
+      if (rev.pages.length > 0) setPages(rev.pages);
+      if (rev.mergeReview) setMergeReview(rev.mergeReview);
+    } catch {
+      // ignore
+    } finally {
+      setLoadingChanges(false);
+      setLoadingScreenshots(false);
+    }
+  };
 
   useEffect(() => {
+    let active = true;
     setLoadingChanges(true);
-    api
-      .getChanges(session.id)
-      .then((res) => setChanges(res.changes))
-      .catch(() => {})
-      .finally(() => setLoadingChanges(false));
+    (async () => {
+      // Q21: Sync when opening the Publish modal so conflicts are resolved & reviewed before publishing
+      if (session.canEdit && session.kind !== 'revert') {
+        try {
+          const syncRes = await api.syncSession(session.id, { kind: 'publish' });
+          if (active && syncRes.review) {
+            setMergeReview(syncRes.review);
+          }
+        } catch {
+          // Non-fatal in offline/dev mode
+        }
+      }
+      if (active) {
+        await loadReview(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, [session.id]);
 
+  useEffect(() => {
+    if (state === 'failed_conflict') {
+      void loadReview(false);
+    }
+  }, [state]);
+
+  const includedCards = cards.filter((c) => !excludedPaths[c.path]);
   const plainSummary =
-    changes.length === 0
-      ? 'No file changes detected yet.'
-      : `Updated ${changes.length} file${changes.length === 1 ? '' : 's'}: ${changes
-          .slice(0, 4)
-          .map((c) => c.path.replace(/^src\/pages\//, '').replace(/^public\//, ''))
-          .join(', ')}${changes.length > 4 ? ` and ${changes.length - 4} more` : ''}.`;
+    includedCards.length === 0
+      ? 'No file changes selected yet.'
+      : isUndoMode && session.revertReason
+        ? `Undo publication: ${session.revertReason}`
+        : `Updated ${includedCards.length} file${includedCards.length === 1 ? '' : 's'}: ${includedCards
+            .slice(0, 4)
+            .map((c) => c.path.replace(/^src\/pages\//, '').replace(/^public\//, ''))
+            .join(', ')}${includedCards.length > 4 ? ` and ${includedCards.length - 4} more` : ''}.`;
+
+  const hasPendingChoices = mergeReview?.status === 'needs_choices';
 
   const handlePublish = async () => {
     setSubmitting(true);
     try {
+      // Q16: For partial undo, revert any unticked files back to current main before publishing
+      if (isUndoMode) {
+        const toExclude = Object.entries(excludedPaths)
+          .filter(([, excluded]) => excluded)
+          .map(([p]) => p);
+        for (const p of toExclude) {
+          await api.revertFile(session.id, p);
+        }
+      }
       await api.publish(session.id, title.trim() || session.title, plainSummary);
     } finally {
       setSubmitting(false);
@@ -83,8 +140,7 @@ export function PublishModal({
 
   const handleRevertFile = async (filePath: string) => {
     await api.revertFile(session.id, filePath);
-    const res = await api.getChanges(session.id);
-    setChanges(res.changes);
+    await loadReview(false);
     await onChangedFilesUpdated();
   };
 
@@ -105,12 +161,18 @@ export function PublishModal({
     return -1;
   })();
 
+  const changes = includedCards;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[2px]">
-      <div className="w-full max-w-xl rounded-2xl border border-[#E7E5E4] bg-white shadow-xl">
+      <div className="w-full max-w-3xl rounded-2xl border border-[#E7E5E4] bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-stone-100 px-6 py-4">
           <h2 className="text-base font-semibold text-stone-900">
-            {isPublished ? 'Published to Live Site' : 'Publish Changes'}
+            {isPublished
+              ? 'Published to Live Site'
+              : isUndoMode
+                ? 'Review & Undo Publication'
+                : 'Review & Publish Changes'}
           </h2>
           <button
             type="button"
@@ -121,7 +183,7 @@ export function PublishModal({
           </button>
         </div>
 
-        <div className="max-h-[75vh] overflow-y-auto px-6 py-5 space-y-5">
+        <div className="max-h-[78vh] overflow-y-auto px-6 py-5 space-y-5">
           {!isInFlight && !isPublished && (
             <>
               <div>
@@ -137,63 +199,43 @@ export function PublishModal({
                 <p className="mt-2 text-xs text-stone-500">{plainSummary}</p>
               </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold uppercase tracking-wider text-stone-500">
-                    What changed ({changes.length})
-                  </span>
-                </div>
-                {loadingChanges ? (
-                  <p className="text-xs text-stone-400">Loading changes…</p>
-                ) : changes.length === 0 ? (
-                  <p className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-500">
-                    No unpublished changes yet.
-                  </p>
-                ) : (
-                  <div className="divide-y divide-stone-200 rounded-xl border border-stone-200">
-                    {changes.map((c) => {
-                      const open = expandedDiff === c.path;
-                      return (
-                        <div key={c.path} className="text-xs">
-                          <div className="flex items-center justify-between px-3.5 py-2.5">
-                            <button
-                              type="button"
-                              onClick={() => setExpandedDiff(open ? null : c.path)}
-                              className="flex items-center gap-2 text-left font-medium text-stone-800 hover:text-amber-800"
-                            >
-                              {open ? (
-                                <ChevronDown className="h-3.5 w-3.5 text-stone-400" />
-                              ) : (
-                                <ChevronRight className="h-3.5 w-3.5 text-stone-400" />
-                              )}
-                              <span>{c.path}</span>
-                            </button>
-                            <div className="flex items-center gap-2">
-                              <span className="text-stone-400">
-                                +{c.additions} / -{c.deletions}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => handleRevertFile(c.path)}
-                                title="Undo changes to this file"
-                                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-stone-500 hover:bg-stone-100 hover:text-red-700"
-                              >
-                                <RotateCcw className="h-3 w-3" />
-                                Undo
-                              </button>
-                            </div>
-                          </div>
-                          {open && (
-                            <pre className="max-h-48 overflow-auto border-t border-stone-100 bg-stone-950 p-3 font-mono text-[11px] leading-relaxed text-stone-200">
-                              {c.diff}
-                            </pre>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
+              {mergeReview &&
+                (mergeReview.status === 'needs_choices' ||
+                  mergeReview.status === 'ready_for_review' ||
+                  mergeReview.records.length > 0) && (
+                  <ConflictCards
+                    sessionId={session.id}
+                    review={mergeReview}
+                    onUpdated={(next) => {
+                      setMergeReview(next);
+                      void loadReview(false);
+                    }}
+                    onUndone={() => {
+                      setMergeReview(null);
+                      void loadReview(false);
+                    }}
+                  />
                 )}
-              </div>
+
+              {loadingChanges ? (
+                <p className="flex items-center gap-2 text-xs text-stone-400">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Syncing with live site & loading visual review…
+                </p>
+              ) : (
+                <VisualReview
+                  cards={cards}
+                  pages={pages}
+                  isUndoMode={isUndoMode}
+                  defaultShowTechnical={persona === 'developer'}
+                  excludedPaths={excludedPaths}
+                  onToggleInclude={(filePath, inc) =>
+                    setExcludedPaths((prev) => ({ ...prev, [filePath]: !inc }))
+                  }
+                  onRevertFile={(filePath) => void handleRevertFile(filePath)}
+                  onRequestScreenshots={() => void loadReview(true)}
+                  loadingScreenshots={loadingScreenshots}
+                />
+              )}
             </>
           )}
 
@@ -312,11 +354,15 @@ export function PublishModal({
               </button>
               <button
                 type="button"
-                disabled={isInFlight || changes.length === 0}
+                disabled={isInFlight || changes.length === 0 || hasPendingChoices}
                 onClick={handlePublish}
                 className="rounded-xl bg-stone-900 px-5 py-2 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
               >
-                {isInFlight ? 'Publishing…' : 'Publish to Live Site'}
+                {isInFlight
+                  ? 'Publishing…'
+                  : isUndoMode
+                    ? 'Publish Undo to Live Site'
+                    : 'Publish to Live Site'}
               </button>
             </>
           )}

@@ -41,6 +41,13 @@ export class PublishService {
     const runnerUrl = endpoint.runnerUrl;
 
     try {
+      // 0. Commit any pending inline/working-tree edits so HEAD has the exact draft state
+      await fetch(`${runnerUrl}/internal/git/checkpoint`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary: 'Ready to publish' }),
+      }).catch(() => {});
+
       // 1. Hard-gate verification checks (astro hygiene, check, build, verify:*)
       this.setState(session.id, 'verifying');
       const verifyRes = await fetch(`${runnerUrl}/internal/verify`, { method: 'POST' });
@@ -57,34 +64,80 @@ export class PublishService {
         return;
       }
 
-      // 2. Fetch & rebase onto latest base branch (with Pi conflict resolution)
+      // 2. Q21: Sync with latest base branch; if main moved mid-publish on overlapping/conflicting
+      // files, pause and return to the modal so no unreviewed resolution ever ships.
       this.setState(session.id, 'rebasing', { checks: verifyData.results });
       const ghToken = await this.github.getAccessToken().catch(() => '');
+      let fetchedByDriver = false;
       if (ghToken) {
-        await this.driver.fetchIntoSession(session, ghToken);
+        fetchedByDriver = await this.driver
+          .fetchIntoSession(session, ghToken)
+          .then(() => true)
+          .catch(() => false);
       }
-      const rebaseRes = await fetch(`${runnerUrl}/internal/git/rebase`, {
+
+      const syncRes = await fetch(`${runnerUrl}/internal/sync/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baseBranch: session.base_branch }),
+        body: JSON.stringify({
+          baseBranch: session.base_branch,
+          kind: 'publish',
+          autoSyncOnly: true,
+          skipFetch: fetchedByDriver,
+        }),
       });
-      const rebaseData = (await rebaseRes.json()) as {
-        status: 'clean' | 'resolved' | 'conflict';
-        conflictedFiles: string[];
-        error?: string;
+      const syncData = (await syncRes.json()) as {
+        heldForUser?: boolean;
+        overlapCount?: number;
+        review?: {
+          status: 'clean' | 'applied' | 'ready_for_review' | 'needs_choices';
+          alreadyUpToDate?: boolean;
+          newBaseSha?: string;
+          prevBaseSha?: string;
+          touchedUserFiles?: string[];
+        };
       };
 
-      if (rebaseData.status === 'conflict') {
+      if (syncData.heldForUser) {
+        // Prepare full conflict resolution / decision cards for the Publish modal
+        await fetch(`${runnerUrl}/internal/sync/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baseBranch: session.base_branch,
+            kind: 'publish',
+            autoSyncOnly: false,
+            skipFetch: true,
+          }),
+        }).catch(() => {});
         this.setState(session.id, 'failed_conflict', {
-          conflictedFiles: rebaseData.conflictedFiles,
           error:
-            'Someone else updated the same page while you were editing. Please review the changes before publishing.',
+            'Someone else updated the same page while you were publishing. Please review the combined changes before publishing.',
         });
         return;
       }
 
-      if (rebaseData.status === 'resolved') {
-        // Re-verify after Pi resolved conflicts
+      if (syncData.review?.newBaseSha && syncData.review.status !== 'needs_choices') {
+        this.db.updateSession(session.id, {
+          prev_base_sha: syncData.review.prevBaseSha ?? (session.base_sha || null),
+          base_sha: syncData.review.newBaseSha,
+        });
+      }
+
+      if (
+        syncData.review &&
+        (syncData.review.status === 'ready_for_review' || syncData.review.status === 'needs_choices')
+      ) {
+        this.setState(session.id, 'failed_conflict', {
+          conflictedFiles: syncData.review.touchedUserFiles,
+          error:
+            'Someone just published an update to a page you edited. Please double-check Live vs Draft and click Publish again.',
+        });
+        return;
+      }
+
+      if (syncData.review && !syncData.review.alreadyUpToDate) {
+        // Non-overlapping mid-publish update merged cleanly: re-verify before pushing
         this.setState(session.id, 'verifying');
         const reVerify = await fetch(`${runnerUrl}/internal/verify`, { method: 'POST' });
         const reData = (await reVerify.json()) as {
@@ -153,11 +206,20 @@ export class PublishService {
       });
       if (!mergedSha) return;
 
-      // 6. Poll GitHub Actions / Pages deployment until live
+      // 6. Freeze editing immediately in 'merged' state and archive transcript deterministically ($0 AI)
+      const mergedAt = new Date().toISOString();
       this.db.updateSession(session.id, {
+        status: 'merged',
         merged_sha: mergedSha,
-        merged_at: new Date().toISOString(),
+        merged_at: mergedAt,
       });
+      await fetch(`${runnerUrl}/internal/read-only`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ readOnly: true }),
+      }).catch(() => {});
+      await this.archiveSessionDeterministically(session.id, runnerUrl, session.base_branch, mergedSha, pr.url);
+
       this.setState(session.id, 'deploying_pages', {
         prNumber: pr.number,
         prUrl: pr.url,
@@ -169,6 +231,65 @@ export class PublishService {
         error: err instanceof Error ? err.message : 'Publish failed unexpectedly',
       });
     }
+  }
+
+  async archiveSessionDeterministically(
+    sessionId: string,
+    runnerUrl: string | null,
+    baseBranch: string,
+    mergedSha: string | null,
+    prUrl: string | null,
+  ): Promise<void> {
+    let transcriptJson = JSON.stringify({ entries: [], usageUsd: 0 });
+    let diffSummary = '[]';
+    if (runnerUrl) {
+      try {
+        const tRes = await fetch(`${runnerUrl}/internal/transcript`);
+        if (tRes.ok) {
+          transcriptJson = await tRes.text();
+        }
+      } catch {
+        // best-effort
+      }
+      try {
+        const cRes = await fetch(
+          `${runnerUrl}/internal/git/changes?baseRef=${encodeURIComponent(`origin/${baseBranch}`)}`,
+        );
+        if (cRes.ok) {
+          const data = (await cRes.json()) as {
+            changes?: Array<{ path: string; status: string; additions: number; deletions: number }>;
+          };
+          diffSummary = JSON.stringify(
+            (data.changes ?? []).map((ch) => ({
+              path: ch.path,
+              status: ch.status,
+              additions: ch.additions,
+              deletions: ch.deletions,
+            })),
+          );
+        }
+      } catch {
+        // best-effort
+      }
+    }
+    this.db.upsertSessionArchive({
+      sessionId,
+      transcriptJson,
+      diffSummary,
+      mergedSha,
+      prUrl,
+    });
+  }
+
+  async retryDeployCheck(session: SessionRecord): Promise<void> {
+    if (!session.merged_sha || !session.pr_number || !session.pr_url) {
+      throw new Error('Session does not have a merged commit to verify');
+    }
+    this.setState(session.id, 'deploying_pages', {
+      prNumber: session.pr_number,
+      prUrl: session.pr_url,
+    });
+    await this.waitForPagesDeploy(session.id, session.merged_sha, session.pr_number, session.pr_url);
   }
 
   private async waitForCiAndMerge(opts: {
@@ -256,22 +377,25 @@ export class PublishService {
         return;
       }
       if (status === 'failed') {
+        this.db.updateSession(sessionId, { status: 'merged' });
         this.setState(sessionId, 'failed_ci', {
           prNumber,
           prUrl,
-          error: 'Changes merged to GitHub, but the live site deploy workflow reported an error.',
+          error:
+            'Changes merged to GitHub, but the live site deploy workflow reported an error. Editing is locked; you can retry checking deploy status.',
         });
         return;
       }
       await new Promise((r) => setTimeout(r, 5000));
     }
 
-    // Even if polling timed out after merge, mark published since merge succeeded
-    this.db.updateSession(sessionId, {
-      status: 'published',
-      publish_state: 'published',
-      archived_at: new Date().toISOString(),
+    // Polling timed out after merge: keep session frozen in 'merged' state so user can retry deploy check
+    this.db.updateSession(sessionId, { status: 'merged' });
+    this.setState(sessionId, 'failed_ci', {
+      prNumber,
+      prUrl,
+      error:
+        'Changes merged to GitHub, but the live site deploy is still taking longer than expected. Click Retry deploy check in a moment.',
     });
-    this.setState(sessionId, 'published', { prNumber, prUrl });
   }
 }

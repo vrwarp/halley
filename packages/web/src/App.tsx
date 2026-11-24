@@ -16,7 +16,13 @@ export function App() {
     capped: false,
   });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [openPublishOnLoad, setOpenPublishOnLoad] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
+
+  const openSession = (id: string, opts?: { openPublish?: boolean }) => {
+    setOpenPublishOnLoad(Boolean(opts?.openPublish));
+    setActiveSessionId(id);
+  };
 
   const params = new URLSearchParams(window.location.search);
   const authError = params.get('authError');
@@ -67,7 +73,7 @@ export function App() {
         }}
         onOpenSession={(id) => {
           setShowAdmin(false);
-          setActiveSessionId(id);
+          openSession(id);
         }}
       />
     );
@@ -76,14 +82,17 @@ export function App() {
   if (activeSessionId) {
     return (
       <EditorPage
+        key={activeSessionId}
         sessionId={activeSessionId}
         user={auth.user}
         initialSpend={spend}
+        initialOpenPublish={openPublishOnLoad}
         onBack={() => {
           setActiveSessionId(null);
+          setOpenPublishOnLoad(false);
           void refresh();
         }}
-        onOpenSession={(id) => setActiveSessionId(id)}
+        onOpenSession={(id, opts) => openSession(id, opts)}
       />
     );
   }
@@ -94,7 +103,7 @@ export function App() {
       repo={auth.repo}
       sessions={sessions}
       spend={spend}
-      onOpenSession={(id) => setActiveSessionId(id)}
+      onOpenSession={(id, opts) => openSession(id, opts)}
       onOpenAdmin={() => setShowAdmin(true)}
       onRefresh={refresh}
       onLogout={async () => {

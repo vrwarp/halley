@@ -120,12 +120,51 @@ export class HalleyPiRuntime {
   private resolvedModelId = '';
   private lastEditorContext: EditorContext | null = null;
   private agentsMdText: string | null = null;
+  private systemContextNotes: string[] = [];
+  private availableModelIds: Array<{ id: string }> = [];
 
   constructor(private opts: PiRuntimeOptions) {}
+
+  getResolvedModelId(): string {
+    return this.resolvedModelId || this.opts.modelId;
+  }
+
+  resolveModelAlias(requestedId: string): string {
+    if (this.availableModelIds.length === 0) return requestedId;
+    return resolveAnthropicModelId(requestedId, this.availableModelIds);
+  }
+
+  isBusy(): boolean {
+    const val = this.watchHandle?.value;
+    if (!val) return false;
+    return this.mapWatchValue(val).live.busy;
+  }
+
+  async reloadAgentsMd(): Promise<void> {
+    const text = await fs
+      .readFile(path.join(this.opts.repoRoot, 'AGENTS.md'), 'utf8')
+      .catch(() => '');
+    this.agentsMdText = text || null;
+  }
+
+  addSystemContextNote(note: string): void {
+    const clean = note.trim();
+    if (!clean) return;
+    this.systemContextNotes.push(clean);
+    if (this.systemContextNotes.length > 10) {
+      this.systemContextNotes.shift();
+    }
+  }
 
   async start(): Promise<void> {
     await fs.mkdir(this.opts.stateDir, { recursive: true });
     const sqlitePath = path.join(this.opts.stateDir, 'pi.sqlite');
+    const handoffText = await fs
+      .readFile(path.join(this.opts.stateDir, 'handoff-context.txt'), 'utf8')
+      .catch(() => '');
+    if (handoffText.trim()) {
+      this.addSystemContextNote(handoffText.trim());
+    }
 
     // Route Anthropic requests through the Control Plane LLM proxy using WORKSPACE_TOKEN.
     // Raw ANTHROPIC_API_KEY never enters the workspace container.
@@ -135,6 +174,7 @@ export class HalleyPiRuntime {
       ...m,
       baseUrl: proxyBaseUrl,
     }));
+    this.availableModelIds = proxiedModels;
     this.resolvedModelId = resolveAnthropicModelId(this.opts.modelId, proxiedModels);
     console.log(
       `[halley-pi] model=${this.opts.modelId} -> ${this.resolvedModelId} (thinking=${this.opts.thinkingLevel})`,
@@ -375,7 +415,12 @@ export class HalleyPiRuntime {
       sections: [
         section('halley_role', () => this.buildHalleyRolePrompt()),
         section('repo_agents_md', () =>
-          agentsMdText ? `Repository AGENTS.md:\n\n${agentsMdText}` : undefined,
+          this.agentsMdText ? `Repository AGENTS.md:\n\n${this.agentsMdText}` : undefined,
+        ),
+        section('halley_context_notes', () =>
+          this.systemContextNotes.length > 0
+            ? `Session & Live-Site Context Notes:\n\n${this.systemContextNotes.map((n) => `- ${n}`).join('\n')}`
+            : undefined,
         ),
       ],
       hooks: [

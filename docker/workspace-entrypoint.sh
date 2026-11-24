@@ -14,8 +14,20 @@ if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
   cd "${WORKSPACE_DIR}"
   git remote set-url origin "https://github.com/${HALLEY_REPO}.git"
   git checkout -B "${HALLEY_WORKING_BRANCH:-halley/standby}" "${HALLEY_BASE_BRANCH}"
+  git config rerere.enabled true
+  git config rerere.autoupdate true
   export HALLEY_BASE_SHA="$(git rev-parse HEAD)"
+else
+  cd "${WORKSPACE_DIR}"
+  git config rerere.enabled true || true
+  git config rerere.autoupdate true || true
+  if [ -z "${HALLEY_BASE_SHA:-}" ]; then
+    export HALLEY_BASE_SHA="$(git rev-parse "origin/${HALLEY_BASE_BRANCH}" 2>/dev/null || git rev-parse HEAD)"
+  fi
+fi
 
+# Install dependencies on first boot or on wake after 7-day node_modules pruning
+if [ ! -d "${WORKSPACE_DIR}/node_modules" ]; then
   echo "[halley-boot] installing_deps"
   if [ -f package-lock.json ]; then
     npm ci --cache /halley-pkg-cache/npm --prefer-offline --ignore-scripts
@@ -23,11 +35,6 @@ if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
     pnpm install --store-dir /halley-pkg-cache/pnpm --frozen-lockfile
   elif [ -f package.json ]; then
     npm install --cache /halley-pkg-cache/npm --prefer-offline --ignore-scripts
-  fi
-else
-  cd "${WORKSPACE_DIR}"
-  if [ -z "${HALLEY_BASE_SHA:-}" ]; then
-    export HALLEY_BASE_SHA="$(git rev-parse "origin/${HALLEY_BASE_BRANCH}" 2>/dev/null || git rev-parse HEAD)"
   fi
 fi
 

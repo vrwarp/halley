@@ -24,6 +24,10 @@ export interface HalleyConfig {
   modelProvider: string;
   modelId: string;
   thinkingLevel: 'off' | 'low' | 'medium' | 'high';
+  conflictModelId: string;
+  escalationModelId: string;
+  escalationThinkingLevel: 'off' | 'low' | 'medium' | 'high';
+  escalationMaxUsd: number;
   dailyCostCapUsd: number;
   workspaceDriver: 'docker' | 'local';
   workspaceImage: string;
@@ -32,6 +36,7 @@ export interface HalleyConfig {
   workspaceIdleTimeoutMs: number;
   browserIdleTimeoutMs: number;
   archiveRetentionDays: number;
+  nodeModulesPruneDays: number;
   warmPoolSize: number;
   devLoginEnabled: boolean;
   devLocalRepo: string;
@@ -80,6 +85,14 @@ export function loadConfig(): HalleyConfig {
     modelProvider: process.env.HALLEY_MODEL_PROVIDER || 'anthropic',
     modelId: process.env.HALLEY_MODEL_ID || 'haiku-latest',
     thinkingLevel: (process.env.HALLEY_THINKING_LEVEL || 'high') as 'off' | 'low' | 'medium' | 'high',
+    conflictModelId: process.env.HALLEY_CONFLICT_MODEL || process.env.HALLEY_MODEL_ID || 'haiku-latest',
+    escalationModelId: process.env.HALLEY_ESCALATION_MODEL || 'opus-latest',
+    escalationThinkingLevel: (process.env.HALLEY_ESCALATION_THINKING || 'medium') as
+      | 'off'
+      | 'low'
+      | 'medium'
+      | 'high',
+    escalationMaxUsd: Number(process.env.HALLEY_ESCALATION_MAX_USD || 2),
     dailyCostCapUsd: Number(process.env.HALLEY_DAILY_COST_CAP_USD || 10),
     workspaceDriver,
     workspaceImage: process.env.WORKSPACE_IMAGE || 'vrwarp/halley-workspace:latest',
@@ -88,7 +101,8 @@ export function loadConfig(): HalleyConfig {
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),
     browserIdleTimeoutMs: Number(process.env.HALLEY_BROWSER_IDLE_TIMEOUT_MS || 60 * 60_000),
-    archiveRetentionDays: Number(process.env.ARCHIVE_RETENTION_DAYS || 7),
+    archiveRetentionDays: Number(process.env.ARCHIVE_RETENTION_DAYS || 420),
+    nodeModulesPruneDays: Number(process.env.NODE_MODULES_PRUNE_DAYS || 7),
     warmPoolSize,
     devLoginEnabled: process.env.HALLEY_DEV_LOGIN === 'true',
     devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || '',
