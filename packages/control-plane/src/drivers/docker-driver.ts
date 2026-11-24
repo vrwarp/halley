@@ -51,9 +51,18 @@ function dockerRequest<T>(
   });
 }
 
+export interface DoctorCheckResult {
+  ok: boolean;
+  warnings: string[];
+  errors: string[];
+  details: Record<string, unknown>;
+}
+
 export class DockerWorkspaceDriver implements WorkspaceDriver {
   private sessionTokens = new Map<string, string>();
   private booting = new Map<string, Promise<WorkspaceEndpoint>>();
+  private pullingImages = new Map<string, Promise<void>>();
+  private resolvedNetwork: string | null = null;
 
   constructor(
     private config: HalleyConfig,
@@ -69,6 +78,172 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     return `halley-ws-${sessionId.slice(0, 12)}`;
   }
 
+  /**
+   * Resolves which user-defined Docker bridge network workspace containers should join.
+   * Priority:
+   * 1. Explicit `WORKSPACE_DOCKER_NETWORK` if configured and present on the Docker daemon.
+   * 2. Auto-detect `control-plane`'s own attached non-default network via container self-inspect.
+   * 3. Auto-create a user-defined bridge network `halley-net`.
+   */
+  async resolveDockerNetwork(): Promise<string> {
+    if (this.resolvedNetwork) return this.resolvedNetwork;
+
+    if (this.config.workspaceDockerNetwork) {
+      const check = await dockerRequest('GET', `/networks/${encodeURIComponent(this.config.workspaceDockerNetwork)}`);
+      if (check.status === 200) {
+        this.resolvedNetwork = this.config.workspaceDockerNetwork;
+        return this.resolvedNetwork;
+      }
+      console.warn(
+        `[halley-docker] Configured WORKSPACE_DOCKER_NETWORK="${this.config.workspaceDockerNetwork}" not found; auto-detecting network…`,
+      );
+    }
+
+    const os = await import('node:os');
+    const self = await dockerRequest<{
+      NetworkSettings?: { Networks?: Record<string, unknown> };
+    }>('GET', `/containers/${encodeURIComponent(os.hostname())}/json`).catch(() => null);
+
+    if (self?.status === 200 && self.data?.NetworkSettings?.Networks) {
+      const attached = Object.keys(self.data.NetworkSettings.Networks).filter(
+        (n) => n !== 'bridge' && n !== 'host' && n !== 'none',
+      );
+      if (attached[0]) {
+        this.resolvedNetwork = attached[0];
+        return this.resolvedNetwork;
+      }
+    }
+
+    const fallback = this.config.workspaceDockerNetwork || 'halley-net';
+    const checkFallback = await dockerRequest('GET', `/networks/${encodeURIComponent(fallback)}`);
+    if (checkFallback.status === 404) {
+      await dockerRequest('POST', '/networks/create', {
+        Name: fallback,
+        Driver: 'bridge',
+      });
+    }
+    this.resolvedNetwork = fallback;
+    return this.resolvedNetwork;
+  }
+
+  /**
+   * Ensures `this.config.workspaceImage` exists locally on the Docker host; if missing,
+   * automatically pulls it via `/images/create` (deduplicated across concurrent boots).
+   */
+  private async ensureImagePresent(image: string): Promise<string | undefined> {
+    const inspect = await dockerRequest<{ Id?: string }>(
+      'GET',
+      `/images/${encodeURIComponent(image)}/json`,
+    );
+    if (inspect.status === 200) return inspect.data?.Id;
+
+    let pullPromise = this.pullingImages.get(image);
+    if (!pullPromise) {
+      console.log(`[halley-docker] Workspace image "${image}" not found locally — pulling from registry…`);
+      pullPromise = new Promise<void>((resolve, reject) => {
+        const req = http.request(
+          {
+            socketPath: '/var/run/docker.sock',
+            path: `/images/create?fromImage=${encodeURIComponent(image)}`,
+            method: 'POST',
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('end', () => {
+              if ((res.statusCode ?? 500) >= 400) {
+                reject(
+                  new Error(
+                    `Failed to pull workspace image "${image}" (HTTP ${res.statusCode}): ${Buffer.concat(chunks).toString('utf8')}`,
+                  ),
+                );
+                return;
+              }
+              console.log(`[halley-docker] Pulled workspace image "${image}" successfully.`);
+              resolve();
+            });
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      }).finally(() => {
+        this.pullingImages.delete(image);
+      });
+      this.pullingImages.set(image, pullPromise);
+    }
+
+    await pullPromise;
+    const after = await dockerRequest<{ Id?: string }>('GET', `/images/${encodeURIComponent(image)}/json`);
+    return after.status === 200 ? after.data?.Id : undefined;
+  }
+
+  async runDoctorChecks(): Promise<DoctorCheckResult> {
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const details: Record<string, unknown> = {
+      workspaceDriver: this.config.workspaceDriver,
+      workspaceImage: this.config.workspaceImage,
+      dataDir: this.config.dataDir,
+    };
+
+    try {
+      const ping = await dockerRequest<{ ApiVersion?: string }>('GET', '/version');
+      if (ping.status !== 200) {
+        errors.push(`Docker daemon returned HTTP ${ping.status} on /var/run/docker.sock`);
+      } else {
+        details.dockerApiVersion = ping.data?.ApiVersion;
+      }
+    } catch (err) {
+      errors.push(
+        `Cannot reach /var/run/docker.sock (${err instanceof Error ? err.message : String(err)}). Mount /var/run/docker.sock:/var/run/docker.sock into control-plane.`,
+      );
+      return { ok: false, warnings, errors, details };
+    }
+
+    const os = await import('node:os');
+    const self = await dockerRequest<{
+      NetworkSettings?: { Networks?: Record<string, unknown> };
+      Mounts?: Array<{ Type: string; Destination: string }>;
+    }>('GET', `/containers/${encodeURIComponent(os.hostname())}/json`).catch(() => null);
+
+    if (self?.status === 200) {
+      const nets = Object.keys(self.data?.NetworkSettings?.Networks ?? {});
+      details.controlPlaneNetworks = nets;
+      if (nets.length === 1 && nets[0] === 'bridge') {
+        errors.push(
+          'control-plane is attached only to Docker default "bridge" network, which disables container-name DNS. Attach control-plane to a user-defined bridge network (e.g. halley-net).',
+        );
+      }
+      const resolvedData = path.resolve(this.config.dataDir);
+      const hasDataMount = (self.data?.Mounts ?? []).some(
+        (m) => resolvedData === path.resolve(m.Destination) || resolvedData.startsWith(path.resolve(m.Destination) + '/'),
+      );
+      details.dataDirMounted = hasDataMount;
+      if (!hasDataMount) {
+        warnings.push(
+          `DATA_DIR (${resolvedData}) is not on a mounted Docker volume/bind-mount — SQLite sessions & spend history will be lost if control-plane is recreated. Mount a persistent volume to /data and keep DATA_DIR=/data.`,
+        );
+      }
+    }
+
+    const imgCheck = await dockerRequest('GET', `/images/${encodeURIComponent(this.config.workspaceImage)}/json`);
+    details.workspaceImagePresent = imgCheck.status === 200;
+    if (imgCheck.status !== 200) {
+      warnings.push(
+        `Workspace image "${this.config.workspaceImage}" is not cached locally yet; Halley will auto-pull it when the first session starts.`,
+      );
+    }
+
+    if (!this.config.anthropicApiKey) {
+      warnings.push('ANTHROPIC_API_KEY is empty — Pi AI chat requests will fail until configured.');
+    }
+    if (!this.config.githubToken && !this.config.githubAppId) {
+      warnings.push('Neither GITHUB_APP_ID nor GITHUB_TOKEN is configured — publishing PRs will fail.');
+    }
+
+    return { ok: errors.length === 0, warnings, errors, details };
+  }
+
   async ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint> {
     const pending = this.booting.get(session.id);
     if (pending) return pending;
@@ -80,14 +255,40 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
 
   private async startOrResume(session: SessionRecord): Promise<WorkspaceEndpoint> {
     const name = this.containerName(session.id);
-    const token = await this.github.getAccessToken().catch(() => '');
+    const token = this.config.devLocalRepo
+      ? ''
+      : await this.github.getAccessToken().catch(() => '');
     const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
-    await ensureBareMirror(mirrorDir, session.repo, token || undefined);
-
-    const inspect = await dockerRequest<{ State?: { Running?: boolean }; Id?: string }>(
-      'GET',
-      `/containers/${name}/json`,
+    await ensureBareMirror(
+      mirrorDir,
+      session.repo,
+      token || undefined,
+      this.config.devLocalRepo || undefined,
     );
+
+    const targetImageId = await this.ensureImagePresent(this.config.workspaceImage);
+    const networkName = await this.resolveDockerNetwork();
+
+    let inspect = await dockerRequest<{
+      State?: { Running?: boolean; Status?: string; ExitCode?: number };
+      Image?: string;
+      Id?: string;
+    }>('GET', `/containers/${name}/json`);
+
+    // Self-heal stale, broken, or outdated stopped containers while preserving the session volume
+    if (inspect.status === 200) {
+      const state = inspect.data?.State;
+      const status = state?.Status || '';
+      const isBrokenState = status === 'created' || status === 'dead' || (!state?.Running && (state?.ExitCode ?? 0) !== 0 && state?.ExitCode !== 137 && state?.ExitCode !== 143);
+      const isOutdatedStopped = !state?.Running && targetImageId && inspect.data?.Image && inspect.data.Image !== targetImageId;
+      if (isBrokenState || isOutdatedStopped) {
+        console.log(
+          `[halley-docker] Recreating container ${name} (status=${status}, exit=${state?.ExitCode ?? 0}, outdated=${Boolean(isOutdatedStopped)}) while preserving volume ${session.volume_name}`,
+        );
+        await dockerRequest('DELETE', `/containers/${name}?force=true`).catch(() => {});
+        inspect = { status: 404, data: {} };
+      }
+    }
 
     if (inspect.status === 404) {
       await dockerRequest('POST', '/volumes/create', { Name: session.volume_name });
@@ -119,7 +320,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         Image: this.config.workspaceImage,
         Env: env,
         HostConfig: {
-          NetworkMode: this.config.workspaceDockerNetwork,
+          NetworkMode: networkName,
           Binds: [
             `${session.volume_name}:/halley-volume`,
             `halley-pkg-cache:/halley-pkg-cache`,
@@ -139,7 +340,10 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     }
 
     if (!inspect.data?.State?.Running) {
-      await dockerRequest('POST', `/containers/${name}/start`);
+      const startRes = await dockerRequest<{ message?: string }>('POST', `/containers/${name}/start`);
+      if (startRes.status >= 400) {
+        throw new Error(`Docker start failed (${startRes.status}): ${JSON.stringify(startRes.data)}`);
+      }
     }
 
     const runnerUrl = `http://${name}:4100`;

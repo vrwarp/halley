@@ -19,6 +19,8 @@ if [ ! -d "${WORKSPACE_DIR}/.git" ]; then
     npm ci --cache /halley-pkg-cache/npm --prefer-offline --ignore-scripts
   elif [ -f pnpm-lock.yaml ]; then
     pnpm install --store-dir /halley-pkg-cache/pnpm --frozen-lockfile
+  elif [ -f package.json ]; then
+    npm install --cache /halley-pkg-cache/npm --prefer-offline --ignore-scripts
   fi
 else
   cd "${WORKSPACE_DIR}"

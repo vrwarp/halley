@@ -41,3 +41,50 @@ jobs:
 
       - name: Run E2E tests (with fakes)
         run: pnpm test:e2e
+
+  docker-smoke:
+    name: Docker-in-Docker Orchestration Smoke Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies (for tsx test runner)
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build halley-control-plane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/control-plane.Dockerfile
+          load: true
+          tags: halley-control-plane:ci-smoke
+          cache-from: type=gha,scope=halley-control-plane
+          cache-to: type=gha,mode=max,scope=halley-control-plane
+
+      - name: Build halley-workspace image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/workspace.Dockerfile
+          load: true
+          tags: halley-workspace:ci-smoke
+          cache-from: type=gha,scope=halley-workspace
+          cache-to: type=gha,mode=max,scope=halley-workspace
+
+      - name: Run Docker-out-of-Docker smoke test
+        run: pnpm test:docker-smoke

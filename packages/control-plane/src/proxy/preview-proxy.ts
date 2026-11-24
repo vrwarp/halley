@@ -36,11 +36,10 @@ export function createPreviewProxy(
   db: ControlPlaneDb,
   driver: WorkspaceDriver,
 ) {
-  const handleHttp = async (c: Context) => {
+  const handleHttpForSession = async (c: Context, sessionId: string) => {
     const user = auth.getUserFromContext(c);
     if (!user) return c.text('Unauthorized', 401);
 
-    const sessionId = c.req.param('sessionId') || '';
     const session = db.getSession(sessionId);
     if (!session) return c.text('Session not found', 404);
 
@@ -114,17 +113,30 @@ export function createPreviewProxy(
     }
   };
 
+  const handleHttp = async (c: Context) => {
+    const sessionId = c.req.param('sessionId') || '';
+    return handleHttpForSession(c, sessionId);
+  };
+
   const handleUpgrade = async (
     req: http.IncomingMessage,
     socket: Duplex,
     head: Buffer,
   ) => {
+    let sessionId = '';
     const match = (req.url ?? '').match(/^\/p\/([^/]+)/);
-    if (!match?.[1]) {
+    if (match?.[1]) {
+      sessionId = match[1];
+    } else {
+      const ref = req.headers.referer || '';
+      const refMatch = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
+      if (refMatch?.[1]) sessionId = refMatch[1];
+    }
+    if (!sessionId) {
       socket.destroy();
       return;
     }
-    const session = db.getSession(match[1]);
+    const session = db.getSession(sessionId);
     if (!session || !session.astro_url) {
       socket.destroy();
       return;
@@ -162,5 +174,5 @@ export function createPreviewProxy(
     proxyReq.end();
   };
 
-  return { handleHttp, handleUpgrade };
+  return { handleHttp, handleHttpForSession, handleUpgrade };
 }

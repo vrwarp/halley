@@ -31,6 +31,7 @@ import {
 import { num, obj, oneOf, opt, str } from '@earendil-works/pi-schema';
 import type { AsyncFileLock } from '@halley/astro-dev-edit';
 import type {
+  EditorContext,
   ElementContext,
   LiveRunStateDto,
   StagedAttachment,
@@ -116,6 +117,7 @@ export class HalleyPiRuntime {
   private images!: Awaited<ReturnType<typeof createNodePhotonImages>>;
   private models = createModels();
   private resolvedModelId = '';
+  private lastEditorContext: EditorContext | null = null;
 
   constructor(private opts: PiRuntimeOptions) {}
 
@@ -538,8 +540,12 @@ export class HalleyPiRuntime {
     text: string;
     contextChips?: ElementContext[];
     attachments?: StagedAttachment[];
+    editorContext?: EditorContext;
     whenBusy?: 'steer' | 'followUp';
   }): Promise<void> {
+    if (input.editorContext) {
+      this.lastEditorContext = input.editorContext;
+    }
     const parts: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
 
     let enrichedText = input.text.trim();

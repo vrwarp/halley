@@ -70,10 +70,23 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
 
   const app = new Hono<Env>();
 
-  // Health
+  // Health & Doctor preflight diagnostics
   app.get('/api/health', (c) =>
     c.json({ ok: true, repo: config.repo, baseBranch: config.baseBranch }),
   );
+
+  app.get('/api/health/doctor', async (c) => {
+    if ('runDoctorChecks' in driver && typeof driver.runDoctorChecks === 'function') {
+      const report = await (driver as DockerWorkspaceDriver).runDoctorChecks();
+      return c.json(report, report.ok ? 200 : 503);
+    }
+    return c.json({
+      ok: true,
+      warnings: [],
+      errors: [],
+      details: { workspaceDriver: config.workspaceDriver, dataDir: config.dataDir },
+    });
+  });
 
   // LLM Proxy (authenticated via WORKSPACE_TOKEN, no user cookie)
   app.all(
@@ -372,6 +385,32 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     return c.json({ ok: true });
   });
 
+  app.post('/api/sessions/:id/prompt', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = await c.req.json();
+    const ep = await driver.ensureRunning(check.session);
+    db.updateSession(check.session.id, { last_active_at: new Date().toISOString() });
+    const res = await fetch(`${ep.runnerUrl}/internal/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({ ok: res.ok }));
+    return c.json(data, res.ok ? 200 : 400);
+  });
+
+  app.get('/api/sessions/:id/transcript', auth.requireAuth, async (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const ep = await driver.ensureRunning(s);
+    const res = await fetch(`${ep.runnerUrl}/internal/transcript`);
+    const data = await res
+      .json()
+      .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }));
+    return c.json(data, res.ok ? 200 : 502);
+  });
+
   app.post('/api/sessions/:id/fix-with-pi', auth.requireAuth, async (c) => {
     const check = await requireSessionEdit(c);
     if ('error' in check) return c.json({ error: check.error }, check.status);
@@ -446,10 +485,29 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     return c.json({ ok: true });
   });
 
-  // Preview Proxy (/p/:sessionId/*)
+  // Preview Proxy (/p/:sessionId/*) + Referer-scoped Vite dev module proxy (/@vite/*, /@fs/*, /src/*, /node_modules/*)
   const previewProxy = createPreviewProxy(auth, db, driver);
   app.all('/p/:sessionId/*', previewProxy.handleHttp);
   app.all('/p/:sessionId', previewProxy.handleHttp);
+
+  app.all('*', async (c, next) => {
+    const p = c.req.path;
+    if (
+      p.startsWith('/@vite/') ||
+      p.startsWith('/@fs/') ||
+      p.startsWith('/@id/') ||
+      p.startsWith('/__astro') ||
+      p.startsWith('/src/') ||
+      p.startsWith('/node_modules/')
+    ) {
+      const ref = c.req.header('referer') || '';
+      const m = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
+      if (m?.[1]) {
+        return previewProxy.handleHttpForSession(c, m[1]);
+      }
+    }
+    return next();
+  });
 
   // Serve built React Web UI in production
   const webRoot = config.webDistDir;
@@ -457,6 +515,10 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
   app.get('*', async (c, next) => {
     if (c.req.path.startsWith('/api/') || c.req.path.startsWith('/p/') || c.req.path.startsWith('/internal/')) {
       return next();
+    }
+    // Never return index.html with text/html for missing static asset extensions
+    if (/\.(?:js|mjs|ts|css|map|wasm|webp|png|jpg|jpeg|svg|ico|woff2?)$/i.test(c.req.path)) {
+      return c.notFound();
     }
     try {
       const html = await fs.readFile(path.join(webRoot, 'index.html'), 'utf8');
@@ -498,6 +560,13 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
       }
       set.add(browserWs);
 
+      // Keep reverse proxies (Synology Nginx, Cloudflare, etc.) from dropping idle WebSockets
+      const pingTimer = setInterval(() => {
+        if (browserWs.readyState === WebSocket.OPEN) {
+          browserWs.ping();
+        }
+      }, 20_000);
+
       // Push current spend & publish status immediately
       const spend = db.getSpendStatus(session.owner_user_id);
       browserWs.send(JSON.stringify({ type: 'spend_status', ...spend }));
@@ -514,10 +583,27 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
       );
 
       let runnerWs: WebSocket | null = null;
+      const pendingMessages: string[] = [];
+
+      browserWs.on('message', (data) => {
+        db.updateSession(sessionId, { last_active_at: new Date().toISOString() });
+        const str = data.toString();
+        if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
+          runnerWs.send(str);
+        } else {
+          pendingMessages.push(str);
+        }
+      });
+
       try {
         const ep = await driver.ensureRunning(session);
         const wsUrl = ep.runnerUrl.replace(/^http/, 'ws') + '/ws';
         runnerWs = new WebSocket(wsUrl);
+        runnerWs.on('open', () => {
+          while (pendingMessages.length > 0 && runnerWs?.readyState === WebSocket.OPEN) {
+            runnerWs.send(pendingMessages.shift()!);
+          }
+        });
         runnerWs.on('error', (err) => {
           if (browserWs.readyState === WebSocket.OPEN) {
             browserWs.send(
@@ -533,22 +619,19 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
             browserWs.send(data.toString());
           }
         });
-        browserWs.on('message', (data) => {
-          db.updateSession(sessionId, { last_active_at: new Date().toISOString() });
-          if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
-            runnerWs.send(data.toString());
-          }
-        });
       } catch (err) {
-        browserWs.send(
-          JSON.stringify({
-            type: 'error',
-            message: err instanceof Error ? err.message : 'Workspace failed to connect',
-          }),
-        );
+        if (browserWs.readyState === WebSocket.OPEN) {
+          browserWs.send(
+            JSON.stringify({
+              type: 'error',
+              message: err instanceof Error ? err.message : 'Workspace failed to connect',
+            }),
+          );
+        }
       }
 
       browserWs.on('close', () => {
+        clearInterval(pingTimer);
         set?.delete(browserWs);
         if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
           runnerWs.close();
@@ -595,4 +678,13 @@ if (isMain) {
   process.on('SIGTERM', shutdown);
 
   console.log(`[halley-control-plane] listening on http://0.0.0.0:${config.port} (repo=${config.repo})`);
+  if ('runDoctorChecks' in cp.driver && typeof cp.driver.runDoctorChecks === 'function') {
+    void (cp.driver as DockerWorkspaceDriver)
+      .runDoctorChecks()
+      .then((report) => {
+        for (const w of report.warnings) console.warn(`[halley-doctor] WARN: ${w}`);
+        for (const e of report.errors) console.error(`[halley-doctor] ERROR: ${e}`);
+      })
+      .catch(() => {});
+  }
 }
