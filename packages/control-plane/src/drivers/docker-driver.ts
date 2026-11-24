@@ -92,30 +92,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     if (inspect.status === 404) {
       await dockerRequest('POST', '/volumes/create', { Name: session.volume_name });
       await dockerRequest('POST', '/volumes/create', { Name: 'halley-pkg-cache' });
-
-      // Resolve how dataDir is mounted into control-plane so the host Docker daemon
-      // can mount git-mirror into the sibling workspace container.
-      let mirrorBind = `${mirrorDir}:/halley-mirror:ro`;
-      let mirrorPathEnv = '/halley-mirror';
-      if (process.env.HOST_DATA_DIR) {
-        mirrorBind = `${path.posix.join(process.env.HOST_DATA_DIR, 'git-mirror/repo.git')}:/halley-mirror:ro`;
-      } else {
-        const os = await import('node:os');
-        const self = await dockerRequest<{
-          Mounts?: Array<{ Type: string; Source: string; Destination: string; Name?: string }>;
-        }>('GET', `/containers/${os.hostname()}/json`).catch(() => null);
-        const dataMount = self?.status === 200
-          ? self.data?.Mounts?.find((m) => path.resolve(m.Destination) === path.resolve(this.config.dataDir))
-          : undefined;
-        if (dataMount) {
-          if (dataMount.Type === 'volume' && dataMount.Name) {
-            mirrorBind = `${dataMount.Name}:/halley-data:ro`;
-            mirrorPathEnv = '/halley-data/git-mirror/repo.git';
-          } else if (dataMount.Source) {
-            mirrorBind = `${path.posix.join(dataMount.Source, 'git-mirror/repo.git')}:/halley-mirror:ro`;
-          }
-        }
-      }
+      await dockerRequest('POST', '/volumes/create', { Name: 'halley-git-mirror' });
 
       const env = [
         `HALLEY_SESSION_ID=${session.id}`,
@@ -123,7 +100,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         `HALLEY_BASE_BRANCH=${session.base_branch}`,
         `HALLEY_WORKING_BRANCH=${session.working_branch}`,
         `HALLEY_BASE_SHA=${session.base_sha}`,
-        `HALLEY_MIRROR_PATH=${mirrorPathEnv}`,
+        `HALLEY_MIRROR_PATH=/halley-mirror/repo.git`,
         `RUNNER_PORT=4100`,
         `ASTRO_PORT=4321`,
         `CONTROL_PLANE_INTERNAL_URL=${this.config.controlPlaneInternalUrl}`,
@@ -146,7 +123,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           Binds: [
             `${session.volume_name}:/halley-volume`,
             `halley-pkg-cache:/halley-pkg-cache`,
-            mirrorBind,
+            `halley-git-mirror:/halley-mirror`,
           ],
           Memory: 2 * 1024 * 1024 * 1024,
         },
@@ -155,6 +132,10 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         throw new Error(`Docker create failed: ${JSON.stringify(created.data)}`);
       }
       this.db.updateSession(session.id, { container_id: created.data.Id });
+
+      // Sync bare git mirror into the named Docker volume via docker cp (works regardless of host paths,
+      // custom container names, or DATA_DIR settings — zero host bind-mount path dependencies).
+      await execFileAsync('docker', ['cp', mirrorDir, `${name}:/halley-mirror/`]);
     }
 
     if (!inspect.data?.State?.Running) {

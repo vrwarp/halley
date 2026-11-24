@@ -1,5 +1,5 @@
 import http from 'node:http';
-import type { Duplex } from 'node:stream';
+import { Readable, type Duplex } from 'node:stream';
 import type { Context } from 'hono';
 import type { AuthService } from '../auth/google.js';
 import type { ControlPlaneDb } from '../db.js';
@@ -64,22 +64,49 @@ export function createPreviewProxy(
 
     const url = new URL(c.req.url);
     const targetBase = new URL(endpoint.astroUrl);
-    const targetUrl = `${endpoint.astroUrl}${url.pathname}${url.search}`;
+    const targetPort = Number(targetBase.port || 4321);
 
-    const reqHeaders = new Headers(c.req.raw.headers);
-    reqHeaders.set('host', `localhost:${targetBase.port || '4321'}`);
+    const headers: Record<string, string> = {};
+    c.req.raw.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== 'host') {
+        headers[key] = value;
+      }
+    });
+    headers['host'] = `localhost:${targetPort}`;
+
+    const reqBody =
+      ['GET', 'HEAD'].includes(c.req.method) ? undefined : Buffer.from(await c.req.arrayBuffer());
 
     try {
-      const upstream = await fetch(targetUrl, {
-        method: c.req.method,
-        headers: reqHeaders,
-        body: ['GET', 'HEAD'].includes(c.req.method) ? undefined : c.req.raw.body,
-        duplex: 'half',
-      } as RequestInit);
-      const resHeaders = new Headers(upstream.headers);
-      resHeaders.delete('content-encoding');
-      return new Response(upstream.body, {
-        status: upstream.status,
+      const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const proxyReq = http.request(
+          {
+            hostname: targetBase.hostname,
+            port: targetPort,
+            path: `${url.pathname}${url.search}`,
+            method: c.req.method,
+            headers,
+          },
+          resolve,
+        );
+        proxyReq.on('error', reject);
+        if (reqBody && reqBody.length > 0) {
+          proxyReq.write(reqBody);
+        }
+        proxyReq.end();
+      });
+
+      const resHeaders = new Headers();
+      for (const [k, v] of Object.entries(upstream.headers)) {
+        if (!v || k.toLowerCase() === 'content-encoding') continue;
+        if (Array.isArray(v)) {
+          for (const item of v) resHeaders.append(k, item);
+        } else {
+          resHeaders.set(k, v);
+        }
+      }
+      return new Response(Readable.toWeb(upstream) as ReadableStream, {
+        status: upstream.statusCode ?? 200,
         headers: resHeaders,
       });
     } catch {

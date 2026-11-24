@@ -562,6 +562,7 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isMain) {
+  const preExistingEnv = { ...process.env };
   for (const envFile of ['.env.local', '.env', '../../.env.local', '../../.env']) {
     try {
       process.loadEnvFile(envFile);
@@ -569,6 +570,7 @@ if (isMain) {
       // ignore missing env file
     }
   }
+  Object.assign(process.env, preExistingEnv);
   const config = loadConfig();
   const cp = createControlPlane(config);
   const stopReaper = startSessionReaper(config, cp.db, cp.driver);

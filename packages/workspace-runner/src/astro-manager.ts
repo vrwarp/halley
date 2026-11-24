@@ -109,6 +109,7 @@ export default {
     ...(baseConfig.server || {}),
     host: '0.0.0.0',
     port: ${this.opts.astroPort},
+    allowedHosts: true,
   },
   vite: {
     ...(baseConfig.vite || {}),
@@ -125,7 +126,7 @@ export default {
     const relConfigPath = path.relative(this.opts.repoRoot, this.wrapperConfigPath);
     this.proc = spawn(
       astroBin,
-      ['dev', '--config', relConfigPath, '--host', '0.0.0.0', '--port', String(this.opts.astroPort)],
+      ['dev', '--config', relConfigPath, '--host', '0.0.0.0', '--port', String(this.opts.astroPort), '--allowed-hosts'],
       {
         cwd: this.opts.repoRoot,
         env: {
