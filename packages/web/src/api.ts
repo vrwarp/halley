@@ -1,12 +1,18 @@
 import type {
   AllowlistEntryDto,
+  ChangeCardDto,
   CheckpointInfo,
   EditorSessionDto,
+  EscalationEstimateDto,
   GitFileChange,
+  LiveHistoryEntryDto,
+  MergeReviewStateDto,
   SpendStatusDto,
   StagedAttachment,
+  TranscriptEntryDto,
   UserDto,
   VerificationCheckResult,
+  VisualDiffPageDto,
 } from '@halley/shared';
 
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
@@ -28,6 +34,14 @@ export interface AuthMeResponse {
   spend?: SpendStatusDto;
 }
 
+export interface PriorThreadDto {
+  parentSessionId: string;
+  parentTitle: string;
+  parentStatus: string;
+  parentPublishedAt: string;
+  entries: TranscriptEntryDto[];
+}
+
 export const api = {
   me: () => apiFetch<AuthMeResponse>('/api/auth/me'),
   devLogin: (email?: string, name?: string) =>
@@ -46,6 +60,7 @@ export const api = {
 
   listSessions: () =>
     apiFetch<{ sessions: EditorSessionDto[]; spend: SpendStatusDto }>('/api/sessions'),
+  listHistory: () => apiFetch<{ entries: LiveHistoryEntryDto[] }>('/api/history'),
   createSession: (title: string) =>
     apiFetch<{ session: EditorSessionDto }>('/api/sessions', {
       method: 'POST',
@@ -58,6 +73,23 @@ export const api = {
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/wake`, { method: 'POST' }),
   duplicateSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/duplicate`, { method: 'POST' }),
+  revertPublication: (body: {
+    sessionId?: string;
+    sha?: string;
+    shas?: string[];
+    reason: string;
+    title?: string;
+  }) =>
+    apiFetch<{ session: EditorSessionDto; revertResult?: Record<string, unknown> | null }>(
+      '/api/sessions/revert',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    ),
+  retryDeploy: (id: string) =>
+    apiFetch<{ ok: boolean }>(`/api/sessions/${id}/retry-deploy`, { method: 'POST' }),
   takeoverSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/takeover`, { method: 'POST' }),
   deleteSession: (id: string) =>
@@ -69,6 +101,67 @@ export const api = {
     ),
   getChanges: (id: string) =>
     apiFetch<{ changes: GitFileChange[]; checkpoints: CheckpointInfo[] }>(`/api/sessions/${id}/changes`),
+  getReview: (id: string, screenshots = false) =>
+    apiFetch<{
+      cards: ChangeCardDto[];
+      pages: VisualDiffPageDto[];
+      mergeReview: MergeReviewStateDto | null;
+      baseSha: string;
+      prevBaseSha: string | null;
+    }>(`/api/sessions/${id}/review?screenshots=${screenshots ? '1' : '0'}`),
+  getUpstreamStatus: (id: string) =>
+    apiFetch<{
+      behind: boolean;
+      latestMainSha: string;
+      newerCommits: Array<{ sha: string; shortSha: string; author: string; date: string; subject: string }>;
+      coEditors: Array<{ sessionId: string; title: string; ownerName: string; changedFilesCount: number }>;
+    }>(`/api/sessions/${id}/upstream-status`),
+  syncSession: (id: string, opts?: { kind?: 'sync' | 'publish' | 'revert'; autoSyncOnly?: boolean }) =>
+    apiFetch<{
+      review?: MergeReviewStateDto;
+      heldForUser?: boolean;
+      overlapCount?: number;
+    }>(`/api/sessions/${id}/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts ?? {}),
+    }),
+  chooseSyncConflicts: (
+    id: string,
+    choices: Array<{ recordId: string; optionId: string; customInstruction?: string }>,
+  ) =>
+    apiFetch<{ review: MergeReviewStateDto }>(`/api/sessions/${id}/sync/choose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ choices }),
+    }),
+  undoSync: (id: string, targetSha?: string) =>
+    apiFetch<{ ok: boolean }>(`/api/sessions/${id}/sync/undo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetSha }),
+    }),
+  estimateEscalation: (id: string, body: { recordIds?: string[]; userNote?: string }) =>
+    apiFetch<{ estimate: EscalationEstimateDto }>(`/api/sessions/${id}/sync/estimate-escalation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  escalateMerge: (
+    id: string,
+    body: { recordIds?: string[]; userNote?: string; ceilingUsd?: number },
+  ) =>
+    apiFetch<{ review: MergeReviewStateDto }>(`/api/sessions/${id}/sync/escalate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  applyAdvancedMerge: (id: string, picks: Array<{ path: string; use: 'advanced' | 'first' }>) =>
+    apiFetch<{ review: MergeReviewStateDto }>(`/api/sessions/${id}/sync/apply-advanced`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ picks }),
+    }),
   revertFile: (id: string, filePath: string) =>
     apiFetch<{ ok: boolean }>(`/api/sessions/${id}/revert-file`, {
       method: 'POST',
@@ -114,8 +207,10 @@ export const api = {
     }),
   getTranscript: (id: string) =>
     apiFetch<{
-      entries: import('@halley/shared').TranscriptEntryDto[];
+      entries: TranscriptEntryDto[];
       live: import('@halley/shared').LiveRunStateDto;
+      volumeExpired?: boolean;
+      priorThread?: PriorThreadDto | null;
     }>(`/api/sessions/${id}/transcript`),
   getDebugTrace: (id: string) =>
     apiFetch<import('@halley/shared').DebugTraceDto>(`/api/sessions/${id}/debug-trace`),
@@ -134,6 +229,13 @@ export const api = {
         inputTokens: number;
         outputTokens: number;
         extraGrantedUsd: number;
+      }>;
+      spendByPurpose?: Array<{
+        purpose: string;
+        requestCount: number;
+        costUsd: number;
+        inputTokens: number;
+        outputTokens: number;
       }>;
       sessions: EditorSessionDto[];
     }>('/api/admin/overview'),

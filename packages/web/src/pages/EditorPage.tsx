@@ -5,6 +5,7 @@ import type {
   EditorSessionDto,
   ElementContext,
   LiveRunStateDto,
+  MergeReviewStateDto,
   PostMessageFromPreview,
   PreviewMode,
   PreviewRect,
@@ -22,6 +23,7 @@ import {
   Copy,
   EyeOff,
   FilePlus,
+  GitBranch,
   History,
   ImagePlus,
   Loader2,
@@ -29,6 +31,7 @@ import {
   MousePointer,
   PenLine,
   RefreshCw,
+  RotateCcw,
   Send,
   Smartphone,
   Square,
@@ -38,9 +41,10 @@ import {
 } from 'lucide-react';
 import { elementKey, friendlyElementKind } from '@halley/shared';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { api } from '../api.js';
+import { api, type PriorThreadDto } from '../api.js';
 import { flyToChip } from '../components/attachFlight.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
+import { ConflictCards } from '../components/ConflictCards.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
 import { PublishModal } from '../components/PublishModal.js';
 import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
@@ -57,8 +61,9 @@ interface Props {
   sessionId: string;
   user: UserDto;
   initialSpend: SpendStatusDto;
+  initialOpenPublish?: boolean;
   onBack: () => void;
-  onOpenSession: (id: string) => void;
+  onOpenSession: (id: string, opts?: { openPublish?: boolean }) => void;
 }
 
 function friendlyToolLabel(name?: string): string {
@@ -85,6 +90,7 @@ export function EditorPage({
   sessionId,
   user,
   initialSpend,
+  initialOpenPublish = false,
   onBack,
   onOpenSession,
 }: Props) {
@@ -92,6 +98,8 @@ export function EditorPage({
   const [bootProgress, setBootProgress] = useState<BootProgressDto | null>(null);
   const [spend, setSpend] = useState<SpendStatusDto>(initialSpend);
   const [entries, setEntries] = useState<TranscriptEntryDto[]>([]);
+  const [priorThread, setPriorThread] = useState<PriorThreadDto | null>(null);
+  const [volumeExpired, setVolumeExpired] = useState(false);
   const [live, setLive] = useState<LiveRunStateDto>({
     busy: false,
     activeTools: [],
@@ -100,6 +108,15 @@ export function EditorPage({
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
   const [changedCount, setChangedCount] = useState(0);
   const [publishProgress, setPublishProgress] = useState<PublishProgressPayload | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncToast, setSyncToast] = useState<string | null>(null);
+  const [syncReview, setSyncReview] = useState<MergeReviewStateDto | null>(null);
+  const [upstreamNotice, setUpstreamNotice] = useState<{
+    behind: boolean;
+    newerCount: number;
+    heldOverlap?: number;
+    coEditors: Array<{ ownerName: string; title: string }>;
+  } | null>(null);
 
   const [mode, setMode] = useState<PreviewMode>('browse');
   const [viewport, setViewport] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
@@ -111,7 +128,7 @@ export function EditorPage({
   const [newPagePath, setNewPagePath] = useState('');
   const [newPageUnlisted, setNewPageUnlisted] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
-  const [showPublish, setShowPublish] = useState(false);
+  const [showPublish, setShowPublish] = useState(initialOpenPublish);
   const [showDebug, setShowDebug] = useState(false);
 
   const [input, setInput] = useState('');
@@ -186,6 +203,13 @@ export function EditorPage({
     wakeRequestedRef.current = false;
     setBootProgress(null);
     void loadSessionMeta();
+    api
+      .getTranscript(sessionId)
+      .then((t) => {
+        if (t.priorThread) setPriorThread(t.priorThread);
+        if (t.volumeExpired) setVolumeExpired(true);
+      })
+      .catch(() => {});
   }, [sessionId]);
 
   useEffect(() => {
@@ -207,6 +231,76 @@ export function EditorPage({
     }, 1500);
     return () => clearInterval(timer);
   }, [sessionId, session?.status]);
+
+  // Q8 / Q12: Safe-moment auto-sync & proactive upstream/co-editor banner
+  const handleManualSync = async () => {
+    if (!session?.canEdit || syncing || live.busy) return;
+    setSyncing(true);
+    setSyncToast(null);
+    try {
+      const res = await api.syncSession(session.id, { kind: 'sync' });
+      if (res.review) {
+        if (res.review.alreadyUpToDate) {
+          setSyncToast('Already up to date with the live site.');
+        } else if (res.review.status === 'applied') {
+          setSyncToast(res.review.summary);
+          reloadPreview(true);
+        } else {
+          setSyncReview(res.review);
+          reloadPreview(true);
+        }
+        setUpstreamNotice((prev) => (prev ? { ...prev, behind: false, heldOverlap: undefined } : prev));
+        await loadSessionMeta();
+      }
+    } catch (err) {
+      setSyncToast(err instanceof Error ? err.message : 'Sync failed');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!session || !session.canEdit || session.status !== 'running') return;
+    let cancelled = false;
+    const checkAndAutoSync = async () => {
+      if (cancelled || live.busy || showPublish || syncing) return;
+      try {
+        const up = await api.getUpstreamStatus(session.id);
+        if (cancelled) return;
+        setUpstreamNotice({
+          behind: up.behind,
+          newerCount: up.newerCommits.length,
+          coEditors: up.coEditors.map((c) => ({ ownerName: c.ownerName, title: c.title })),
+        });
+        // Auto-sync silently when behind and safe (never spends AI without user click)
+        if (up.behind && !live.busy && !showPublish) {
+          const res = await api.syncSession(session.id, { kind: 'sync', autoSyncOnly: true });
+          if (cancelled) return;
+          if (res.heldForUser) {
+            setUpstreamNotice((prev) =>
+              prev ? { ...prev, behind: true, heldOverlap: res.overlapCount ?? 1 } : prev,
+            );
+          } else if (res.review && !res.review.alreadyUpToDate) {
+            if (res.review.status === 'ready_for_review') {
+              setSyncReview(res.review);
+            } else {
+              setSyncToast(res.review.summary);
+            }
+            reloadPreview(true);
+            await loadSessionMeta();
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    };
+    void checkAndAutoSync();
+    const timer = setInterval(() => void checkAndAutoSync(), 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [session?.id, session?.status, session?.canEdit, live.busy, showPublish]);
 
   const [wsConnected, setWsConnected] = useState(false);
 
@@ -543,13 +637,66 @@ export function EditorPage({
           <span className="truncate text-sm font-semibold text-stone-900">{session.title}</span>
           {!session.canEdit && (
             <span className="rounded-full bg-stone-100 px-2.5 py-0.5 text-xs font-medium text-stone-600">
-              {session.status === 'published' ? 'Published archive' : `Read-only (${session.ownerName})`}
+              {session.status === 'published'
+                ? 'Published archive'
+                : session.status === 'merged'
+                  ? 'Merged (deploy pending)'
+                  : `Read-only (${session.ownerName})`}
             </span>
           )}
         </div>
 
         <div className="flex items-center gap-2">
-          {!session.canEdit && session.status !== 'published' && (
+          {(session.status === 'published' || session.status === 'merged') && (
+            <>
+              <button
+                type="button"
+                onClick={async () => {
+                  const { session: cont } = await api.duplicateSession(session.id);
+                  onOpenSession(cont.id);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-stone-800"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                Continue editing
+              </button>
+              {session.mergedSha && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const reason = prompt('Reason for undoing this publication:');
+                    if (!reason?.trim()) return;
+                    const { session: rev } = await api.revertPublication({
+                      sessionId: session.id,
+                      sha: session.mergedSha!,
+                      reason: reason.trim(),
+                      title: session.title,
+                    });
+                    onOpenSession(rev.id, { openPublish: true });
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-xs font-medium text-stone-700 hover:border-red-300 hover:text-red-700"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Undo publication
+                </button>
+              )}
+              {session.status === 'merged' && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await api.retryDeploy(session.id);
+                    await loadSessionMeta();
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Retry deploy check
+                </button>
+              )}
+            </>
+          )}
+
+          {!session.canEdit && session.status !== 'published' && session.status !== 'merged' && (
             <>
               <button
                 type="button"
@@ -590,6 +737,30 @@ export function EditorPage({
 
           {session.canEdit && (
             <>
+              <button
+                type="button"
+                disabled={syncing || live.busy}
+                onClick={() => void handleManualSync()}
+                title="Pull latest updates from the live site"
+                className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 disabled:opacity-40"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
+                <span className="hidden sm:inline">{syncing ? 'Updating…' : 'Get latest'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={async () => {
+                  const { session: dup } = await api.duplicateSession(session.id);
+                  onOpenSession(dup.id);
+                }}
+                title="Branch off a copy of this draft"
+                className="hidden sm:inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50"
+              >
+                <GitBranch className="h-3.5 w-3.5" />
+                Branch off
+              </button>
+
               <div className="relative flex items-center">
                 <button
                   type="button"
@@ -620,22 +791,29 @@ export function EditorPage({
                         <p className="px-2 py-3 text-xs text-stone-500">No checkpoints yet.</p>
                       ) : (
                         checkpoints.map((c, idx) => (
-                          <div key={c.sha} className="flex items-center justify-between gap-2 px-2 py-2 text-xs">
-                            <div className="min-w-0">
-                              <p className="truncate font-medium text-stone-800">{c.summary}</p>
-                              <p className="text-[11px] text-stone-400">
-                                {new Date(c.timestamp).toLocaleTimeString()}
+                          <div key={c.sha} className="px-2 py-2 text-xs">
+                            {c.isSyncBoundary && (
+                              <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-teal-700">
+                                — Updated from live site · {new Date(c.timestamp).toLocaleDateString()} —
                               </p>
-                            </div>
-                            {idx > 0 && (
-                              <button
-                                type="button"
-                                onClick={() => handleRestoreCheckpoint(c.sha)}
-                                className="shrink-0 rounded border border-stone-200 px-2 py-0.5 text-[11px] font-medium text-stone-700 hover:bg-stone-50"
-                              >
-                                Restore
-                              </button>
                             )}
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="truncate font-medium text-stone-800">{c.summary}</p>
+                                <p className="text-[11px] text-stone-400">
+                                  {new Date(c.timestamp).toLocaleTimeString()}
+                                </p>
+                              </div>
+                              {idx > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRestoreCheckpoint(c.sha)}
+                                  className="shrink-0 rounded border border-stone-200 px-2 py-0.5 text-[11px] font-medium text-stone-700 hover:bg-stone-50"
+                                >
+                                  Restore
+                                </button>
+                              )}
+                            </div>
                           </div>
                         ))
                       )}
@@ -691,6 +869,123 @@ export function EditorPage({
           }`}
         >
           <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+            {(volumeExpired || session.volumeExpired) && (
+              <div className="rounded-xl border border-stone-200 bg-stone-50 px-3.5 py-2.5 text-xs text-stone-600">
+                Workspace expired after 420 days; conversation history is still available. Use{' '}
+                <strong>Continue editing</strong> or <strong>Undo publication</strong> above anytime.
+              </div>
+            )}
+
+            {upstreamNotice && (upstreamNotice.heldOverlap || upstreamNotice.behind || upstreamNotice.coEditors.length > 0) && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-950 space-y-1.5">
+                {upstreamNotice.heldOverlap ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <span>
+                      An update from the live site overlaps your edits on {upstreamNotice.heldOverlap} file
+                      {upstreamNotice.heldOverlap === 1 ? '' : 's'}.
+                    </span>
+                    <button
+                      type="button"
+                      disabled={syncing}
+                      onClick={() => void handleManualSync()}
+                      className="shrink-0 rounded-lg bg-stone-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-stone-800"
+                    >
+                      Combine now
+                    </button>
+                  </div>
+                ) : upstreamNotice.behind ? (
+                  <div className="flex items-center justify-between gap-2">
+                    <span>
+                      The live site has {upstreamNotice.newerCount} newer update
+                      {upstreamNotice.newerCount === 1 ? '' : 's'}.
+                    </span>
+                    <button
+                      type="button"
+                      disabled={syncing}
+                      onClick={() => void handleManualSync()}
+                      className="shrink-0 rounded-lg bg-stone-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-stone-800"
+                    >
+                      Get latest
+                    </button>
+                  </div>
+                ) : null}
+                {upstreamNotice.coEditors.length > 0 && (
+                  <p className="text-[11px] text-amber-800">
+                    Heads up: {upstreamNotice.coEditors[0]!.ownerName} also has an unpublished draft (
+                    &ldquo;{upstreamNotice.coEditors[0]!.title}&rdquo;).
+                  </p>
+                )}
+              </div>
+            )}
+
+            {syncToast && (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-teal-200 bg-teal-50 px-3.5 py-2 text-xs text-teal-900">
+                <span>{syncToast}</span>
+                <button
+                  type="button"
+                  onClick={() => setSyncToast(null)}
+                  className="text-teal-700 hover:text-teal-950"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+
+            {syncReview && (
+              <ConflictCards
+                sessionId={session.id}
+                review={syncReview}
+                onUpdated={(next) => {
+                  setSyncReview(next);
+                  reloadPreview(true);
+                  void loadSessionMeta();
+                }}
+                onUndone={() => {
+                  setSyncReview(null);
+                  setSyncToast('Update undone.');
+                  reloadPreview(true);
+                  void loadSessionMeta();
+                }}
+              />
+            )}
+
+            {/* Q2 / Q18: Unified Hybrid carry-over — read-only prior conversation above divider */}
+            {priorThread && priorThread.entries.length > 0 && (
+              <div className="space-y-3 opacity-75">
+                {priorThread.entries.map((entry) => {
+                  if (entry.role === 'user') {
+                    const parsed = parseUserMessageDisplay(entry.text);
+                    return (
+                      <div key={`prior-${entry.id}`} className="flex flex-col items-end">
+                        <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-stone-700 px-3.5 py-2 text-xs text-white whitespace-pre-wrap">
+                          {parsed.body}
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (entry.role === 'assistant') {
+                    return (
+                      <div
+                        key={`prior-${entry.id}`}
+                        className="rounded-xl bg-stone-50 px-3 py-2 text-xs text-stone-700"
+                      >
+                        <ChatMessageContent text={entry.text} onNavigateRoute={navigatePreview} />
+                      </div>
+                    );
+                  }
+                  return null;
+                })}
+                <div className="flex items-center gap-2 py-1 text-[11px] font-medium text-stone-500">
+                  <div className="h-px flex-1 bg-stone-200" />
+                  <span>
+                    Continued from &ldquo;{priorThread.parentTitle}&rdquo; ·{' '}
+                    {new Date(priorThread.parentPublishedAt).toLocaleDateString()}
+                  </span>
+                  <div className="h-px flex-1 bg-stone-200" />
+                </div>
+              </div>
+            )}
+
             {entries.length === 0 && !live.busy && (
               <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
                 <div>
@@ -1284,6 +1579,7 @@ export function EditorPage({
       {showPublish && (
         <PublishModal
           session={session}
+          persona={persona}
           publishProgress={publishProgress}
           onClose={() => setShowPublish(false)}
           onAskHalleyToFix={async (summary, logs) => {

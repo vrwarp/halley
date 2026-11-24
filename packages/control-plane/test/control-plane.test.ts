@@ -172,11 +172,289 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         headers: { Cookie: cookie2 },
       });
       expect(dupRes.status).toBe(201);
-      const dupData = (await dupRes.json()) as { session: { canEdit: boolean; isOwner: boolean } };
+      const dupData = (await dupRes.json()) as {
+        session: { canEdit: boolean; isOwner: boolean; parentSessionId: string | null; kind: string };
+      };
       expect(dupData.session.isOwner).toBe(true);
       expect(dupData.session.canEdit).toBe(true);
+      expect(dupData.session.parentSessionId).toBe(session.id);
+      expect(dupData.session.kind).toBe('edit');
+
+      // Marking Sarah's session 'merged' freezes editing and duplicating it creates a 'continuation'
+      cp.db.updateSession(session.id, { status: 'merged', merged_sha: 'deadbeef' });
+      const mergedView = await cp.app.request(`/api/sessions/${session.id}`, {
+        headers: { Cookie: cookie1 },
+      });
+      const mergedDto = (await mergedView.json()) as { session: { canEdit: boolean; status: string } };
+      expect(mergedDto.session.status).toBe('merged');
+      expect(mergedDto.session.canEdit).toBe(false);
+
+      const mergedPubRes = await cp.app.request(`/api/sessions/${session.id}/publish`, {
+        method: 'POST',
+        headers: { Cookie: cookie1 },
+      });
+      expect(mergedPubRes.status).toBe(409);
+
+      const contRes = await cp.app.request(`/api/sessions/${session.id}/duplicate`, {
+        method: 'POST',
+        headers: { Cookie: cookie1 },
+      });
+      expect(contRes.status).toBe(201);
+      const contData = (await contRes.json()) as {
+        session: { kind: string; title: string; parentSessionId: string | null };
+      };
+      expect(contData.session.kind).toBe('continuation');
+      expect(contData.session.title).toContain('Continued:');
+      expect(contData.session.parentSessionId).toBe(session.id);
+
+      // Session archive upsert & GET /api/sessions/:id/archive
+      cp.db.upsertSessionArchive({
+        sessionId: session.id,
+        transcriptJson: JSON.stringify({ entries: [{ id: '1', role: 'user', text: 'Update Easter' }] }),
+        diffSummary: JSON.stringify([{ path: 'src/pages/index.astro', status: 'modified', additions: 2, deletions: 1 }]),
+        mergedSha: 'deadbeef',
+        prUrl: 'https://github.com/vrwarp/thecrossing.website/pull/99',
+      });
+      const archRes = await cp.app.request(`/api/sessions/${session.id}/archive`, {
+        headers: { Cookie: cookie2 },
+      });
+      expect(archRes.status).toBe(200);
+      const archData = (await archRes.json()) as { archive: { mergedSha: string; handoffSummary: string | null } };
+      expect(archData.archive.mergedSha).toBe('deadbeef');
+      expect(archData.archive.handoffSummary).toBeNull();
     } finally {
       await fakeScreenshotService.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('runs reaper rules: 7d node_modules prune, 420d published & draft expiry, skipping in-flight and merged drafts', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-reaper-test-'));
+    try {
+      const pruned: string[] = [];
+      const destroyed: string[] = [];
+      const driver: WorkspaceDriver = {
+        ...createMockDriver(),
+        pruneNodeModules: async (s) => {
+          pruned.push(s.id);
+        },
+        destroy: async (s) => {
+          destroyed.push(s.id);
+        },
+      };
+
+      const cfg = {
+        ...loadConfig(),
+        dataDir: tmp,
+        archiveRetentionDays: 420,
+        nodeModulesPruneDays: 7,
+        devLoginEnabled: true,
+      };
+      const cp = createControlPlane(cfg, driver);
+      const user = cp.db.upsertUser({ email: 'editor@thecrossing.website', name: 'Editor', picture: null });
+
+      const DAY = 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      const mkSession = (id: string, patch: Record<string, unknown>) => {
+        cp.db.createSession({
+          id,
+          title: id,
+          slug: id,
+          ownerUserId: user.id,
+          repo: 'vrwarp/thecrossing.website',
+          baseBranch: 'main',
+          workingBranch: `halley/${id}`,
+          volumeName: `halley-ws-${id}`,
+          workspaceTokenHash: `hash-${id}`,
+        });
+        cp.db.updateSession(id, patch);
+      };
+
+      // 1. Sleeping draft 10 days old -> should prune node_modules, NOT destroy
+      mkSession('draft-10d', {
+        status: 'sleeping',
+        last_active_at: new Date(now - 10 * DAY).toISOString(),
+      });
+      // 2. Abandoned draft 425 days old -> should destroy + mark volume_expired_at
+      mkSession('draft-425d', {
+        status: 'sleeping',
+        last_active_at: new Date(now - 425 * DAY).toISOString(),
+      });
+      // 3. Published session 425 days old -> should destroy + mark volume_expired_at
+      mkSession('pub-425d', {
+        status: 'published',
+        archived_at: new Date(now - 425 * DAY).toISOString(),
+      });
+      // 4. Merged session 425 days old -> prune node_modules, do NOT expire as abandoned draft
+      mkSession('merged-425d', {
+        status: 'merged',
+        merged_at: new Date(now - 425 * DAY).toISOString(),
+        last_active_at: new Date(now - 425 * DAY).toISOString(),
+      });
+      // 5. In-flight publish 425 days old -> do NOT prune or destroy
+      mkSession('inflight-425d', {
+        status: 'sleeping',
+        publish_state: 'waiting_ci',
+        last_active_at: new Date(now - 425 * DAY).toISOString(),
+      });
+
+      const { runReaperPass } = await import('../src/reaper.js');
+      await runReaperPass(cfg, cp.db, driver, now);
+
+      expect(pruned).toContain('draft-10d');
+      expect(pruned).toContain('merged-425d');
+      expect(pruned).not.toContain('inflight-425d');
+
+      expect(destroyed).toContain('draft-425d');
+      expect(destroyed).toContain('pub-425d');
+      expect(destroyed).not.toContain('draft-10d');
+      expect(destroyed).not.toContain('merged-425d');
+      expect(destroyed).not.toContain('inflight-425d');
+
+      expect(cp.db.getSession('draft-425d')?.volume_expired_at).toBeTruthy();
+      expect(cp.db.getSession('pub-425d')?.volume_expired_at).toBeTruthy();
+      expect(cp.db.getSession('draft-10d')?.node_modules_pruned_at).toBeTruthy();
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('enforces LLM proxy model allowlist (F15), current Opus pricing (F17), revert permissions/in-flight lock, history, and expired transcript fallback', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-p1-p6-test-'));
+    try {
+      const { computeCostUsd, isModelAllowedForPurpose } = await import('../src/proxy/llm-proxy.js');
+      const cfg = {
+        ...loadConfig(),
+        dataDir: tmp,
+        modelId: 'haiku-latest',
+        conflictModelId: 'haiku-latest',
+        escalationModelId: 'opus-latest',
+        adminEmails: ['admin@thecrossing.website'],
+        allowedDomains: ['thecrossing.website'],
+        devLoginEnabled: true,
+      };
+
+      // F15: Opus blocked for normal chat, allowed for conflict-escalation
+      expect(isModelAllowedForPurpose('claude-opus-4-6', 'chat', cfg)).toBe(false);
+      expect(isModelAllowedForPurpose('claude-opus-4-6', 'conflict', cfg)).toBe(false);
+      expect(isModelAllowedForPurpose('claude-opus-4-6', 'conflict-escalation', cfg)).toBe(true);
+      expect(isModelAllowedForPurpose('claude-haiku-4-5-20251001', 'chat', cfg)).toBe(true);
+
+      // F17: Current Opus 4.5 / 4.6 priced at $5 input / $25 output per MTok (not legacy $15/$75)
+      const opusCost = computeCostUsd('claude-opus-4-6', {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+      });
+      expect(opusCost).toBeCloseTo(30, 5);
+
+      const cp = createControlPlane(cfg, createMockDriver());
+
+      const login1 = await cp.app.request('/api/auth/dev-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sarah@thecrossing.website', name: 'Sarah' }),
+      });
+      const cookieSarah = login1.headers.get('set-cookie')!.split(';')[0]!;
+      const { user: sarah } = (await login1.json()) as { user: { id: string } };
+
+      const login2 = await cp.app.request('/api/auth/dev-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'david@thecrossing.website', name: 'David' }),
+      });
+      const cookieDavid = login2.headers.get('set-cookie')!.split(';')[0]!;
+
+      // Create & publish Sarah's session, then expire its volume (>420d) while keeping DB archive
+      const pubSession = cp.db.createSession({
+        id: 'pub-1',
+        title: 'Easter Banner',
+        slug: 'easter-banner',
+        ownerUserId: sarah.id,
+        repo: cfg.repo,
+        baseBranch: 'main',
+        workingBranch: 'halley/easter-1',
+        volumeName: 'halley-ws-pub-1',
+        workspaceTokenHash: 'tok-pub-1',
+      });
+      cp.db.updateSession(pubSession.id, {
+        status: 'published',
+        publish_state: 'published',
+        merged_sha: '1111222233334444555566667777888899990000',
+        merged_at: new Date().toISOString(),
+        archived_at: null,
+        volume_expired_at: new Date().toISOString(),
+      });
+      cp.db.upsertSessionArchive({
+        sessionId: pubSession.id,
+        transcriptJson: JSON.stringify({
+          entries: [{ id: 'e1', kind: 'user', role: 'user', text: 'Update Easter banner' }],
+          live: { busy: false, activeTools: [], queuedCount: 0 },
+          usageUsd: 0.05,
+        }),
+        mergedSha: '1111222233334444555566667777888899990000',
+      });
+
+      // Expired volume still serves archived transcript without waking container
+      const txRes = await cp.app.request(`/api/sessions/${pubSession.id}/transcript`, {
+        headers: { Cookie: cookieDavid },
+      });
+      expect(txRes.status).toBe(200);
+      const txData = (await txRes.json()) as { volumeExpired?: boolean; entries: Array<{ text: string }> };
+      expect(txData.volumeExpired).toBe(true);
+      expect(txData.entries[0]?.text).toBe('Update Easter banner');
+
+      // Q1: Any editor (David) can undo Sarah's publication, but reason is required
+      const noReason = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieDavid },
+        body: JSON.stringify({ sessionId: pubSession.id, reason: '   ' }),
+      });
+      expect(noReason.status).toBe(400);
+
+      const rev1 = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieDavid },
+        body: JSON.stringify({ sessionId: pubSession.id, reason: 'Wrong date' }),
+      });
+      expect(rev1.status).toBe(201);
+      const { session: revSession } = (await rev1.json()) as { session: { id: string; kind: string; revertsSha: string } };
+      expect(revSession.kind).toBe('revert');
+      expect(revSession.revertsSha).toBe('1111222233334444555566667777888899990000');
+
+      // Idle revert draft must NOT block another editor from starting an undo
+      const rev2 = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieSarah },
+        body: JSON.stringify({ sessionId: pubSession.id, reason: 'Fixing date' }),
+      });
+      expect(rev2.status).toBe(201);
+
+      // An actively IN-FLIGHT revert publish MUST lock and return 409
+      cp.db.updateSession(revSession.id, { publish_state: 'waiting_ci' });
+      const revBlocked = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookieSarah },
+        body: JSON.stringify({ sessionId: pubSession.id, reason: 'Duplicate while publishing' }),
+      });
+      expect(revBlocked.status).toBe(409);
+
+      // Published History lists Sarah's publication
+      const histRes = await cp.app.request('/api/history', {
+        headers: { Cookie: cookieDavid },
+      });
+      expect(histRes.status).toBe(200);
+      const histData = (await histRes.json()) as { entries: Array<{ sessionId?: string; canUndo: boolean }> };
+      expect(histData.entries.some((e) => e.sessionId === pubSession.id && e.canUndo)).toBe(true);
+
+      // Purpose-tagged spend tracking
+      cp.db.recordSpend(sarah.id, 0.42, 5000, 1200, undefined, {
+        sessionId: pubSession.id,
+        purpose: 'conflict-escalation',
+        model: 'claude-opus-4-6',
+      });
+      const byPurpose = cp.db.listTodaySpendByPurpose();
+      expect(byPurpose.some((p) => p.purpose === 'conflict-escalation' && p.costUsd >= 0.42)).toBe(true);
+    } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });

@@ -115,18 +115,20 @@ export async function runAstroHygieneGuard(
       }
     }
 
-    // Check url('/images/...') references in src/
+    // Check url('/...') static asset references (images, PDFs, icons, fonts, media) in src/
+    const STATIC_ASSET_EXT_RE = /\.(?:webp|png|jpe?g|gif|svg|ico|avif|pdf|mp3|mp4|webm|woff2?|ttf|otf)$/i;
     const srcFiles = await walkFiles(path.join(repoRoot, 'src'), new Set(['.astro', '.ts', '.tsx']));
     for (const sf of srcFiles) {
       const text = await fs.readFile(sf, 'utf8');
-      const refs = [...text.matchAll(/url\(\s*['"](\/images\/[^'"]+)['"]\s*\)/g)];
+      const refs = [...text.matchAll(/url\(\s*['"](\/[^'"?#]+)(?:[?#][^'"]*)?['"]\s*\)/g)];
       for (const m of refs) {
-        const imgRel = m[1]!;
-        const abs = path.join(repoRoot, 'public', imgRel.replace(/^\/+/, ''));
+        const assetRel = m[1]!;
+        if (!STATIC_ASSET_EXT_RE.test(assetRel)) continue;
+        const abs = path.join(repoRoot, 'public', assetRel.replace(/^\/+/, ''));
         try {
           await fs.access(abs);
         } catch {
-          issues.push(`${path.relative(repoRoot, sf)}: missing public asset ${imgRel}`);
+          issues.push(`${path.relative(repoRoot, sf)}: missing public asset ${assetRel}`);
         }
       }
     }

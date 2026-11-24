@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ChatServerMessage, PublishProgressPayload, UserDto } from '@halley/shared';
+import type { ChatServerMessage, LiveHistoryEntryDto, PublishProgressPayload, UserDto } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
@@ -308,9 +308,7 @@ export function createControlPlane(
       workspaceTokenHash: hashWorkspaceToken(rawToken),
     });
 
-    if ('setRawWorkspaceToken' in driver && typeof driver.setRawWorkspaceToken === 'function') {
-      (driver as LocalWorkspaceDriver).setRawWorkspaceToken(id, rawToken);
-    }
+    driver.setRawWorkspaceToken?.(id, rawToken);
 
     // Start booting (or claiming warm standby) workspace asynchronously so the UI opens immediately
     void driver.ensureRunning(session).catch((err) => {
@@ -342,14 +340,100 @@ export function createControlPlane(
     return c.json({ session: enrichSessionDto(updated, user) });
   });
 
+  const buildDeterministicHandoffSummary = (
+    src: ReturnType<ControlPlaneDb['getSession']> & object,
+    archive: ReturnType<ControlPlaneDb['getSessionArchive']>,
+    priorHandoff?: string | null,
+  ): string => {
+    const lines: string[] = [];
+    if (priorHandoff) {
+      lines.push(`Earlier lineage summary: ${priorHandoff.slice(0, 600)}`);
+    }
+    const statusLabel =
+      src.status === 'published'
+        ? `published${src.pr_number ? ` as PR #${src.pr_number}` : ''}`
+        : src.status === 'merged'
+          ? `merged${src.pr_number ? ` as PR #${src.pr_number}` : ''}`
+          : 'in-progress draft';
+    lines.push(
+      `This session continues "${src.title}" (${statusLabel}, edited by ${src.owner_name || 'a teammate'}).`,
+    );
+    if (src.status === 'published' || src.status === 'merged') {
+      lines.push('Those published changes are already live on the main branch.');
+    }
+    if (archive?.diffSummary && archive.diffSummary !== '[]') {
+      try {
+        const diffs = JSON.parse(archive.diffSummary) as Array<{ path: string; status: string }>;
+        if (diffs.length > 0) {
+          lines.push(
+            `Files touched previously: ${diffs.map((d) => `${d.path} (${d.status})`).slice(0, 12).join(', ')}.`,
+          );
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (archive?.transcriptJson) {
+      try {
+        const t = JSON.parse(archive.transcriptJson) as {
+          entries?: Array<{ role: string; text?: string; attachments?: Array<{ stagedId: string; filename: string }> }>;
+        };
+        const userPrompts = (t.entries ?? [])
+          .filter((e) => e.role === 'user' && e.text)
+          .slice(-6)
+          .map((e) => e.text!.replace(/\s+/g, ' ').trim().slice(0, 180));
+        if (userPrompts.length > 0) {
+          lines.push(`Recent requests from the prior thread:\n- ${userPrompts.join('\n- ')}`);
+        }
+        const uploads = (t.entries ?? [])
+          .flatMap((e) => e.attachments ?? [])
+          .slice(-10)
+          .map((a) => `${a.filename} (stagedId=${a.stagedId})`);
+        if (uploads.length > 0 && src.status !== 'published' && src.status !== 'merged') {
+          lines.push(`Staged uploads carried over: ${uploads.join(', ')}.`);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return lines.join('\n');
+  };
+
   app.post('/api/sessions/:id/duplicate', auth.requireAuth, async (c) => {
     const user = c.get('user');
     const src = db.getSession(c.req.param('id')!);
     if (!src) return c.json({ error: 'Not found' }, 404);
 
+    // Ensure source transcript is captured in session_archives for unified Hybrid carry-over (Q18, Q19)
+    let srcArchive = db.getSessionArchive(src.id);
+    if (!srcArchive && src.runner_url) {
+      await publishService
+        .archiveSessionDeterministically(
+          src.id,
+          src.runner_url,
+          src.base_branch,
+          src.merged_sha,
+          src.pr_url,
+        )
+        .catch(() => {});
+      srcArchive = db.getSessionArchive(src.id);
+    }
+
+    const parentArchive = src.parent_session_id ? db.getSessionArchive(src.parent_session_id) : null;
+    let handoffSummary = srcArchive?.handoffSummary ?? null;
+    if (!handoffSummary) {
+      handoffSummary = buildDeterministicHandoffSummary(src, srcArchive, parentArchive?.handoffSummary);
+      if (srcArchive) {
+        db.setArchiveHandoffSummary(src.id, handoffSummary);
+      }
+    }
+
+    const isFinished = src.status === 'published' || src.status === 'merged';
+    const mode = isFinished ? 'fresh-from-main' : 'branch-off';
+    const kind = isFinished ? 'continuation' : 'edit';
     const id = crypto.randomUUID();
     const short = id.slice(0, 6);
-    const title = `${src.title} (Copy)`;
+    const title = isFinished ? `Continued: ${src.title}` : `${src.title} (Copy)`;
     const slug = slugify(title);
     const rawToken = crypto.randomBytes(24).toString('hex');
 
@@ -357,22 +441,250 @@ export function createControlPlane(
       id,
       title,
       slug,
+      kind,
+      parentSessionId: src.id,
       ownerUserId: user.id,
       repo: src.repo,
       baseBranch: src.base_branch,
+      workingBranch: `halley/${slug}-${short}`,
+      baseSha: mode === 'branch-off' ? src.base_sha : '',
+      volumeName: `halley-ws-${id}`,
+      workspaceTokenHash: hashWorkspaceToken(rawToken),
+    });
+
+    driver.setRawWorkspaceToken?.(id, rawToken);
+
+    await driver.duplicateWorkspace(src, copy, mode);
+    void driver
+      .ensureRunning(copy)
+      .then(async (ep) => {
+        if (handoffSummary) {
+          await fetch(`${ep.runnerUrl}/internal/context-note`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note: handoffSummary, persist: true }),
+          }).catch(() => {});
+        }
+      })
+      .catch(() => {});
+
+    return c.json({ session: enrichSessionDto(copy, user) }, 201);
+  });
+
+  // Journey A: Any editor can undo a Halley publication or non-.github/** main commit (Q1, Q5, Q17)
+  app.post('/api/sessions/revert', auth.requireAuth, async (c) => {
+    const user = c.get('user');
+    const body = (await c.req.json().catch(() => ({}))) as {
+      sessionId?: string;
+      sha?: string;
+      shas?: string[];
+      reason?: string;
+      title?: string;
+    };
+    const reason = (body.reason || '').trim();
+    if (!reason) {
+      return c.json({ error: 'Please enter a short reason for undoing this publication.' }, 400);
+    }
+
+    const srcSession = body.sessionId ? db.getSession(body.sessionId) : null;
+    const targetShas =
+      body.shas && body.shas.length > 0
+        ? body.shas
+        : body.sha
+          ? [body.sha]
+          : srcSession?.merged_sha
+            ? [srcSession.merged_sha]
+            : [];
+
+    if (targetShas.length === 0) {
+      return c.json({ error: 'No published commit SHA found to undo.' }, 400);
+    }
+
+    const primarySha = targetShas[0]!;
+    // In-flight publish lock only (idle/abandoned revert drafts never block teammates)
+    const inFlight = db.hasInFlightRevertForSha(primarySha);
+    if (inFlight) {
+      return c.json(
+        {
+          error: `${inFlight.owner_name || 'A teammate'} is already publishing an undo for this change.`,
+          inFlightSessionId: inFlight.id,
+        },
+        409,
+      );
+    }
+
+    // Block undoing developer commits that touch protected .github/** files
+    if (!srcSession) {
+      const files = await github.getCommitFiles(primarySha);
+      if (files.some((f) => f.startsWith('.github/'))) {
+        return c.json(
+          { error: 'Developer infrastructure update (.github/**) — revert directly on GitHub.' },
+          403,
+        );
+      }
+    }
+
+    const id = crypto.randomUUID();
+    const short = id.slice(0, 6);
+    const baseTitle = body.title || srcSession?.title || `commit ${primarySha.slice(0, 7)}`;
+    const title = `Undo: ${baseTitle}`;
+    const slug = slugify(title);
+    const rawToken = crypto.randomBytes(24).toString('hex');
+
+    const revertSession = db.createSession({
+      id,
+      title,
+      slug,
+      kind: 'revert',
+      parentSessionId: srcSession?.id ?? null,
+      revertsSha: primarySha,
+      revertReason: reason,
+      ownerUserId: user.id,
+      repo: config.repo,
+      baseBranch: config.baseBranch,
       workingBranch: `halley/${slug}-${short}`,
       volumeName: `halley-ws-${id}`,
       workspaceTokenHash: hashWorkspaceToken(rawToken),
     });
 
-    if ('setRawWorkspaceToken' in driver && typeof driver.setRawWorkspaceToken === 'function') {
-      (driver as LocalWorkspaceDriver).setRawWorkspaceToken(id, rawToken);
+    driver.setRawWorkspaceToken?.(id, rawToken);
+
+    let revertResult: Record<string, unknown> | null = null;
+    try {
+      const ep = await driver.ensureRunning(revertSession);
+      const res = await fetch(`${ep.runnerUrl}/internal/git/revert-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shas: targetShas }),
+      });
+      revertResult = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    } catch {
+      // Workspace may still be booting; UI can retry
     }
 
-    await driver.duplicateWorkspace(src, copy);
-    void driver.ensureRunning(copy).catch(() => {});
+    return c.json(
+      {
+        session: db.toSessionDto(db.getSession(revertSession.id)!, user),
+        revertResult,
+      },
+      201,
+    );
+  });
 
-    return c.json({ session: db.toSessionDto(copy, user) }, 201);
+  // Published History timeline: Halley publications + direct developer commits + PR reconciliation (Q20, P6)
+  app.get('/api/history', auth.requireAuth, async (c) => {
+    const allSessions = db.listSessions();
+
+    // Best-effort reconciliation of open Halley PRs that were merged/closed manually on GitHub (P6)
+    const openPrSessions = allSessions.filter(
+      (s) => s.pr_number && s.status !== 'published' && s.status !== 'merged',
+    );
+    for (const s of openPrSessions.slice(0, 5)) {
+      try {
+        const prState = await github.getPrState(s.pr_number!);
+        if (prState.merged && prState.mergeCommitSha) {
+          db.updateSession(s.id, {
+            status: 'published',
+            publish_state: 'published',
+            merged_sha: prState.mergeCommitSha,
+            merged_at: s.merged_at ?? new Date().toISOString(),
+            archived_at: s.archived_at ?? new Date().toISOString(),
+          });
+        }
+      } catch {
+        // GitHub unavailable in dev/offline mode
+      }
+    }
+
+    const refreshed = db.listSessions();
+    const publishedSessions = refreshed.filter(
+      (s) => s.status === 'published' || s.status === 'merged',
+    );
+    const revertedBySha = new Map<
+      string,
+      { sessionId: string; authorName: string; timestamp: string; reason: string | null }
+    >();
+
+    for (const s of publishedSessions) {
+      if (s.kind === 'revert' && s.reverts_sha) {
+        revertedBySha.set(s.reverts_sha, {
+          sessionId: s.id,
+          authorName: s.owner_name ?? 'Editor',
+          timestamp: s.merged_at ?? s.archived_at ?? s.last_active_at,
+          reason: s.revert_reason,
+        });
+      }
+    }
+
+    const entries: LiveHistoryEntryDto[] = [];
+    const seenShas = new Set<string>();
+
+    for (const s of publishedSessions) {
+      const sha = s.merged_sha || s.id;
+      if (s.merged_sha) seenShas.add(s.merged_sha);
+      entries.push({
+        id: `session-${s.id}`,
+        source: 'halley',
+        sha,
+        shortSha: sha.slice(0, 7),
+        title: s.title,
+        authorName: s.owner_name ?? 'Editor',
+        timestamp: s.merged_at ?? s.archived_at ?? s.last_active_at,
+        prNumber: s.pr_number,
+        prUrl: s.pr_url,
+        sessionId: s.id,
+        sessionKind: s.kind,
+        parentSessionId: s.parent_session_id,
+        revertsSha: s.reverts_sha,
+        revertReason: s.revert_reason,
+        revertedBy: s.merged_sha ? (revertedBySha.get(s.merged_sha) ?? null) : null,
+        canUndo: Boolean(s.merged_sha),
+        undoDisabledReason: s.merged_sha ? undefined : 'No merged commit SHA recorded',
+        volumeExpired: Boolean(s.volume_expired_at),
+      });
+    }
+
+    const ghCommits = await github.listMainCommits(config.baseBranch, 25);
+    for (const cm of ghCommits) {
+      if (seenShas.has(cm.sha)) continue;
+      const isInfra = /^\s*(?:ci|build|chore|workflow)\b/i.test(cm.subject) && cm.subject.includes('.github');
+      entries.push({
+        id: `commit-${cm.sha}`,
+        source: 'github',
+        sha: cm.sha,
+        shortSha: cm.shortSha,
+        title: cm.subject,
+        authorName: cm.author,
+        timestamp: cm.date,
+        revertedBy: revertedBySha.get(cm.sha) ?? null,
+        canUndo: !isInfra,
+        undoDisabledReason: isInfra ? 'Developer infrastructure update — revert on GitHub' : undefined,
+      });
+    }
+
+    entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return c.json({ entries });
+  });
+
+  app.get('/api/sessions/:id/archive', auth.requireAuth, (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const archive = db.getSessionArchive(s.id);
+    return c.json({ archive });
+  });
+
+  app.post('/api/sessions/:id/retry-deploy', auth.requireAuth, async (c) => {
+    const user = c.get('user');
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    if (s.owner_user_id !== user.id && !user.isAdmin) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (s.status !== 'merged' || !s.merged_sha) {
+      return c.json({ error: 'Session is not awaiting deploy verification' }, 409);
+    }
+    void publishService.retryDeployCheck(s).catch(() => {});
+    return c.json({ ok: true });
   });
 
   app.post('/api/sessions/:id/takeover', auth.requireAdmin, async (c) => {
@@ -403,8 +715,8 @@ export function createControlPlane(
     if (s.owner_user_id !== user.id && !user.isAdmin) {
       return { error: 'Read-only: only the owner or an admin can edit this session', status: 403 as const };
     }
-    if (s.status === 'published') {
-      return { error: 'This edit has already been published', status: 409 as const };
+    if (s.status === 'published' || s.status === 'merged') {
+      return { error: 'This edit has already been merged or published', status: 409 as const };
     }
     return { session: s, user };
   };
@@ -475,6 +787,232 @@ export function createControlPlane(
     return c.json(await res.json(), res.status as 200);
   });
 
+  app.post('/api/sessions/:id/sync', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      kind?: 'sync' | 'publish' | 'revert';
+      autoSyncOnly?: boolean;
+    };
+    const ep = await driver.ensureRunning(check.session);
+    const ghToken = await github.getAccessToken().catch(() => '');
+    if (ghToken) {
+      await driver.fetchIntoSession(check.session, ghToken).catch(() => {});
+    }
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        baseBranch: check.session.base_branch,
+        kind: body.kind ?? 'sync',
+        autoSyncOnly: body.autoSyncOnly,
+        skipFetch: Boolean(ghToken),
+      }),
+    });
+    const data = (await res.json().catch(() => ({ error: 'Sync failed' }))) as {
+      review?: { newBaseSha?: string; prevBaseSha?: string; status?: string };
+      error?: string;
+    };
+    if (data.review?.newBaseSha && data.review.status !== 'needs_choices') {
+      db.updateSession(check.session.id, {
+        prev_base_sha: data.review.prevBaseSha ?? (check.session.base_sha || null),
+        base_sha: data.review.newBaseSha,
+        last_active_at: new Date().toISOString(),
+      });
+    }
+    return c.json(data, res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/sync/choose', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = await c.req.json();
+    const ep = await driver.ensureRunning(check.session);
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/choose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({ error: 'Choice failed' }))) as {
+      review?: { newBaseSha?: string; prevBaseSha?: string; status?: string };
+    };
+    if (data.review?.newBaseSha && data.review.status === 'ready_for_review') {
+      db.updateSession(check.session.id, {
+        prev_base_sha: data.review.prevBaseSha ?? (check.session.base_sha || null),
+        base_sha: data.review.newBaseSha,
+      });
+    }
+    return c.json(data, res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/sync/undo', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = await c.req.json().catch(() => ({}));
+    const ep = await driver.ensureRunning(check.session);
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/undo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.ok && check.session.prev_base_sha) {
+      db.updateSession(check.session.id, { base_sha: check.session.prev_base_sha });
+    }
+    return c.json(await res.json().catch(() => ({ ok: res.ok })), res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/sync/estimate-escalation', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      recordIds?: string[];
+      userNote?: string;
+    };
+    const spend = db.getSpendStatus(check.user.id);
+    const remainingBudgetUsd = Math.max(
+      0,
+      spend.dailyCapUsd + spend.extraGrantedUsd - spend.spentTodayUsd,
+    );
+    const ep = await driver.ensureRunning(check.session);
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/estimate-escalation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recordIds: body.recordIds,
+        userNote: body.userNote,
+        remainingBudgetUsd,
+        escalationModelId: config.escalationModelId,
+        hardCeilingUsd: config.escalationMaxUsd,
+      }),
+    });
+    return c.json(await res.json().catch(() => ({ error: 'Estimate failed' })), res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/sync/escalate', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      recordIds?: string[];
+      userNote?: string;
+      ceilingUsd?: number;
+    };
+    const ep = await driver.ensureRunning(check.session);
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/escalate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recordIds: body.recordIds,
+        userNote: body.userNote,
+        escalationModelId: config.escalationModelId,
+        escalationThinking: config.escalationThinkingLevel,
+        ceilingUsd: Math.min(body.ceilingUsd ?? config.escalationMaxUsd, config.escalationMaxUsd),
+      }),
+    });
+    return c.json(await res.json().catch(() => ({ error: 'Escalation failed' })), res.status as 200);
+  });
+
+  app.post('/api/sessions/:id/sync/apply-advanced', auth.requireAuth, async (c) => {
+    const check = await requireSessionEdit(c);
+    if ('error' in check) return c.json({ error: check.error }, check.status);
+    const body = await c.req.json();
+    const ep = await driver.ensureRunning(check.session);
+    const res = await fetch(`${ep.runnerUrl}/internal/sync/apply-advanced`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return c.json(await res.json().catch(() => ({ error: 'Apply failed' })), res.status as 200);
+  });
+
+  app.get('/api/sessions/:id/review', auth.requireAuth, async (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const ep = await driver.ensureRunning(s);
+    const includeScreenshots = c.req.query('screenshots') === '1';
+    const qs = new URLSearchParams({
+      baseRef: `origin/${s.base_branch}`,
+    });
+    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
+    const data = (await res
+      .json()
+      .catch(() => ({ cards: [], pages: [], mergeReview: null }))) as {
+      cards: Array<{ route?: string }>;
+      pages: unknown[];
+      draftFiles?: string[];
+      mergedFromLiveFiles?: string[];
+      astroReady?: boolean;
+      previewBase?: string;
+      mergeReview: unknown;
+      baseSha?: string;
+      prevBaseSha?: string | null;
+    };
+
+    if (includeScreenshots && res.ok && data.astroReady !== false && ep.astroUrl) {
+      const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
+      const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
+      const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
+      const routes = [
+        ...data.cards.map((card) => card.route || '/'),
+        ...(data.cards.length === 0 ? ['/'] : []),
+      ];
+      data.pages = await screenshotService
+        .captureLiveVsDraftPages({
+          routes,
+          draftFiles: data.draftFiles ?? [],
+          mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
+          draftBaseUrl,
+          liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+        })
+        .catch(() => []);
+    }
+
+    return c.json(data, res.ok ? 200 : 502);
+  });
+
+  app.get('/api/sessions/:id/upstream-status', auth.requireAuth, async (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const ghCommits = await github.listMainCommits(s.base_branch, 10);
+    const latestMainSha = ghCommits[0]?.sha ?? '';
+    const behind = Boolean(latestMainSha && s.base_sha && latestMainSha !== s.base_sha);
+    const newerCommits = behind
+      ? ghCommits.slice(
+          0,
+          Math.max(
+            1,
+            ghCommits.findIndex((cm) => cm.sha === s.base_sha) === -1
+              ? ghCommits.length
+              : ghCommits.findIndex((cm) => cm.sha === s.base_sha),
+          ),
+        )
+      : [];
+
+    // Warn early if teammates have other active drafts with edits
+    const coEditors = db
+      .listSessions()
+      .filter(
+        (other) =>
+          other.id !== s.id &&
+          other.status !== 'published' &&
+          other.status !== 'merged' &&
+          !other.volume_expired_at &&
+          other.changed_files_count > 0,
+      )
+      .map((other) => ({
+        sessionId: other.id,
+        title: other.title,
+        ownerName: other.owner_name ?? 'A teammate',
+        changedFilesCount: other.changed_files_count,
+      }));
+
+    return c.json({
+      behind,
+      latestMainSha,
+      newerCommits,
+      coEditors,
+    });
+  });
+
   app.post('/api/sessions/:id/publish', auth.requireAuth, async (c) => {
     const check = await requireSessionEdit(c);
     if ('error' in check) return c.json({ error: check.error }, check.status);
@@ -503,12 +1041,55 @@ export function createControlPlane(
   app.get('/api/sessions/:id/transcript', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
+    const parentSession = s.parent_session_id ? db.getSession(s.parent_session_id) : null;
+    const parentArchive = s.parent_session_id ? db.getSessionArchive(s.parent_session_id) : null;
+    const priorThread =
+      parentSession && parentArchive
+        ? {
+            parentSessionId: parentSession.id,
+            parentTitle: parentSession.title,
+            parentStatus: parentSession.status,
+            parentPublishedAt: parentSession.merged_at ?? parentSession.archived_at ?? parentSession.last_active_at,
+            entries: (() => {
+              try {
+                const parsed = JSON.parse(parentArchive.transcriptJson) as { entries?: unknown[] };
+                return parsed.entries ?? [];
+              } catch {
+                return [];
+              }
+            })(),
+          }
+        : null;
+
+    // If volume expired (>420d), serve archived transcript from DB without waking a deleted volume
+    if (s.volume_expired_at) {
+      const ownArchive = db.getSessionArchive(s.id);
+      if (ownArchive) {
+        try {
+          const parsed = JSON.parse(ownArchive.transcriptJson) as Record<string, unknown>;
+          return c.json({ ...parsed, volumeExpired: true, priorThread });
+        } catch {
+          // fall through
+        }
+      }
+      return c.json({
+        entries: [],
+        live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
+        usageUsd: 0,
+        volumeExpired: true,
+        priorThread,
+      });
+    }
+
     const ep = await driver.ensureRunning(s);
     const res = await fetch(`${ep.runnerUrl}/internal/transcript`);
-    const data = await res
+    const data = (await res
       .json()
-      .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }));
-    return c.json(data, res.ok ? 200 : 502);
+      .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }))) as Record<
+      string,
+      unknown
+    >;
+    return c.json({ ...data, priorThread }, res.ok ? 200 : 502);
   });
 
   app.get('/api/sessions/:id/debug-trace', auth.requireAuth, async (c) => {
@@ -561,6 +1142,7 @@ export function createControlPlane(
       users: db.listUsers(),
       dailyCapUsd: db.getDailyCapUsd(),
       todaySpend: db.listTodaySpendByUser(),
+      spendByPurpose: db.listTodaySpendByPurpose(),
       sessions: db.listSessions().map((s) => db.toSessionDto(s, c.get('user'))),
     });
   });

@@ -32,11 +32,19 @@ export interface WarmPoolStatus {
 
 export type BootProgressListener = (sessionId: string, progress: BootProgressDto) => void;
 
+export type DuplicateMode = 'branch-off' | 'fresh-from-main';
+
 export interface WorkspaceDriver {
+  setRawWorkspaceToken?(sessionId: string, token: string): void;
   ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint>;
   stop(session: SessionRecord): Promise<void>;
   destroy(session: SessionRecord): Promise<void>;
-  duplicateWorkspace(source: SessionRecord, target: SessionRecord): Promise<void>;
+  pruneNodeModules?(session: SessionRecord): Promise<void>;
+  duplicateWorkspace(
+    source: SessionRecord,
+    target: SessionRecord,
+    mode?: DuplicateMode,
+  ): Promise<void>;
   pushSessionBranch(session: SessionRecord, token: string): Promise<void>;
   fetchIntoSession(session: SessionRecord, token: string): Promise<void>;
   setBootProgressListener?(listener: BootProgressListener): void;

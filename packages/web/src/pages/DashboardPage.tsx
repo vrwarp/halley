@@ -1,15 +1,19 @@
-import type { EditorSessionDto, SpendStatusDto, UserDto } from '@halley/shared';
+import type { EditorSessionDto, LiveHistoryEntryDto, SpendStatusDto, UserDto } from '@halley/shared';
 import {
   CheckCircle2,
   Copy,
+  GitBranch,
+  GitCommitHorizontal,
+  History,
   Loader2,
   LogOut,
   Plus,
+  RotateCcw,
   Settings,
   Sparkles,
   Trash2,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 
 interface Props {
@@ -17,7 +21,7 @@ interface Props {
   repo: string;
   sessions: EditorSessionDto[];
   spend: SpendStatusDto;
-  onOpenSession: (id: string) => void;
+  onOpenSession: (id: string, opts?: { openPublish?: boolean }) => void;
   onOpenAdmin: () => void;
   onRefresh: () => Promise<void>;
   onLogout: () => Promise<void>;
@@ -28,6 +32,13 @@ function statusBadge(s: EditorSessionDto) {
     return (
       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700 border border-emerald-200/70">
         <CheckCircle2 className="h-3 w-3" /> Published
+      </span>
+    );
+  }
+  if (s.status === 'merged') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800 border border-amber-200">
+        Merged (deploy pending)
       </span>
     );
   }
@@ -95,9 +106,33 @@ export function DashboardPage({
 }: Props) {
   const [title, setTitle] = useState('');
   const [creating, setCreating] = useState(false);
+  const [tab, setTab] = useState<'drafts' | 'history'>('drafts');
+  const [history, setHistory] = useState<LiveHistoryEntryDto[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [undoTarget, setUndoTarget] = useState<LiveHistoryEntryDto | null>(null);
+  const [undoReason, setUndoReason] = useState('');
+  const [undoBusy, setUndoBusy] = useState(false);
+  const [undoError, setUndoError] = useState<string | null>(null);
 
-  const mySessions = sessions.filter((s) => s.isOwner);
-  const teamSessions = sessions.filter((s) => !s.isOwner);
+  const isFinished = (s: EditorSessionDto) => s.status === 'published' || s.status === 'merged';
+  const myDrafts = sessions.filter((s) => s.isOwner && !isFinished(s));
+  const teamDrafts = sessions.filter((s) => !s.isOwner && !isFinished(s));
+
+  const loadHistory = async () => {
+    setLoadingHistory(true);
+    try {
+      const res = await api.listHistory();
+      setHistory(res.entries);
+    } catch {
+      // ignore
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadHistory();
+  }, [sessions.length]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -118,25 +153,53 @@ export function DashboardPage({
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this draft edit? Unsaved changes in this draft will be discarded.')) return;
+    if (!confirm('Discard this draft and its workspace?')) return;
     await api.deleteSession(id);
     await onRefresh();
   };
 
+  const handleConfirmUndo = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!undoTarget || !undoReason.trim() || undoBusy) return;
+    setUndoBusy(true);
+    setUndoError(null);
+    try {
+      const { session } = await api.revertPublication({
+        sessionId: undoTarget.sessionId ?? undefined,
+        sha: undoTarget.sha,
+        reason: undoReason.trim(),
+        title: undoTarget.title,
+      });
+      setUndoTarget(null);
+      setUndoReason('');
+      // Q17: Open the revert session in the Editor with Live vs Draft Publish modal already open
+      onOpenSession(session.id, { openPublish: true });
+    } catch (err) {
+      setUndoError(err instanceof Error ? err.message : 'Could not start undo');
+    } finally {
+      setUndoBusy(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-[#FAF9F7]">
-      <header className="border-b border-[#E7E5E4] bg-white/80 backdrop-blur-sm">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-6">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-50 text-amber-700 border border-amber-200/70">
-              <Sparkles className="h-3.5 w-3.5" />
+    <div className="min-h-screen bg-[#FAF9F7] text-[#1C1917]">
+      <header className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/90 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-3.5">
+          <div className="flex items-center gap-3">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-stone-900 text-amber-400">
+              <Sparkles className="h-4 w-4" />
             </div>
-            <span className="text-sm font-semibold text-stone-900">Halley</span>
-            <span className="text-stone-300">/</span>
-            <span className="text-sm text-stone-500">{repo}</span>
+            <div>
+              <h1 className="text-sm font-semibold tracking-tight text-stone-900">Halley</h1>
+              <p className="text-xs text-stone-500">{repo}</p>
+            </div>
           </div>
 
           <div className="flex items-center gap-3">
+            <span className="hidden text-xs text-stone-500 sm:inline">
+              Daily AI budget: ${spend.spentTodayUsd.toFixed(2)} / $
+              {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}
+            </span>
             {user.isAdmin && (
               <button
                 type="button"
@@ -147,44 +210,34 @@ export function DashboardPage({
                 Admin
               </button>
             )}
-            <div className="flex items-center gap-2 text-xs text-stone-600">
-              {user.picture && (
-                <img src={user.picture} alt={user.name} className="h-6 w-6 rounded-full" />
-              )}
-              <span>{user.name}</span>
+            <div className="flex items-center gap-2 border-l border-stone-200 pl-3">
+              <span className="text-xs font-medium text-stone-700">{user.name}</span>
+              <button
+                type="button"
+                onClick={onLogout}
+                title="Sign out"
+                className="rounded-lg p-1.5 text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+              >
+                <LogOut className="h-4 w-4" />
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={onLogout}
-              title="Sign out"
-              className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 hover:text-stone-700"
-            >
-              <LogOut className="h-4 w-4" />
-            </button>
           </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-10">
-        {spend.capped && (
-          <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
-            You&apos;ve reached today&apos;s AI editing budget (${(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}). Inline text editing still works, or ask an admin to grant extra allowance.
-          </div>
-        )}
-
-        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-6 shadow-2xs">
-          <h1 className="font-serif text-3xl text-stone-900">What would you like to update?</h1>
+        <section className="rounded-2xl border border-[#E7E5E4] bg-white p-6 shadow-xs">
+          <h2 className="text-lg font-semibold text-stone-900">Start a new website edit</h2>
           <p className="mt-1 text-sm text-stone-500">
-            Start a new draft to make changes safely without affecting the live website until you publish.
+            Every edit gets its own private live preview. Publish whenever you&apos;re ready.
           </p>
-
-          <form onSubmit={handleCreate} className="mt-5 flex flex-col gap-3 sm:flex-row">
+          <form onSubmit={handleCreate} className="mt-4 flex flex-col gap-3 sm:flex-row">
             <input
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g., Update Easter service times, Add Youth retreat photos…"
-              className="flex-1 rounded-xl border border-stone-300 bg-[#FAF9F7] px-4 py-2.5 text-sm text-stone-900 placeholder:text-stone-400 outline-none focus:border-amber-600 focus:bg-white"
+              placeholder='e.g. "Update Easter service times" or "Add Fall Retreat page"'
+              className="flex-1 rounded-xl border border-stone-300 bg-[#FAF9F7] px-4 py-2.5 text-sm text-stone-900 placeholder:text-stone-400 focus:border-amber-600 focus:bg-white focus:outline-none"
             />
             <button
               type="submit"
@@ -197,108 +250,311 @@ export function DashboardPage({
           </form>
         </section>
 
-        <section className="mt-10">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
-            Your Edits ({mySessions.length})
-          </h2>
-          {mySessions.length === 0 ? (
-            <p className="mt-3 text-sm text-stone-500">No edits yet — create one above to get started.</p>
-          ) : (
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              {mySessions.map((s) => (
-                <div
-                  key={s.id}
-                  className="group flex flex-col justify-between rounded-xl border border-[#E7E5E4] bg-white p-4 transition hover:border-stone-300 hover:shadow-xs"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <button
-                      type="button"
-                      onClick={() => onOpenSession(s.id)}
-                      className="text-left flex-1"
-                    >
-                      <h3 className="font-semibold text-stone-900 group-hover:text-amber-800">
-                        {s.title}
-                      </h3>
-                      <p className="mt-1 text-xs text-stone-500">
-                        {s.changedFilesCount > 0
-                          ? `${s.changedFilesCount} page/file change${s.changedFilesCount === 1 ? '' : 's'}`
-                          : 'No changes yet'}
-                        {' · '}
-                        {new Date(s.lastActiveAt).toLocaleDateString()}
-                      </p>
-                    </button>
-                    {statusBadge(s)}
-                  </div>
+        {/* Q20: Split Dashboard into Active Drafts vs Published History */}
+        <div className="mt-8 flex items-center gap-2 border-b border-stone-200">
+          <button
+            type="button"
+            onClick={() => setTab('drafts')}
+            className={`border-b-2 px-4 py-2.5 text-sm font-semibold transition ${
+              tab === 'drafts'
+                ? 'border-stone-900 text-stone-900'
+                : 'border-transparent text-stone-500 hover:text-stone-800'
+            }`}
+          >
+            Active Drafts ({myDrafts.length + teamDrafts.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setTab('history');
+              void loadHistory();
+            }}
+            className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-semibold transition ${
+              tab === 'history'
+                ? 'border-stone-900 text-stone-900'
+                : 'border-transparent text-stone-500 hover:text-stone-800'
+            }`}
+          >
+            <History className="h-4 w-4" />
+            Published History ({history.length})
+          </button>
+        </div>
 
-                  <div className="mt-4 flex items-center justify-between border-t border-stone-100 pt-3">
-                    <button
-                      type="button"
-                      onClick={() => onOpenSession(s.id)}
-                      className="text-xs font-semibold text-stone-700 hover:text-amber-700"
+        {tab === 'drafts' ? (
+          <>
+            <section className="mt-6">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+                Your Active Drafts ({myDrafts.length})
+              </h2>
+              {myDrafts.length === 0 ? (
+                <p className="mt-3 text-sm text-stone-500">
+                  No active drafts — start a new edit above or continue from Published History.
+                </p>
+              ) : (
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  {myDrafts.map((s) => (
+                    <div
+                      key={s.id}
+                      className="group flex flex-col justify-between rounded-xl border border-[#E7E5E4] bg-white p-4 transition hover:border-stone-300 hover:shadow-xs"
                     >
-                      {s.status === 'published' ? 'View archive →' : 'Open editor →'}
-                    </button>
-                    {s.status !== 'published' && (
-                      <button
-                        type="button"
-                        onClick={() => handleDelete(s.id)}
-                        title="Discard draft"
-                        className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-red-600"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
+                      <div className="flex items-start justify-between gap-3">
+                        <button
+                          type="button"
+                          onClick={() => onOpenSession(s.id)}
+                          className="text-left flex-1"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <h3 className="font-semibold text-stone-900 group-hover:text-amber-800">
+                              {s.title}
+                            </h3>
+                            {s.kind === 'continuation' && (
+                              <span className="rounded bg-stone-100 px-1.5 py-0.5 text-[10px] font-medium text-stone-600">
+                                Continued
+                              </span>
+                            )}
+                            {s.kind === 'revert' && (
+                              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                                Undo draft
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-1 text-xs text-stone-500">
+                            {s.changedFilesCount > 0
+                              ? `${s.changedFilesCount} page/file change${s.changedFilesCount === 1 ? '' : 's'}`
+                              : 'No changes yet'}
+                            {' · '}
+                            {new Date(s.lastActiveAt).toLocaleDateString()}
+                          </p>
+                        </button>
+                        {statusBadge(s)}
+                      </div>
+
+                      <div className="mt-4 flex items-center justify-between border-t border-stone-100 pt-3">
+                        <button
+                          type="button"
+                          onClick={() => onOpenSession(s.id)}
+                          className="text-xs font-semibold text-stone-700 hover:text-amber-700"
+                        >
+                          Open editor →
+                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleDuplicate(s.id)}
+                            title="Branch off a copy of this draft"
+                            className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2 py-1 text-[11px] font-medium text-stone-600 hover:bg-stone-50"
+                          >
+                            <GitBranch className="h-3 w-3" />
+                            Branch off
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleDelete(s.id)}
+                            title="Discard draft"
+                            className="rounded p-1 text-stone-400 hover:bg-stone-100 hover:text-red-600"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-        </section>
+              )}
+            </section>
 
-        {teamSessions.length > 0 && (
-          <section className="mt-10">
+            {teamDrafts.length > 0 && (
+              <section className="mt-8">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+                  Team Drafts (Read-only)
+                </h2>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  {teamDrafts.map((s) => (
+                    <div
+                      key={s.id}
+                      className="flex flex-col justify-between rounded-xl border border-[#E7E5E4] bg-white/70 p-4"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <h3 className="font-semibold text-stone-900">{s.title}</h3>
+                          <p className="mt-1 text-xs text-stone-500">
+                            By {s.ownerName} · {new Date(s.lastActiveAt).toLocaleDateString()}
+                          </p>
+                        </div>
+                        {statusBadge(s)}
+                      </div>
+
+                      <div className="mt-4 flex items-center justify-between border-t border-stone-100 pt-3">
+                        <button
+                          type="button"
+                          onClick={() => onOpenSession(s.id)}
+                          className="text-xs font-medium text-stone-600 hover:text-stone-900"
+                        >
+                          View read-only →
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleDuplicate(s.id)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
+                        >
+                          <Copy className="h-3 w-3" />
+                          Duplicate to my edits
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
+        ) : (
+          <section className="mt-6">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
-              Team Edits (Read-only)
+              Live Site Timeline (Halley publications &amp; GitHub commits)
             </h2>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              {teamSessions.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex flex-col justify-between rounded-xl border border-[#E7E5E4] bg-white/70 p-4"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <h3 className="font-semibold text-stone-900">{s.title}</h3>
+            {loadingHistory && history.length === 0 ? (
+              <p className="mt-3 text-sm text-stone-500">Loading published history…</p>
+            ) : history.length === 0 ? (
+              <p className="mt-3 text-sm text-stone-500">No published edits yet.</p>
+            ) : (
+              <div className="mt-3 divide-y divide-stone-200 rounded-xl border border-[#E7E5E4] bg-white">
+                {history.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <GitCommitHorizontal className="h-4 w-4 shrink-0 text-stone-400" />
+                        <span className="font-semibold text-sm text-stone-900">{entry.title}</span>
+                        {entry.source === 'github' && (
+                          <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-medium text-stone-600">
+                            GitHub commit
+                          </span>
+                        )}
+                        {entry.sessionKind === 'continuation' && (
+                          <span className="rounded-full bg-stone-100 px-2 py-0.5 text-[10px] font-medium text-stone-600">
+                            Continued
+                          </span>
+                        )}
+                        {entry.sessionKind === 'revert' && (
+                          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-800 border border-amber-200">
+                            Undo
+                          </span>
+                        )}
+                        {entry.revertedBy && (
+                          <span className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700 border border-red-200">
+                            Undone by {entry.revertedBy.authorName}
+                          </span>
+                        )}
+                      </div>
                       <p className="mt-1 text-xs text-stone-500">
-                        By {s.ownerName} · {new Date(s.lastActiveAt).toLocaleDateString()}
+                        {entry.authorName} · {new Date(entry.timestamp).toLocaleString()} ·{' '}
+                        <span className="font-mono">{entry.shortSha}</span>
+                        {entry.revertReason ? ` · Reason: ${entry.revertReason}` : ''}
                       </p>
                     </div>
-                    {statusBadge(s)}
-                  </div>
 
-                  <div className="mt-4 flex items-center justify-between border-t border-stone-100 pt-3">
-                    <button
-                      type="button"
-                      onClick={() => onOpenSession(s.id)}
-                      className="text-xs font-medium text-stone-600 hover:text-stone-900"
-                    >
-                      View read-only →
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDuplicate(s.id)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
-                    >
-                      <Copy className="h-3 w-3" />
-                      Duplicate to my edits
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {entry.sessionId && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => onOpenSession(entry.sessionId!)}
+                            className="rounded-lg border border-stone-200 px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
+                          >
+                            View archive
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleDuplicate(entry.sessionId!)}
+                            className="inline-flex items-center gap-1 rounded-lg bg-stone-900 px-2.5 py-1 text-xs font-semibold text-white hover:bg-stone-800"
+                          >
+                            <Copy className="h-3 w-3" />
+                            Continue editing
+                          </button>
+                        </>
+                      )}
+                      {entry.canUndo ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUndoTarget(entry);
+                            setUndoReason('');
+                            setUndoError(null);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2.5 py-1 text-xs font-medium text-stone-700 hover:border-red-300 hover:text-red-700"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          {entry.sessionKind === 'revert' ? 'Put it back' : 'Undo'}
+                        </button>
+                      ) : (
+                        entry.undoDisabledReason && (
+                          <span className="text-[11px] text-stone-400">
+                            {entry.undoDisabledReason}
+                          </span>
+                        )
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </section>
         )}
       </main>
+
+      {/* Undo publication reason modal (Q1, Q5, Q17) */}
+      {undoTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/35 p-4 backdrop-blur-[2px]">
+          <form
+            onSubmit={handleConfirmUndo}
+            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-xl space-y-4"
+          >
+            <div>
+              <h3 className="text-base font-semibold text-stone-900">
+                Undo &ldquo;{undoTarget.title}&rdquo;?
+              </h3>
+              <p className="mt-1 text-xs text-stone-500">
+                This prepares an undo on top of the latest live site and opens the Live vs Draft
+                review so you can inspect (or undo only specific files) before publishing.
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-stone-700 mb-1">
+                Reason for undoing (required)
+              </label>
+              <input
+                type="text"
+                required
+                value={undoReason}
+                onChange={(e) => setUndoReason(e.target.value)}
+                placeholder='e.g. "Wrong service time listed on Easter banner"'
+                className="w-full rounded-xl border border-stone-300 px-3.5 py-2 text-sm focus:border-stone-900 focus:outline-none"
+              />
+            </div>
+            {undoError && (
+              <p className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700">{undoError}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setUndoTarget(null)}
+                className="rounded-lg px-3.5 py-2 text-xs font-medium text-stone-600 hover:bg-stone-100"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={!undoReason.trim() || undoBusy}
+                className="rounded-lg bg-stone-900 px-4 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+              >
+                {undoBusy ? 'Preparing undo…' : 'Review & undo'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

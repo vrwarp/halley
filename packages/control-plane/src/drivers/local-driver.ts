@@ -147,37 +147,37 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
         }
         await runGit(workspaceDir, ['checkout', '-B', session.working_branch, session.base_branch]);
         baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
-
-        // Install dependencies (fast if devLocalRepo has node_modules or npm cache)
-        const hasModules = await fs
-          .access(path.join(workspaceDir, 'node_modules'))
-          .then(() => true)
-          .catch(() => false);
-        if (!hasModules) {
-          this.emitProgress(session.id, 'installing_deps', 'Installing project packages…');
-          if (this.config.devLocalRepo) {
-            const srcModules = path.join(this.config.devLocalRepo, 'node_modules');
-            const hasSrcModules = await fs.access(srcModules).then(() => true).catch(() => false);
-            if (hasSrcModules) {
-              await fs.symlink(srcModules, path.join(workspaceDir, 'node_modules'));
-            }
-          } else {
-            const hasPkgLock = await fs.access(path.join(workspaceDir, 'package-lock.json')).then(() => true).catch(() => false);
-            const hasPnpmLock = await fs.access(path.join(workspaceDir, 'pnpm-lock.yaml')).then(() => true).catch(() => false);
-            const { execFile } = await import('node:child_process');
-            const { promisify } = await import('node:util');
-            const execFileAsync = promisify(execFile);
-            if (hasPkgLock) {
-              await execFileAsync('npm', ['ci', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
-            } else if (hasPnpmLock) {
-              await execFileAsync('pnpm', ['install', '--frozen-lockfile'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
-            } else {
-              await execFileAsync('npm', ['install', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
-            }
-          }
-        }
       } else if (!baseSha) {
         baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
+      }
+
+      // Install or restore dependencies (including after 7-day node_modules pruning)
+      const hasModules = await fs
+        .access(path.join(workspaceDir, 'node_modules'))
+        .then(() => true)
+        .catch(() => false);
+      if (!hasModules) {
+        this.emitProgress(session.id, 'installing_deps', 'Installing project packages…');
+        if (this.config.devLocalRepo) {
+          const srcModules = path.join(this.config.devLocalRepo, 'node_modules');
+          const hasSrcModules = await fs.access(srcModules).then(() => true).catch(() => false);
+          if (hasSrcModules) {
+            await fs.symlink(srcModules, path.join(workspaceDir, 'node_modules'));
+          }
+        } else {
+          const hasPkgLock = await fs.access(path.join(workspaceDir, 'package-lock.json')).then(() => true).catch(() => false);
+          const hasPnpmLock = await fs.access(path.join(workspaceDir, 'pnpm-lock.yaml')).then(() => true).catch(() => false);
+          const { execFile } = await import('node:child_process');
+          const { promisify } = await import('node:util');
+          const execFileAsync = promisify(execFile);
+          if (hasPkgLock) {
+            await execFileAsync('npm', ['ci', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+          } else if (hasPnpmLock) {
+            await execFileAsync('pnpm', ['install', '--frozen-lockfile'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+          } else {
+            await execFileAsync('npm', ['install', '--ignore-scripts'], { cwd: workspaceDir, maxBuffer: 16 * 1024 * 1024 });
+          }
+        }
       }
 
       this.emitProgress(session.id, 'starting_preview', 'Starting Astro live preview…');
@@ -216,7 +216,8 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
         HALLEY_GIT_BOT_EMAIL: this.config.gitBotEmail,
         HALLEY_EDITOR_NAME: session.owner_name || 'Editor',
         HALLEY_EDITOR_EMAIL: session.owner_email || 'editor@example.com',
-        HALLEY_READ_ONLY: session.status === 'published' ? 'true' : 'false',
+        HALLEY_READ_ONLY:
+          session.status === 'published' || session.status === 'merged' ? 'true' : 'false',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -251,12 +252,14 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
       await new Promise((r) => setTimeout(r, 400));
     }
 
+    const isFrozen = session.status === 'published' || session.status === 'merged';
     this.db.updateSession(session.id, {
-      status: session.status === 'published' ? 'published' : 'running',
+      status: isFrozen ? session.status : 'running',
       base_sha: baseSha,
       runner_url: runnerUrl,
       astro_url: astroUrl,
       astro_base: astroBase,
+      node_modules_pruned_at: null,
       last_active_at: new Date().toISOString(),
     });
 
@@ -282,8 +285,9 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
       if (proc.exitCode === null) proc.kill('SIGKILL');
     }
     this.procs.delete(session.id);
+    const isFrozen = session.status === 'published' || session.status === 'merged';
     this.db.updateSession(session.id, {
-      status: session.status === 'published' ? 'published' : 'sleeping',
+      status: isFrozen ? session.status : 'sleeping',
       runner_url: null,
       astro_url: null,
     });
@@ -294,19 +298,55 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
     await fs.rm(this.sessionDir(session.id), { recursive: true, force: true });
   }
 
-  async duplicateWorkspace(source: SessionRecord, target: SessionRecord): Promise<void> {
-    const srcWs = path.join(this.sessionDir(source.id), 'workspace');
+  async pruneNodeModules(session: SessionRecord): Promise<void> {
+    const nmPath = path.join(this.sessionDir(session.id), 'workspace', 'node_modules');
+    await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
+  }
+
+  async duplicateWorkspace(
+    source: SessionRecord,
+    target: SessionRecord,
+    mode: 'branch-off' | 'fresh-from-main' = 'branch-off',
+  ): Promise<void> {
     const dstBase = this.sessionDir(target.id);
+    await fs.mkdir(path.join(dstBase, 'state'), { recursive: true });
+
+    if (mode === 'fresh-from-main') {
+      // Leave workspace absent so ensureRunning clones cleanly from latest origin/main
+      return;
+    }
+
+    const srcBase = this.sessionDir(source.id);
+    const srcWs = path.join(srcBase, 'workspace');
     const dstWs = path.join(dstBase, 'workspace');
-    await fs.mkdir(dstBase, { recursive: true });
-    await runGit(dstBase, ['clone', srcWs, 'workspace']);
+
+    // Copy full workspace directory including dirty uncommitted files (excluding node_modules)
+    await fs.cp(srcWs, dstWs, {
+      recursive: true,
+      filter: (srcPath) => path.basename(srcPath) !== 'node_modules',
+    });
+
+    // Copy staged uploads (NOT live pi.sqlite per Q18)
+    const srcUploads = path.join(srcBase, 'state', 'uploads');
+    const hasUploads = await fs
+      .access(srcUploads)
+      .then(() => true)
+      .catch(() => false);
+    if (hasUploads) {
+      await fs.cp(srcUploads, path.join(dstBase, 'state', 'uploads'), { recursive: true });
+    }
+
     if (!this.config.devLocalRepo) {
       await runGit(dstWs, ['remote', 'set-url', 'origin', `https://github.com/${target.repo}.git`]);
     }
     await runGit(dstWs, ['checkout', '-b', target.working_branch]);
+
     if (this.config.devLocalRepo) {
       const srcModules = path.join(this.config.devLocalRepo, 'node_modules');
-      const hasSrcModules = await fs.access(srcModules).then(() => true).catch(() => false);
+      const hasSrcModules = await fs
+        .access(srcModules)
+        .then(() => true)
+        .catch(() => false);
       if (hasSrcModules) {
         await fs.symlink(srcModules, path.join(dstWs, 'node_modules')).catch(() => {});
       }

@@ -759,6 +759,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         await execFileAsync('docker', ['cp', mirrorDir, `${slot.containerName}:/halley-mirror/`]);
       }
 
+      const isFrozen = session.status === 'published' || session.status === 'merged';
       const persona = this.db.getUserById(session.owner_user_id)?.persona ?? 'non-technical';
       const claimRes = await fetch(`${slot.runnerUrl}/internal/claim`, {
         method: 'POST',
@@ -769,7 +770,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           editorName: session.owner_name || 'Editor',
           editorEmail: session.owner_email || 'editor@example.com',
           persona,
-          readOnly: session.status === 'published',
+          readOnly: isFrozen,
           syncFromMirror: needsSync,
         }),
       });
@@ -786,11 +787,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
 
       this.db.updateSession(session.id, {
         container_id: slot.containerId,
-        status: session.status === 'published' ? 'published' : 'running',
+        status: isFrozen ? session.status : 'running',
         base_sha: baseSha,
         runner_url: slot.runnerUrl,
         astro_url: slot.astroUrl,
         astro_base: astroBase,
+        node_modules_pruned_at: null,
         last_active_at: new Date().toISOString(),
       });
 
@@ -821,6 +823,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     }
 
     const name = this.containerName(session.id);
+    const isFrozen = session.status === 'published' || session.status === 'merged';
     try {
       // Fast-path: if container is already running & healthy (and has a valid WORKSPACE_TOKEN), return immediately
       let inspect = await dockerRequest<{
@@ -849,11 +852,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
               const astroBase = health.originalBase || session.astro_base || '/';
               const baseSha = health.baseSha || session.base_sha;
               this.db.updateSession(session.id, {
-                status: session.status === 'published' ? 'published' : 'running',
+                status: isFrozen ? session.status : 'running',
                 runner_url: runnerUrl,
                 astro_url: astroUrl,
                 astro_base: astroBase,
                 base_sha: baseSha,
+                node_modules_pruned_at: null,
                 last_active_at: new Date().toISOString(),
               });
               this.emitProgress(session.id, 'ready', 'Workspace ready!');
@@ -942,7 +946,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           `HALLEY_GIT_BOT_EMAIL=${this.config.gitBotEmail}`,
           `HALLEY_EDITOR_NAME=${session.owner_name || 'Editor'}`,
           `HALLEY_EDITOR_EMAIL=${session.owner_email || 'editor@example.com'}`,
-          `HALLEY_READ_ONLY=${session.status === 'published' ? 'true' : 'false'}`,
+          `HALLEY_READ_ONLY=${isFrozen ? 'true' : 'false'}`,
         ];
 
         const created = await dockerRequest<{ Id: string }>('POST', `/containers/create?name=${name}`, {
@@ -986,11 +990,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       const baseSha = health.baseSha || session.base_sha;
 
       this.db.updateSession(session.id, {
-        status: session.status === 'published' ? 'published' : 'running',
+        status: isFrozen ? session.status : 'running',
         base_sha: baseSha,
         runner_url: runnerUrl,
         astro_url: astroUrl,
         astro_base: astroBase,
+        node_modules_pruned_at: null,
         last_active_at: new Date().toISOString(),
       });
 
@@ -1007,8 +1012,9 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     const name = this.containerName(session.id);
     this.bootProgress.delete(session.id);
     await dockerRequest('POST', `/containers/${name}/stop?t=5`).catch(() => {});
+    const isFrozen = session.status === 'published' || session.status === 'merged';
     this.db.updateSession(session.id, {
-      status: session.status === 'published' ? 'published' : 'sleeping',
+      status: isFrozen ? session.status : 'sleeping',
       runner_url: null,
       astro_url: null,
     });
@@ -1022,9 +1028,30 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     await dockerRequest('DELETE', `/volumes/${session.volume_name}`).catch(() => {});
   }
 
-  async duplicateWorkspace(source: SessionRecord, target: SessionRecord): Promise<void> {
+  async pruneNodeModules(session: SessionRecord): Promise<void> {
+    await execFileAsync('docker', [
+      'run',
+      '--rm',
+      '-v',
+      `${session.volume_name}:/halley-volume`,
+      this.config.workspaceImage,
+      'sh',
+      '-c',
+      'rm -rf /halley-volume/workspace/node_modules',
+    ]);
+  }
+
+  async duplicateWorkspace(
+    source: SessionRecord,
+    target: SessionRecord,
+    mode: 'branch-off' | 'fresh-from-main' = 'branch-off',
+  ): Promise<void> {
     await dockerRequest('POST', '/volumes/create', { Name: target.volume_name });
-    // Copy workspace git repo from source volume to target volume and checkout new branch
+    if (mode === 'fresh-from-main') {
+      // Leave volume empty so the container clones cleanly from latest origin/main on boot
+      return;
+    }
+    // Copy workspace git repo (including uncommitted edits) + staged uploads (NOT live pi.sqlite per Q18)
     await execFileAsync('docker', [
       'run',
       '--rm',
@@ -1035,7 +1062,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       this.config.workspaceImage,
       'sh',
       '-c',
-      `cp -a /src/workspace /dst/workspace && cd /dst/workspace && git checkout -b ${target.working_branch}`,
+      [
+        'mkdir -p /dst/state',
+        'cp -a /src/workspace /dst/workspace',
+        'if [ -d /src/state/uploads ]; then cp -a /src/state/uploads /dst/state/uploads; fi',
+        `cd /dst/workspace && git checkout -b ${target.working_branch}`,
+      ].join(' && '),
     ]);
   }
 

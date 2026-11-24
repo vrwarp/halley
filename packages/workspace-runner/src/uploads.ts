@@ -18,13 +18,45 @@ export class UploadManager {
   ): Promise<StagedAttachment> {
     await this.init();
     const stagedId = crypto.randomUUID();
-    const safeExt = path.extname(filename).replace(/[^a-zA-Z0-9.]/g, '') || '.bin';
+    let safeExt = path.extname(filename).replace(/[^a-zA-Z0-9.]/g, '').toLowerCase() || '.bin';
+    let finalBytes = bytes;
+    let finalMime = mimeType;
+
+    // Strip EXIF/GPS/XMP metadata at upload time while applying EXIF orientation first
+    // so portrait phone photos stay upright and zero location metadata persists on disk.
+    try {
+      const meta = await sharp(bytes).metadata();
+      if (meta.format) {
+        const oriented = sharp(bytes).rotate();
+        if (meta.format === 'jpeg') {
+          finalBytes = await oriented.jpeg({ quality: 95, mozjpeg: false }).toBuffer();
+          safeExt = '.jpg';
+          finalMime = 'image/jpeg';
+        } else if (meta.format === 'png') {
+          finalBytes = await oriented.png().toBuffer();
+          safeExt = '.png';
+          finalMime = 'image/png';
+        } else if (meta.format === 'webp') {
+          finalBytes = await oriented.webp({ quality: 95 }).toBuffer();
+          safeExt = '.webp';
+          finalMime = 'image/webp';
+        } else if (meta.format !== 'svg' && meta.format !== 'gif') {
+          // HEIC / AVIF / TIFF -> high-quality WebP without metadata
+          finalBytes = await oriented.webp({ quality: 92 }).toBuffer();
+          safeExt = '.webp';
+          finalMime = 'image/webp';
+        }
+      }
+    } catch {
+      // Non-image or undecodable buffer — store as-is
+    }
+
     const dest = path.join(this.uploadDir, `${stagedId}${safeExt}`);
-    await fs.writeFile(dest, bytes);
+    await fs.writeFile(dest, finalBytes);
 
     let thumbnailDataUrl: string | undefined;
     try {
-      const thumb = await sharp(bytes)
+      const thumb = await sharp(finalBytes)
         .rotate()
         .resize({ width: 160, height: 160, fit: 'inside', withoutEnlargement: true })
         .webp({ quality: 72 })
@@ -37,8 +69,8 @@ export class UploadManager {
     return {
       stagedId,
       filename: path.basename(filename),
-      mimeType,
-      sizeBytes: bytes.length,
+      mimeType: finalMime,
+      sizeBytes: finalBytes.length,
       thumbnailDataUrl,
     };
   }

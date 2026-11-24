@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
@@ -7,6 +8,8 @@ import { discoverSiteRoutes, PerFileMutex } from '@halley/astro-dev-edit';
 import {
   ChatClientMessageSchema,
   type ChatServerMessage,
+  type ConflictResolutionRecordDto,
+  type MergeReviewStateDto,
 } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
@@ -14,17 +17,30 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { AstroDevManager } from './astro-manager.js';
 import {
   createCheckpoint,
+  ensureGitRerere,
   getGitChanges,
   hasProtectedPathChanges,
   listCheckpoints,
-  rebaseOnBase,
+  mergeWithBase,
+  resetToRef,
   revertSingleFile,
+  startRevertCommits,
   undoToCheckpoint,
   type GitIdentity,
 } from './checkpoints-and-git.js';
+import {
+  applyResolvedFile,
+  buildConflictEvidencePack,
+  estimateEscalationCost,
+  getUpstreamCommits,
+  resolvePackWithLlm,
+  tryDeterministicResolve,
+  type ConflictEvidencePack,
+} from './conflict-protocol.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import { runAllVerificationChecks } from './verify.js';
+import { buildChangeCards } from './visual-diff.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -270,6 +286,7 @@ async function main() {
       await execFileAsync('git', ['checkout', '-B', body.workingBranch], { cwd: REPO_ROOT });
     }
 
+    await ensureGitRerere(REPO_ROOT).catch(() => {});
     baseSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
     if (body.editorName) gitIdentity.editorName = body.editorName;
     if (body.editorEmail) gitIdentity.editorEmail = body.editorEmail;
@@ -313,7 +330,7 @@ async function main() {
     const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
     const changes = await getGitChanges(REPO_ROOT, baseRef);
     const checkpoints = await listCheckpoints(REPO_ROOT, baseSha);
-    return c.json({ changes, checkpoints });
+    return c.json({ changes, checkpoints, baseSha });
   });
 
   app.post('/internal/git/revert-file', async (c) => {
@@ -347,20 +364,584 @@ async function main() {
     return c.json({ clean: protectedFiles.length === 0, protectedFiles });
   });
 
-  app.post('/internal/git/rebase', async (c) => {
+  const handleMergeWithBase = async (c: import('hono').Context) => {
     const body = (await c.req.json().catch(() => ({}))) as {
       baseBranch?: string;
-      gitAskPassToken?: string;
+      skipFetch?: boolean;
     };
-    const outcome = await rebaseOnBase(REPO_ROOT, {
+    await ensureGitRerere(REPO_ROOT);
+    const outcome = await mergeWithBase(REPO_ROOT, {
       baseBranch: body.baseBranch || BASE_BRANCH,
       identity: gitIdentity,
+      skipFetch: body.skipFetch,
       onResolveConflict: async (conflictedFiles) => {
         if (!piRuntime) return false;
         return piRuntime.submitConflictResolutionPrompt(conflictedFiles);
       },
     });
+    if ((outcome.status === 'clean' || outcome.status === 'resolved') && outcome.newBaseSha) {
+      baseSha = outcome.newBaseSha;
+      await savePersistedSessionMeta().catch(() => {});
+    }
     return c.json(outcome);
+  };
+
+  app.post('/internal/git/rebase', handleMergeWithBase);
+  app.post('/internal/git/sync', handleMergeWithBase);
+
+  // Track active conflict/merge review state in memory for Sync, Publish, Revert & Escalation
+  let activeMergeState: MergeReviewStateDto | null = null;
+  let activeConflictPacks = new Map<string, ConflictEvidencePack>();
+  let prevBaseSha = '';
+
+  const runPostSyncTasks = async (upstreamSummary: string, newSha: string, prevSha: string) => {
+    prevBaseSha = prevSha;
+    baseSha = newSha;
+    await savePersistedSessionMeta().catch(() => {});
+    await piRuntime?.reloadAgentsMd().catch(() => {});
+    if (upstreamSummary) {
+      piRuntime?.addSystemContextNote(`Live site updates merged into this draft: ${upstreamSummary}`);
+    }
+    // Check if dependencies or astro config changed in prevSha..newSha
+    if (prevSha && newSha && prevSha !== newSha) {
+      const diffFiles = await execFileAsync('git', ['diff', '--name-only', `${prevSha}..${newSha}`], {
+        cwd: REPO_ROOT,
+      })
+        .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
+        .catch(() => [] as string[]);
+      const needsRestart = diffFiles.some(
+        (f) =>
+          f === 'package.json' ||
+          f === 'package-lock.json' ||
+          f === 'pnpm-lock.yaml' ||
+          f.startsWith('astro.config.'),
+      );
+      if (needsRestart) {
+        await astroManager.stop().catch(() => {});
+        await astroManager.start().catch(() => {});
+      }
+    }
+  };
+
+  app.post('/internal/context-note', async (c) => {
+    const body = (await c.req.json()) as { note?: string; persist?: boolean };
+    if (body.note?.trim()) {
+      piRuntime?.addSystemContextNote(body.note.trim());
+      if (body.persist) {
+        await fs.mkdir(STATE_DIR, { recursive: true });
+        await fs.writeFile(path.join(STATE_DIR, 'handoff-context.txt'), body.note.trim(), 'utf8');
+      }
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post('/internal/sync/start', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    if (piRuntime?.isBusy()) {
+      return c.json({ error: 'Pi is currently editing; try again once it finishes.' }, 409);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as {
+      baseBranch?: string;
+      kind?: 'sync' | 'publish' | 'revert';
+      autoSyncOnly?: boolean;
+      skipFetch?: boolean;
+    };
+    const baseBranch = body.baseBranch || BASE_BRANCH;
+    const kind = body.kind ?? 'sync';
+
+    await ensureGitRerere(REPO_ROOT);
+    // Snapshot uncommitted edits into a checkpoint before merging
+    await createCheckpoint(REPO_ROOT, 'Before live-site update', gitIdentity).catch(() => null);
+
+    if (!body.skipFetch) {
+      await execFileAsync('git', ['fetch', 'origin', baseBranch], { cwd: REPO_ROOT }).catch(() => {});
+    }
+
+    const baseRef = `origin/${baseBranch}`;
+    const preSyncSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
+    const newBaseSha = (await execFileAsync('git', ['rev-parse', baseRef], { cwd: REPO_ROOT })).stdout.trim();
+    const mergeBaseSha = await execFileAsync('git', ['merge-base', 'HEAD', baseRef], { cwd: REPO_ROOT })
+      .then((r) => r.stdout.trim())
+      .catch(() => baseSha);
+
+    if (mergeBaseSha === newBaseSha) {
+      const review: MergeReviewStateDto = {
+        mergeId: crypto.randomUUID(),
+        kind,
+        status: 'clean',
+        preSyncSha,
+        prevBaseSha: mergeBaseSha,
+        newBaseSha,
+        alreadyUpToDate: true,
+        summary: 'Your draft is already up to date with the live site.',
+        records: [],
+        upstreamCommits: [],
+        touchedUserFiles: [],
+      };
+      activeMergeState = review;
+      return c.json({ review });
+    }
+
+    const upstreamCommits = await getUpstreamCommits(REPO_ROOT, mergeBaseSha, baseRef);
+    const userChanged = (await getGitChanges(REPO_ROOT, mergeBaseSha)).map((ch) => ch.path);
+    const upstreamChanged = await execFileAsync('git', ['diff', '--name-only', `${mergeBaseSha}..${baseRef}`], {
+      cwd: REPO_ROOT,
+    })
+      .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
+      .catch(() => [] as string[]);
+    const overlap = userChanged.filter((f) => upstreamChanged.includes(f));
+
+    // Attempt standard git merge
+    let mergeClean = false;
+    try {
+      await execFileAsync(
+        'git',
+        [
+          '-c',
+          `user.name=${gitIdentity.botName}`,
+          '-c',
+          `user.email=${gitIdentity.botEmail}`,
+          'merge',
+          '--no-ff',
+          '-m',
+          `halley-sync: Updated from live site (${newBaseSha.slice(0, 7)})`,
+          baseRef,
+        ],
+        { cwd: REPO_ROOT },
+      );
+      mergeClean = true;
+    } catch {
+      mergeClean = false;
+    }
+
+    if (mergeClean) {
+      const summary =
+        overlap.length > 0
+          ? `Merged ${upstreamCommits.length} live update${upstreamCommits.length === 1 ? '' : 's'} into ${overlap.length} file${overlap.length === 1 ? '' : 's'} you edited — please review.`
+          : `Updated with ${upstreamCommits.length} change${upstreamCommits.length === 1 ? '' : 's'} from the live site.`;
+      await runPostSyncTasks(
+        upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
+        newBaseSha,
+        mergeBaseSha,
+      );
+      const review: MergeReviewStateDto = {
+        mergeId: crypto.randomUUID(),
+        kind,
+        status: overlap.length > 0 ? 'ready_for_review' : 'applied',
+        preSyncSha,
+        prevBaseSha: mergeBaseSha,
+        newBaseSha,
+        summary,
+        records: [],
+        upstreamCommits,
+        touchedUserFiles: overlap,
+      };
+      activeMergeState = review;
+      return c.json({ review });
+    }
+
+    // Conflicts occurred: collect unmerged files and build evidence packs
+    const unmergedOut = await execFileAsync('git', ['diff', '--name-only', '--diff-filter=U'], {
+      cwd: REPO_ROOT,
+    })
+      .then((r) => r.stdout.trim().split(/\r?\n/).filter(Boolean))
+      .catch(() => [] as string[]);
+
+    activeConflictPacks = new Map();
+    const records: ConflictResolutionRecordDto[] = [];
+    let firstPassUsageUsd = 0;
+    let needsAi = false;
+
+    for (const relPath of unmergedOut) {
+      const pack = await buildConflictEvidencePack(REPO_ROOT, relPath, mergeBaseSha, baseBranch);
+      activeConflictPacks.set(relPath, pack);
+
+      const det = tryDeterministicResolve(pack);
+      if (det) {
+        records.push(det);
+      } else if (body.autoSyncOnly) {
+        // Auto-sync NEVER spends AI budget without the user clicking (Q8)
+        needsAi = true;
+      } else {
+        const res = await resolvePackWithLlm(REPO_ROOT, pack, {
+          controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
+          workspaceToken: WORKSPACE_TOKEN,
+          modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
+          thinkingLevel: THINKING_LEVEL,
+          purpose: 'conflict',
+        });
+        firstPassUsageUsd += res.usageUsd;
+        records.push(res.record);
+      }
+    }
+
+    if (body.autoSyncOnly && (needsAi || records.some((r) => r.status === 'needs_choice'))) {
+      await execFileAsync('git', ['merge', '--abort'], { cwd: REPO_ROOT }).catch(() => {});
+      return c.json({
+        heldForUser: true,
+        overlapCount: unmergedOut.length,
+        upstreamCommits,
+      });
+    }
+
+    const needsChoices = records.some((r) => r.status === 'needs_choice');
+    if (!needsChoices) {
+      // Apply all auto-resolved files and commit the merge
+      let allApplied = true;
+      for (const rec of records) {
+        const applied = await applyResolvedFile(REPO_ROOT, rec.path, rec.resolvedContent ?? '');
+        if (!applied.ok) allApplied = false;
+      }
+      if (allApplied) {
+        await execFileAsync(
+          'git',
+          [
+            '-c',
+            `user.name=${gitIdentity.botName}`,
+            '-c',
+            `user.email=${gitIdentity.botEmail}`,
+            'commit',
+            '--no-edit',
+          ],
+          { cwd: REPO_ROOT, env: { ...process.env, GIT_EDITOR: 'true' } },
+        );
+        await runPostSyncTasks(
+          upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
+          newBaseSha,
+          mergeBaseSha,
+        );
+        const review: MergeReviewStateDto = {
+          mergeId: crypto.randomUUID(),
+          kind,
+          status: 'ready_for_review',
+          preSyncSha,
+          prevBaseSha: mergeBaseSha,
+          newBaseSha,
+          summary: `Combined ${records.length} overlapping change${records.length === 1 ? '' : 's'} automatically — please review.`,
+          records,
+          upstreamCommits,
+          touchedUserFiles: unmergedOut,
+          firstPassUsageUsd,
+        };
+        activeMergeState = review;
+        return c.json({ review });
+      }
+    }
+
+    // Keep merge paused waiting for user choices (or abort on cancel)
+    const review: MergeReviewStateDto = {
+      mergeId: crypto.randomUUID(),
+      kind,
+      status: 'needs_choices',
+      preSyncSha,
+      prevBaseSha: mergeBaseSha,
+      newBaseSha,
+      summary: `${records.filter((r) => r.status === 'needs_choice').length} conflict${records.filter((r) => r.status === 'needs_choice').length === 1 ? '' : 's'} need your choice.`,
+      records,
+      upstreamCommits,
+      touchedUserFiles: unmergedOut,
+      firstPassUsageUsd,
+    };
+    activeMergeState = review;
+    return c.json({ review });
+  });
+
+  app.post('/internal/sync/choose', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    if (!activeMergeState) return c.json({ error: 'No active merge review' }, 404);
+
+    const body = (await c.req.json()) as {
+      choices: Array<{ recordId: string; optionId: string; customInstruction?: string }>;
+    };
+
+    for (const choice of body.choices) {
+      const rec = activeMergeState.records.find((r) => r.id === choice.recordId);
+      const pack = rec ? activeConflictPacks.get(rec.path) : undefined;
+      if (!rec || !pack) continue;
+
+      if (choice.optionId === 'custom' && choice.customInstruction?.trim()) {
+        const res = await resolvePackWithLlm(
+          REPO_ROOT,
+          pack,
+          {
+            controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
+            workspaceToken: WORKSPACE_TOKEN,
+            modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
+            thinkingLevel: THINKING_LEVEL,
+            purpose: 'conflict',
+          },
+          { customInstruction: choice.customInstruction.trim() },
+        );
+        rec.resolvedContent = res.record.resolvedContent ?? pack.oursContent ?? '';
+        rec.resolvedPreview = res.record.resolvedPreview;
+        rec.customInstruction = choice.customInstruction.trim();
+        rec.chosenOptionId = 'custom';
+        rec.status = 'chosen';
+      } else if (choice.optionId === 'theirs') {
+        rec.resolvedContent = pack.theirsContent ?? undefined;
+        rec.chosenOptionId = 'theirs';
+        rec.status = 'chosen';
+      } else if (choice.optionId === 'ours') {
+        rec.resolvedContent = pack.oursContent ?? undefined;
+        rec.chosenOptionId = 'ours';
+        rec.status = 'chosen';
+      } else if (choice.optionId === 'combined') {
+        rec.chosenOptionId = 'combined';
+        rec.status = 'chosen';
+      }
+    }
+
+    const stillPending = activeMergeState.records.some((r) => r.status === 'needs_choice');
+    if (!stillPending) {
+      for (const rec of activeMergeState.records) {
+        const pack = activeConflictPacks.get(rec.path);
+        const contentToWrite =
+          rec.chosenOptionId === 'theirs'
+            ? (pack?.theirsContent ?? null)
+            : rec.chosenOptionId === 'ours'
+              ? (pack?.oursContent ?? null)
+              : (rec.resolvedContent ?? pack?.oursContent ?? '');
+        const applied = await applyResolvedFile(REPO_ROOT, rec.path, contentToWrite);
+        if (!applied.ok) {
+          return c.json({ error: applied.error || `Failed to apply ${rec.path}` }, 400);
+        }
+      }
+      await execFileAsync(
+        'git',
+        [
+          '-c',
+          `user.name=${gitIdentity.botName}`,
+          '-c',
+          `user.email=${gitIdentity.botEmail}`,
+          'commit',
+          '--no-edit',
+        ],
+        { cwd: REPO_ROOT, env: { ...process.env, GIT_EDITOR: 'true' } },
+      ).catch(() => {});
+
+      await runPostSyncTasks(
+        activeMergeState.upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
+        activeMergeState.newBaseSha,
+        activeMergeState.prevBaseSha,
+      );
+      activeMergeState.status = 'ready_for_review';
+      activeMergeState.summary = 'All conflicts resolved — review the result below.';
+    }
+
+    return c.json({ review: activeMergeState });
+  });
+
+  app.post('/internal/sync/undo', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const body = (await c.req.json().catch(() => ({}))) as { targetSha?: string };
+    const targetSha = body.targetSha || activeMergeState?.preSyncSha;
+    if (!targetSha) return c.json({ error: 'No pre-sync snapshot to restore' }, 400);
+    const ok = await resetToRef(REPO_ROOT, targetSha);
+    if (!ok) return c.json({ error: 'Failed to undo update' }, 500);
+    if (activeMergeState?.prevBaseSha) {
+      baseSha = activeMergeState.prevBaseSha;
+      await savePersistedSessionMeta().catch(() => {});
+    }
+    activeMergeState = null;
+    activeConflictPacks.clear();
+    return c.json({ ok: true });
+  });
+
+  app.post('/internal/sync/estimate-escalation', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      recordIds?: string[];
+      userNote?: string;
+      remainingBudgetUsd?: number;
+      escalationModelId?: string;
+      hardCeilingUsd?: number;
+    };
+    const selectedPacks: ConflictEvidencePack[] = [];
+    for (const rec of activeMergeState?.records ?? []) {
+      if (!body.recordIds || body.recordIds.length === 0 || body.recordIds.includes(rec.id)) {
+        const pack = activeConflictPacks.get(rec.path);
+        if (pack) selectedPacks.push(pack);
+      }
+    }
+    const resolvedEscModel = piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
+    const estimate = await estimateEscalationCost({
+      packs: selectedPacks,
+      controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
+      workspaceToken: WORKSPACE_TOKEN,
+      escalationModelId: resolvedEscModel,
+      hardCeilingUsd: body.hardCeilingUsd ?? 2,
+      remainingBudgetUsd: body.remainingBudgetUsd ?? 10,
+      firstPassUsageUsd: activeMergeState?.firstPassUsageUsd,
+      userNote: body.userNote,
+    });
+    return c.json({ estimate });
+  });
+
+  app.post('/internal/sync/escalate', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    if (!activeMergeState) return c.json({ error: 'No active merge review to improve' }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      recordIds?: string[];
+      userNote?: string;
+      escalationModelId?: string;
+      escalationThinking?: 'off' | 'low' | 'medium' | 'high';
+      ceilingUsd?: number;
+    };
+    const resolvedEscModel = piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
+    const runId = crypto.randomUUID();
+    const ceilingUsd = Math.min(body.ceilingUsd ?? 2, 2);
+
+    const advRecords: ConflictResolutionRecordDto[] = [];
+    let totalUsage = 0;
+    let stoppedAtCeiling = false;
+
+    for (const rec of activeMergeState.records) {
+      if (body.recordIds && body.recordIds.length > 0 && !body.recordIds.includes(rec.id)) {
+        continue;
+      }
+      const pack = activeConflictPacks.get(rec.path);
+      if (!pack) continue;
+      const res = await resolvePackWithLlm(
+        REPO_ROOT,
+        pack,
+        {
+          controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
+          workspaceToken: WORKSPACE_TOKEN,
+          modelId: resolvedEscModel,
+          thinkingLevel: body.escalationThinking ?? 'medium',
+          purpose: 'conflict-escalation',
+          runId,
+          runCeilingUsd: ceilingUsd,
+        },
+        {
+          rejectedAttempt: rec.resolvedContent,
+          userNote: body.userNote,
+        },
+      );
+      totalUsage += res.usageUsd;
+      advRecords.push(res.record);
+      if (res.stoppedAtCeiling) {
+        stoppedAtCeiling = true;
+        break;
+      }
+    }
+
+    const identicalToFirst =
+      advRecords.length > 0 &&
+      advRecords.every((adv) => {
+        const orig = activeMergeState!.records.find((r) => r.path === adv.path);
+        return orig && orig.resolvedContent === adv.resolvedContent;
+      });
+
+    activeMergeState.advancedAttempt = {
+      records: advRecords,
+      usageUsd: Number(totalUsage.toFixed(4)),
+      identicalToFirst,
+      stoppedAtCeiling,
+      message: stoppedAtCeiling
+        ? `Stopped at $${totalUsage.toFixed(2)} to stay within the $${ceilingUsd.toFixed(2)} ceiling. First attempt kept.`
+        : identicalToFirst
+          ? 'The Advanced model reached the same result.'
+          : 'Compare First vs Advanced below and choose which to keep.',
+    };
+    return c.json({ review: activeMergeState });
+  });
+
+  app.post('/internal/sync/apply-advanced', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    if (!activeMergeState?.advancedAttempt) return c.json({ error: 'No advanced attempt available' }, 404);
+    const body = (await c.req.json()) as {
+      picks: Array<{ path: string; use: 'advanced' | 'first' }>;
+    };
+    for (const pick of body.picks) {
+      if (pick.use !== 'advanced') continue;
+      const adv = activeMergeState.advancedAttempt.records.find((r) => r.path === pick.path);
+      if (!adv?.resolvedContent) continue;
+      const applied = await applyResolvedFile(REPO_ROOT, adv.path, adv.resolvedContent);
+      if (!applied.ok) return c.json({ error: applied.error }, 400);
+      const orig = activeMergeState.records.find((r) => r.path === adv.path);
+      if (orig) {
+        orig.resolvedContent = adv.resolvedContent;
+        orig.resolvedPreview = adv.resolvedPreview;
+        orig.explanation = adv.explanation;
+        orig.modelUsed = adv.modelUsed;
+        orig.status = 'chosen';
+      }
+    }
+    await createCheckpoint(REPO_ROOT, 'Applied Advanced merge improvements', gitIdentity).catch(() => null);
+    return c.json({ review: activeMergeState });
+  });
+
+  app.post('/internal/git/revert-start', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const body = (await c.req.json()) as { shas: string[] };
+    const result = await startRevertCommits(REPO_ROOT, body.shas ?? [], gitIdentity);
+    if (result.status === 'conflict' && result.conflictedFiles.length > 0) {
+      activeConflictPacks = new Map();
+      const records: ConflictResolutionRecordDto[] = [];
+      for (const relPath of result.conflictedFiles) {
+        const pack = await buildConflictEvidencePack(REPO_ROOT, relPath, baseSha, BASE_BRANCH);
+        activeConflictPacks.set(relPath, pack);
+        const det = tryDeterministicResolve(pack);
+        if (det) {
+          records.push(det);
+        } else {
+          const res = await resolvePackWithLlm(REPO_ROOT, pack, {
+            controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
+            workspaceToken: WORKSPACE_TOKEN,
+            modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
+            thinkingLevel: THINKING_LEVEL,
+            purpose: 'conflict',
+          });
+          records.push(res.record);
+        }
+      }
+      const headSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
+      activeMergeState = {
+        mergeId: crypto.randomUUID(),
+        kind: 'revert',
+        status: records.some((r) => r.status === 'needs_choice') ? 'needs_choices' : 'ready_for_review',
+        preSyncSha: headSha,
+        prevBaseSha: baseSha,
+        newBaseSha: baseSha,
+        summary: 'Someone updated these pages after your publication — choose what to keep.',
+        records,
+        upstreamCommits: [],
+        touchedUserFiles: result.conflictedFiles,
+      };
+      return c.json({ ...result, review: activeMergeState });
+    }
+    return c.json(result);
+  });
+
+  app.get('/internal/review', async (c) => {
+    const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
+    const changes = await getGitChanges(REPO_ROOT, baseRef);
+    const cards = await buildChangeCards(REPO_ROOT, changes, {
+      baseRef,
+      prevBaseSha: prevBaseSha || null,
+      editorName: gitIdentity.editorName,
+      conflictRecords: activeMergeState?.records,
+    });
+    const mergedFromLiveFiles =
+      prevBaseSha && baseSha && prevBaseSha !== baseSha
+        ? await execFileAsync('git', ['diff', '--name-only', `${prevBaseSha}..${baseSha}`], {
+            cwd: REPO_ROOT,
+          })
+            .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
+            .catch(() => [] as string[])
+        : [];
+
+    return c.json({
+      cards,
+      pages: [],
+      draftFiles: changes.map((ch) => ch.path),
+      mergedFromLiveFiles,
+      astroReady: astroManager.getStatus().ready,
+      previewBase,
+      mergeReview: activeMergeState,
+      baseSha,
+      prevBaseSha: prevBaseSha || null,
+    });
   });
 
   app.post('/internal/verify', async (c) => {

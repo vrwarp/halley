@@ -276,4 +276,52 @@ export class GitHubService {
     const anyPending = runs.workflow_runs.some((r) => r.status !== 'completed');
     return anyPending ? 'pending' : 'deployed';
   }
+
+  async listMainCommits(
+    baseBranch: string,
+    limit = 30,
+  ): Promise<
+    Array<{
+      sha: string;
+      shortSha: string;
+      author: string;
+      date: string;
+      subject: string;
+    }>
+  > {
+    const { owner, repo } = this.ownerRepo;
+    try {
+      const commits = await this.api<
+        Array<{
+          sha: string;
+          commit: {
+            message: string;
+            author?: { name?: string; date?: string };
+          };
+          author?: { login?: string } | null;
+        }>
+      >(`/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(baseBranch)}&per_page=${limit}`);
+      return commits.map((c) => ({
+        sha: c.sha,
+        shortSha: c.sha.slice(0, 7),
+        author: c.commit.author?.name || c.author?.login || 'a developer',
+        date: c.commit.author?.date || new Date().toISOString(),
+        subject: (c.commit.message || '').split(/\r?\n/)[0] || 'Commit',
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async getCommitFiles(sha: string): Promise<string[]> {
+    const { owner, repo } = this.ownerRepo;
+    try {
+      const data = await this.api<{ files?: Array<{ filename: string }> }>(
+        `/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}`,
+      );
+      return (data.files ?? []).map((f) => f.filename);
+    } catch {
+      return [];
+    }
+  }
 }
