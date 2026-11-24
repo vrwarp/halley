@@ -141,41 +141,85 @@ export function EditorPage({
     return () => clearInterval(timer);
   }, [sessionId, session?.status]);
 
-  useEffect(() => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/sessions/${sessionId}`);
-    wsRef.current = ws;
+  const [wsConnected, setWsConnected] = useState(false);
 
-    ws.onmessage = (evt) => {
-      const msg = JSON.parse(evt.data) as ChatServerMessage;
-      if (msg.type === 'transcript_state') {
-        setEntries(msg.entries);
-        setLive(msg.live);
-      } else if (msg.type === 'workspace_lock') {
-        iframeRef.current?.contentWindow?.postMessage(
-          { type: 'halley:lock', locked: msg.locked, reason: msg.file },
-          '*',
-        );
-      } else if (msg.type === 'checkpoint_created') {
-        setChangedCount(msg.changedFilesCount);
-        setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
-      } else if (msg.type === 'publish_state') {
-        setPublishProgress(msg.payload);
-        if (msg.payload.state === 'published') {
-          void loadSessionMeta();
+  useEffect(() => {
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (disposed) return;
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${window.location.host}/ws/sessions/${sessionId}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!disposed) setWsConnected(true);
+      };
+
+      ws.onmessage = (evt) => {
+        const msg = JSON.parse(evt.data) as ChatServerMessage;
+        if (msg.type === 'transcript_state') {
+          setEntries(msg.entries);
+          setLive(msg.live);
+        } else if (msg.type === 'workspace_lock') {
+          iframeRef.current?.contentWindow?.postMessage(
+            { type: 'halley:lock', locked: msg.locked, reason: msg.file },
+            '*',
+          );
+        } else if (msg.type === 'checkpoint_created') {
+          setChangedCount(msg.changedFilesCount);
+          setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
+        } else if (msg.type === 'publish_state') {
+          setPublishProgress(msg.payload);
+          if (msg.payload.state === 'published') {
+            void loadSessionMeta();
+          }
+        } else if (msg.type === 'spend_status') {
+          setSpend({
+            spentTodayUsd: msg.spentTodayUsd,
+            dailyCapUsd: msg.dailyCapUsd,
+            extraGrantedUsd: msg.extraGrantedUsd,
+            capped: msg.capped,
+          });
         }
-      } else if (msg.type === 'spend_status') {
-        setSpend({
-          spentTodayUsd: msg.spentTodayUsd,
-          dailyCapUsd: msg.dailyCapUsd,
-          extraGrantedUsd: msg.extraGrantedUsd,
-          capped: msg.capped,
-        });
-      }
+      };
+
+      ws.onclose = () => {
+        if (disposed) return;
+        setWsConnected(false);
+        reconnectTimer = setTimeout(connect, 2000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
     };
 
-    return () => ws.close();
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
   }, [sessionId]);
+
+  // Fallback HTTP transcript polling whenever WebSocket is disconnected (e.g. reverse proxy without WS headers)
+  useEffect(() => {
+    if (wsConnected) return;
+    const poll = () => {
+      void api
+        .getTranscript(sessionId)
+        .then((t) => {
+          setEntries(t.entries);
+          setLive(t.live);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => clearInterval(timer);
+  }, [sessionId, wsConnected]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -216,19 +260,26 @@ export function EditorPage({
     return () => window.removeEventListener('message', onMsg);
   }, [mode, session]);
 
+  const dispatchClientMessage = (payload: Record<string, unknown>) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    } else {
+      void api.sendClientMessage(sessionId, payload);
+    }
+  };
+
   const sendPrompt = (whenBusy?: 'steer' | 'followUp') => {
     if (!session?.canEdit) return;
     if (!input.trim() && attachments.length === 0 && chips.length === 0) return;
-    wsRef.current?.send(
-      JSON.stringify({
-        type: 'submit_input',
-        requestId: crypto.randomUUID(),
-        text: input.trim() || 'Please use the attached context/image.',
-        contextChips: chips,
-        attachments,
-        whenBusy,
-      }),
-    );
+    dispatchClientMessage({
+      type: 'submit_input',
+      requestId: crypto.randomUUID(),
+      text: input.trim() || 'Please use the attached context/image.',
+      contextChips: chips,
+      attachments,
+      whenBusy,
+    });
     setInput('');
     setChips([]);
     setAttachments([]);
@@ -746,15 +797,13 @@ export function EditorPage({
                             const prompt = newPageUnlisted
                               ? `Please create a new unlisted page at \`/${slug}\` (\`src/pages/${slug}.astro\`) using the site's layout and \`url()\`. Keep it unlisted: do NOT link it in navigation menus, mark it \`indexable={false}\` (noindex), and exclude it from the sitemap if \`astro.config.mjs\` uses a sitemap filter.`
                               : `Please create a new page at \`/${slug}\` (\`src/pages/${slug}.astro\`) using the site's layout and \`url()\`.`;
-                            wsRef.current?.send(
-                              JSON.stringify({
-                                type: 'submit_input',
-                                requestId: crypto.randomUUID(),
-                                text: prompt,
-                                contextChips: [],
-                                attachments: [],
-                              }),
-                            );
+                            dispatchClientMessage({
+                              type: 'submit_input',
+                              requestId: crypto.randomUUID(),
+                              text: prompt,
+                              contextChips: [],
+                              attachments: [],
+                            });
                             setNewPagePath('');
                             setNewPageUnlisted(false);
                             setShowNewPageForm(false);

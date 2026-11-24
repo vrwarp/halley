@@ -71,8 +71,8 @@ export function loadConfig(): HalleyConfig {
     thinkingLevel: (process.env.HALLEY_THINKING_LEVEL || 'high') as 'off' | 'low' | 'medium' | 'high',
     dailyCostCapUsd: Number(process.env.HALLEY_DAILY_COST_CAP_USD || 10),
     workspaceDriver: process.env.WORKSPACE_DRIVER === 'local' ? 'local' : 'docker',
-    workspaceImage: process.env.WORKSPACE_IMAGE || 'halley-workspace:latest',
-    workspaceDockerNetwork: process.env.WORKSPACE_DOCKER_NETWORK || 'halley-net',
+    workspaceImage: process.env.WORKSPACE_IMAGE || 'vrwarp/halley-workspace:latest',
+    workspaceDockerNetwork: process.env.WORKSPACE_DOCKER_NETWORK || '',
     controlPlaneInternalUrl:
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),

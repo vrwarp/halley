@@ -104,6 +104,17 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ errorSummary, logs }),
     }),
+  sendClientMessage: (id: string, msg: unknown) =>
+    apiFetch<{ ok: boolean }>(`/api/sessions/${id}/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg),
+    }),
+  getTranscript: (id: string) =>
+    apiFetch<{
+      entries: import('@halley/shared').TranscriptEntryDto[];
+      live: import('@halley/shared').LiveRunStateDto;
+    }>(`/api/sessions/${id}/transcript`),
 
   adminOverview: () =>
     apiFetch<{

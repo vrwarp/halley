@@ -45,4 +45,100 @@ describe('real thecrossing.website templates', () => {
     expect(paths).toContain('/im-new');
     expect(paths).toContain('/get-connected/youth');
   });
+
+  it('parses and round-trip patches static elements across every .astro page without byte drift', async () => {
+    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
+    if (!exists) return;
+
+    const { parse } = await import('@astrojs/compiler');
+    const os = await import('node:os');
+    const { PerFileMutex, patchStaticSpan } = await import('../src/index.js');
+
+    async function collectAstroFiles(dir: string): Promise<string[]> {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const out: string[] = [];
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) out.push(...(await collectAstroFiles(full)));
+        else if (e.isFile() && e.name.endsWith('.astro')) out.push(full);
+      }
+      return out;
+    }
+
+    const files = await collectAstroFiles(path.join(CROSSING_ROOT, 'src/pages'));
+    expect(files.length).toBeGreaterThan(15);
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-fullsite-ast-'));
+    try {
+      await fs.mkdir(path.join(tmp, 'src/lib'), { recursive: true });
+      await fs.writeFile(path.join(tmp, 'src/lib/url.ts'), 'export const url = (p: string) => p;\n');
+      const lock = new PerFileMutex();
+      let checkedStaticCount = 0;
+
+      for (const file of files) {
+        const src = await fs.readFile(file, 'utf8');
+        const parsed = await parse(src, { position: true });
+        type NodeLike = {
+          type?: string;
+          name?: string;
+          position?: { start?: { line: number; column: number } };
+          children?: NodeLike[];
+        };
+
+        // Find the deepest static heading/paragraph on each page (maximizing preceding UTF-8 bytes)
+        const candidates: Array<{ tag: string; loc: string }> = [];
+        const walk = (n: NodeLike) => {
+          if (
+            n.type === 'element' &&
+            n.name &&
+            ['h1', 'h2', 'h3', 'p', 'blockquote'].includes(n.name) &&
+            n.position?.start
+          ) {
+            candidates.push({
+              tag: n.name,
+              loc: `${n.position.start.line}:${n.position.start.column}`,
+            });
+          }
+          for (const c of n.children ?? []) walk(c);
+        };
+        walk(parsed.ast as unknown as NodeLike);
+
+        const lastCandidate = candidates[candidates.length - 1];
+        if (!lastCandidate) continue;
+
+        const info = await inspectAstroElement(src, lastCandidate.loc);
+        expect(info).not.toBeNull();
+        if (info?.editability === 'editable-static') {
+          checkedStaticCount++;
+          // Verify exact surrounding tags stay intact when patched
+          expect(src.slice(info.innerEndOffset, info.innerEndOffset + lastCandidate.tag.length + 3)).toBe(
+            `</${lastCandidate.tag}>`,
+          );
+
+          const rel = path.relative(CROSSING_ROOT, file);
+          const dst = path.join(tmp, rel);
+          await fs.mkdir(path.dirname(dst), { recursive: true });
+          await fs.writeFile(dst, src, 'utf8');
+
+          const res = await patchStaticSpan({
+            repoRoot: tmp,
+            relFile: rel.split(path.sep).join('/'),
+            loc: lastCandidate.loc,
+            expectedHash: info.snapshotHash,
+            newHtml: 'Updated — test copy',
+            previewBase: '/p/s1/thecrossing.website',
+            originalBase: '/thecrossing.website',
+            fileLock: lock,
+          });
+          expect(res.ok).toBe(true);
+          const updated = await fs.readFile(dst, 'utf8');
+          expect(updated).toContain(`>Updated — test copy</${lastCandidate.tag}>`);
+        }
+      }
+
+      expect(checkedStaticCount).toBeGreaterThan(10);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });

@@ -1,0 +1,28 @@
+# Ready-to-run production / Synology NAS Compose file using prebuilt Docker Hub images.
+# Usage:
+#   1. Copy .env.example to .env and fill in secrets
+#   2. docker compose -f docker-compose.prod.yml up -d
+#      (halley-control-plane automatically pulls vrwarp/halley-workspace:latest on first session)
+services:
+  control-plane:
+    image: vrwarp/halley-control-plane:latest
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000
+    volumes:
+      - halley-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - halley-net
+    restart: unless-stopped
+
+volumes:
+  halley-data:
+
+networks:
+  halley-net:
+    name: halley-net
+    driver: bridge

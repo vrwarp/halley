@@ -8,8 +8,6 @@ services:
     env_file:
       - .env
     environment:
-      - WORKSPACE_DRIVER=docker
-      - WORKSPACE_DOCKER_NETWORK=halley_halley-net
       - CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000
     volumes:
       - halley-data:/data
@@ -23,4 +21,5 @@ volumes:
 
 networks:
   halley-net:
+    name: halley-net
     driver: bridge

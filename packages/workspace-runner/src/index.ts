@@ -262,6 +262,17 @@ async function main() {
     return c.json({ ok: true });
   });
 
+  app.get('/internal/transcript', (c) => {
+    return c.json(
+      latestTranscript ?? {
+        type: 'transcript_state',
+        entries: [],
+        live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
+        usageUsd: 0,
+      },
+    );
+  });
+
   const server = serve({
     fetch: app.fetch,
     port: RUNNER_PORT,
