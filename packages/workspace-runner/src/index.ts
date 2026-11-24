@@ -273,6 +273,13 @@ async function main() {
     );
   });
 
+  app.get('/internal/debug/trace', (c) => {
+    if (!piRuntime) {
+      return c.json({ error: 'Agent runtime is not ready yet' }, 503);
+    }
+    return c.json(piRuntime.getDebugTrace());
+  });
+
   const server = serve({
     fetch: app.fetch,
     port: RUNNER_PORT,

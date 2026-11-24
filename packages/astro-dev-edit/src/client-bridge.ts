@@ -500,6 +500,10 @@ export function buildClientBridgeScript(previewBase: string): string {
         showToast('Halley is editing this page…');
       }
     } else if (msg.type === 'halley:reload') {
+      if (activeEl && !msg.force) return;
+      try {
+        sessionStorage.setItem('__halley_scroll_y', String(window.scrollY));
+      } catch {}
       window.location.reload();
     }
   });
@@ -507,6 +511,16 @@ export function buildClientBridgeScript(previewBase: string): string {
   window.addEventListener('popstate', notifyRoute);
   document.addEventListener('astro:page-load', notifyRoute);
   notifyRoute();
+  try {
+    const savedY = sessionStorage.getItem('__halley_scroll_y');
+    if (savedY !== null) {
+      sessionStorage.removeItem('__halley_scroll_y');
+      const y = parseInt(savedY, 10);
+      if (!Number.isNaN(y) && y > 0) {
+        requestAnimationFrame(() => window.scrollTo(0, y));
+      }
+    }
+  } catch {}
   window.parent.postMessage({ type: 'halley:ready', route: currentRoute() }, '*');
 })();
 `;

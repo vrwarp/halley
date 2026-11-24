@@ -31,6 +31,8 @@ import {
 import { num, obj, oneOf, opt, str } from '@earendil-works/pi-schema';
 import type { AsyncFileLock } from '@halley/astro-dev-edit';
 import type {
+  DebugTraceDto,
+  DebugTraceEntryDto,
   EditorContext,
   ElementContext,
   LiveRunStateDto,
@@ -118,6 +120,7 @@ export class HalleyPiRuntime {
   private models = createModels();
   private resolvedModelId = '';
   private lastEditorContext: EditorContext | null = null;
+  private agentsMdText: string | null = null;
 
   constructor(private opts: PiRuntimeOptions) {}
 
@@ -167,6 +170,7 @@ export class HalleyPiRuntime {
     const agentsMdText = await fs
       .readFile(path.join(this.opts.repoRoot, 'AGENTS.md'), 'utf8')
       .catch(() => '');
+    this.agentsMdText = agentsMdText || null;
 
     const halleyExtension = this.buildHalleyExtension(agentsMdText);
     registry.install(halleyExtension);
@@ -357,30 +361,7 @@ export class HalleyPiRuntime {
       tools: [processImageTool, screenshotPageTool, runChecksTool],
       wraps: [wrapFileTool(editToolDef), wrapFileTool(writeToolDef)],
       sections: [
-        section('halley_role', () => {
-          const persona = opts.getPersona?.() ?? 'non-technical';
-          const personaGuidance =
-            persona === 'developer'
-              ? [
-                  'User Persona: Technical / Developer.',
-                  'Be concise and direct. You may reference exact file paths, Astro components, Tailwind classes, and check outputs.',
-                ]
-              : [
-                  'User Persona: Non-technical site maintainer (church staff / volunteer).',
-                  'Prioritize ONLY the most important information the user needs to know—keep responses short (2–4 sentences or a couple of brief bullets).',
-                  'Speak in warm, plain, everyday English about pages, sections, photos, and what visitors will see. NEVER mention technical details or lingo (no file paths like `src/pages/...`, no Astro/HTML/CSS/TypeScript/JSON/git terms, no component or script names, and no sitemap/robots internals) unless the user explicitly asks.',
-                  'State what changed and any next step or question clearly (e.g., "I added your Spring Retreat page and kept it unlisted so it won\'t appear in menus or search. Take a look in the preview and let me know if you\'d like to add dates or photos!").',
-                  'Summarize verification in plain terms ("Everything passed our site checks and is ready to publish").',
-                ];
-          return [
-            'You are Halley, a friendly, careful AI website editor helping maintain an Astro website.',
-            ...personaGuidance,
-            'Never attempt to modify files under `.github/`. They are protected and read-only.',
-            'When asked to create an unlisted or hidden page, create the `.astro` page under `src/pages/...`, do NOT link it in navigation menus, and mark it `indexable={false}` (or add `<meta name="robots" content="noindex" />`) and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used.',
-            'When images are attached with a `stagedId`, use `process_image` to convert and save them cleanly into `public/images/...`.',
-            'After significant layout or visual changes, use `screenshot_page` (desktop and mobile) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
-          ].join('\n');
-        }),
+        section('halley_role', () => this.buildHalleyRolePrompt()),
         section('repo_agents_md', () =>
           agentsMdText ? `Repository AGENTS.md:\n\n${agentsMdText}` : undefined,
         ),
@@ -420,6 +401,158 @@ export class HalleyPiRuntime {
         }),
       ],
     });
+  }
+
+  private buildHalleyRolePrompt(): string {
+    const persona = this.opts.getPersona?.() ?? 'non-technical';
+    const personaGuidance =
+      persona === 'developer'
+        ? [
+            'User Persona: Technical / Developer.',
+            'Be concise and direct. You may reference exact file paths, Astro components, Tailwind classes, and check outputs.',
+          ]
+        : [
+            'User Persona: Non-technical site maintainer (church staff / volunteer).',
+            'Prioritize ONLY the most important information the user needs to know—keep responses short (2–4 sentences or a couple of brief bullets).',
+            'Speak in warm, plain, everyday English about pages, sections, photos, and what visitors will see. NEVER mention technical details or lingo (no file paths like `src/pages/...`, no Astro/HTML/CSS/TypeScript/JSON/git terms, no component or script names, and no sitemap/robots internals) unless the user explicitly asks.',
+            'State what changed and any next step or question clearly (e.g., "I added your Spring Retreat page and kept it unlisted so it won\'t appear in menus or search. Take a look in the preview and let me know if you\'d like to add dates or photos!").',
+            'Summarize verification in plain terms ("Everything passed our site checks and is ready to publish").',
+          ];
+    const editorCtxLines = this.lastEditorContext
+      ? [
+          `Live preview context: the user is currently viewing page \`${this.lastEditorContext.currentRoute}\` (viewport: ${this.lastEditorContext.viewport ?? 'desktop'}, mode: ${this.lastEditorContext.mode ?? 'edit'}).`,
+          `When the user says "this page", "here", or asks what page they are looking at, use the \`[Current Preview]\` route (currently \`${this.lastEditorContext.currentRoute}\`) directly and inspect its file under \`src/pages/\` if needed.`,
+        ]
+      : [
+          'Each user message may begin with `[Current Preview] route=... viewport=... mode=...` telling you the exact page currently open on the user\'s screen. Use it whenever the user asks what page they are looking at or refers to "this page".',
+        ];
+    return [
+      'You are Halley, a friendly, careful AI website editor helping maintain an Astro website.',
+      ...personaGuidance,
+      ...editorCtxLines,
+      'Whenever you mention a page on the site or the user asks for a link to a page (including pages you just created or edited), ALWAYS format it as an internal markdown link using the page\'s route, like `[Our Staff](/im-new/our-staff)` or `[Events](/events)`. NEVER give a full live-site URL (like `https://...github.io/...`) — the editor automatically turns internal `[Page Name](/route)` links into clickable buttons that open the page directly in the live preview pane.',
+      'Never attempt to modify files under `.github/`. They are protected and read-only.',
+      'When asked to create an unlisted or hidden page, create the `.astro` page under `src/pages/...`, do NOT link it in navigation menus, and mark it `indexable={false}` (or add `<meta name="robots" content="noindex" />`) and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used.',
+      'When images are attached with a `stagedId`, use `process_image` to convert and save them cleanly into `public/images/...`.',
+      'After significant layout or visual changes, use `screenshot_page` (desktop and mobile) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
+    ].join('\n');
+  }
+
+  getDebugTrace(): DebugTraceDto {
+    const val = this.watchHandle?.value;
+    const mapped = val
+      ? this.mapWatchValue(val)
+      : {
+          entries: [],
+          live: { busy: false, activeTools: [], queuedCount: 0 },
+          usageUsd: 0,
+        };
+
+    const debugEntries: DebugTraceEntryDto[] = [];
+    if (val) {
+      for (const entry of val.entries) {
+        if (UserEntry.is(entry)) {
+          const content = entry.model?.[0]?.content;
+          let text = '';
+          let imagesCount = 0;
+          if (typeof content === 'string') {
+            text = content;
+          } else if (Array.isArray(content)) {
+            const texts: string[] = [];
+            for (const b of content) {
+              if (b.type === 'text') texts.push(b.text);
+              else if (b.type === 'image') imagesCount += 1;
+            }
+            text = texts.join('\n');
+          }
+          debugEntries.push({
+            id: String(entry.id),
+            kind: entry.kind,
+            role: 'user',
+            text,
+            ...(imagesCount > 0 ? { imagesCount } : {}),
+          });
+        } else if (AssistantEntry.is(entry)) {
+          const msg = entry.model?.[0] as
+            | {
+                content?: Array<Record<string, unknown>>;
+                model?: string;
+                stopReason?: string;
+                usage?: unknown;
+              }
+            | undefined;
+          const blocks = Array.isArray(msg?.content) ? msg.content : [];
+          const texts: string[] = [];
+          const thinkings: string[] = [];
+          const toolCalls: Array<{ id?: string; name: string; arguments: unknown }> = [];
+          for (const b of blocks) {
+            if (b.type === 'text' && typeof b.text === 'string') {
+              texts.push(b.text);
+            } else if (b.type === 'thinking' && typeof b.thinking === 'string') {
+              thinkings.push(b.thinking);
+            } else if (b.type === 'toolCall' && typeof b.name === 'string') {
+              toolCalls.push({
+                id: typeof b.id === 'string' ? b.id : undefined,
+                name: b.name,
+                arguments: b.arguments,
+              });
+            }
+          }
+          debugEntries.push({
+            id: String(entry.id),
+            kind: entry.kind,
+            role: 'assistant',
+            ...(texts.length > 0 ? { text: texts.join('') } : {}),
+            ...(thinkings.length > 0 ? { thinking: thinkings.join('\n\n') } : {}),
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(msg?.model ? { model: msg.model } : {}),
+            ...(msg?.stopReason ? { stopReason: msg.stopReason } : {}),
+            ...(msg?.usage ? { usage: msg.usage } : {}),
+          });
+        } else if (ToolResultEntry.is(entry)) {
+          const msg = entry.model?.[0];
+          if (msg && msg.role === 'toolResult') {
+            const textOut = Array.isArray(msg.content)
+              ? msg.content
+                  .map((b) =>
+                    b.type === 'text'
+                      ? b.text
+                      : `[${b.type} attachment omitted]`,
+                  )
+                  .join('\n')
+              : '';
+            debugEntries.push({
+              id: String(entry.id),
+              kind: entry.kind,
+              role: 'tool',
+              toolCallId: msg.toolCallId,
+              toolName: msg.toolName,
+              toolOutput: textOut,
+              isError: Boolean(msg.isError),
+            });
+          }
+        }
+      }
+    }
+
+    const usageDoc = val?.docs['pi.usage'];
+    return {
+      exportedAt: new Date().toISOString(),
+      sessionId: this.opts.sessionId,
+      modelId: this.resolvedModelId || this.opts.modelId,
+      thinkingLevel: this.opts.thinkingLevel,
+      persona: this.opts.getPersona?.() ?? 'non-technical',
+      previewBase: this.opts.previewBase,
+      lastEditorContext: this.lastEditorContext,
+      systemPrompt: {
+        halleyRole: this.buildHalleyRolePrompt(),
+        agentsMd: this.agentsMdText,
+      },
+      usageUsd: mapped.usageUsd,
+      usageByModel: (usageDoc?.models ?? {}) as Record<string, unknown>,
+      live: mapped.live,
+      entries: debugEntries,
+    };
   }
 
   private mapWatchValue(value: NonNullable<typeof this.watchHandle>['value']): {
@@ -549,6 +682,10 @@ export class HalleyPiRuntime {
     const parts: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
 
     let enrichedText = input.text.trim();
+    if (input.editorContext) {
+      const ctxLine = `[Current Preview] route=${input.editorContext.currentRoute} viewport=${input.editorContext.viewport ?? 'desktop'} mode=${input.editorContext.mode ?? 'edit'}`;
+      enrichedText = `${ctxLine}\n\n${enrichedText}`;
+    }
     if (input.contextChips && input.contextChips.length > 0) {
       const chipLines = input.contextChips.map(
         (c, i) =>

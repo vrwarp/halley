@@ -18,12 +18,26 @@ interface InlineProps {
   text: string;
   onNavigateRoute: (route: string) => void;
   knownRoutes?: Set<string>;
+  astroBase?: string;
 }
 
-function renderInline({ text, onNavigateRoute, knownRoutes }: InlineProps): React.ReactNode[] {
-  // Matches: [label](href) | `code` | **bold** | *italic* | bare /route
+function extractPreviewRouteFromUrl(rawUrl: string, astroBase?: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    const normalizedBase = astroBase && astroBase !== '/' ? astroBase.replace(/\/$/, '') : '';
+    if (normalizedBase && (parsed.pathname === normalizedBase || parsed.pathname.startsWith(normalizedBase + '/'))) {
+      return parsed.pathname.slice(normalizedBase.length) || '/';
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function renderInline({ text, onNavigateRoute, knownRoutes, astroBase }: InlineProps): React.ReactNode[] {
+  // Matches: [label](href) | `code` | **bold** | *italic* | bare https:// URL | bare /route
   const tokenRe =
-    /\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|\*([^*\n]+)\*|(?<![a-zA-Z0-9:/._-])(\/[a-zA-Z0-9][a-zA-Z0-9/_-]*)/g;
+    /\[([^\]]+)\]\(([^)\s]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|\*([^*\n]+)\*|(https?:\/\/[^\s)<>]+)|(?<![a-zA-Z0-9:/._-])(\/[a-zA-Z0-9][a-zA-Z0-9/_-]*)/g;
 
   const nodes: React.ReactNode[] = [];
   let lastIndex = 0;
@@ -35,11 +49,14 @@ function renderInline({ text, onNavigateRoute, knownRoutes }: InlineProps): Reac
       nodes.push(text.slice(lastIndex, match.index));
     }
 
-    const [full, linkLabel, linkHref, codeText, boldText, italicText, bareRoute] = match;
+    const [full, linkLabel, linkHref, codeText, boldText, italicText, bareUrl, bareRoute] = match;
 
     if (linkLabel && linkHref) {
-      if (linkHref.startsWith('/')) {
-        const cleanRoute = linkHref.split(/[?#]/)[0] || '/';
+      const previewFromExternal = /^https?:\/\//i.test(linkHref)
+        ? extractPreviewRouteFromUrl(linkHref, astroBase)
+        : null;
+      if (linkHref.startsWith('/') || previewFromExternal) {
+        const cleanRoute = previewFromExternal ?? (linkHref.split(/[?#]/)[0] || '/');
         nodes.push(
           <button
             key={key++}
@@ -97,7 +114,7 @@ function renderInline({ text, onNavigateRoute, knownRoutes }: InlineProps): Reac
     } else if (boldText !== undefined) {
       nodes.push(
         <strong key={key++} className="font-semibold text-stone-900">
-          {renderInline({ text: boldText, onNavigateRoute, knownRoutes })}
+          {renderInline({ text: boldText, onNavigateRoute, knownRoutes, astroBase })}
         </strong>,
       );
     } else if (italicText !== undefined) {
@@ -106,6 +123,38 @@ function renderInline({ text, onNavigateRoute, knownRoutes }: InlineProps): Reac
           {italicText}
         </em>,
       );
+    } else if (bareUrl !== undefined) {
+      const cleanUrl = bareUrl.replace(/[.,;:!?]+$/, '');
+      const trailing = bareUrl.slice(cleanUrl.length);
+      const previewRoute = extractPreviewRouteFromUrl(cleanUrl, astroBase);
+      if (previewRoute) {
+        nodes.push(
+          <button
+            key={key++}
+            type="button"
+            onClick={() => onNavigateRoute(previewRoute)}
+            title={`Open ${previewRoute} in preview`}
+            className="inline-flex items-center gap-0.5 rounded bg-amber-50 px-1.5 py-0.5 font-mono text-xs font-medium text-amber-800 transition hover:bg-amber-100 hover:text-amber-950"
+          >
+            <span>{previewRoute}</span>
+            <ArrowUpRight className="h-3 w-3 shrink-0" />
+          </button>,
+        );
+      } else {
+        nodes.push(
+          <a
+            key={key++}
+            href={cleanUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-0.5 font-medium text-amber-800 underline decoration-amber-400/70 underline-offset-2 hover:text-amber-950 break-all"
+          >
+            <span>{cleanUrl}</span>
+            <ExternalLink className="h-3 w-3 shrink-0" />
+          </a>,
+        );
+      }
+      if (trailing) nodes.push(trailing);
     } else if (bareRoute !== undefined) {
       if (isNavigableSiteRoute(bareRoute, knownRoutes)) {
         nodes.push(
@@ -141,10 +190,12 @@ export function ChatMessageContent({
   text,
   onNavigateRoute,
   knownRoutes,
+  astroBase,
 }: {
   text: string;
   onNavigateRoute: (route: string) => void;
   knownRoutes?: Set<string>;
+  astroBase?: string;
 }) {
   const lines = text.split('\n');
   const blocks: React.ReactNode[] = [];
@@ -167,7 +218,7 @@ export function ChatMessageContent({
       blocks.push(
         <ul key={blocks.length} className="list-disc space-y-1 pl-4">
           {items.map((item, idx) => (
-            <li key={idx}>{renderInline({ text: item, onNavigateRoute, knownRoutes })}</li>
+            <li key={idx}>{renderInline({ text: item, onNavigateRoute, knownRoutes, astroBase })}</li>
           ))}
         </ul>,
       );
@@ -184,7 +235,7 @@ export function ChatMessageContent({
       blocks.push(
         <ol key={blocks.length} className="list-decimal space-y-1 pl-4">
           {items.map((item, idx) => (
-            <li key={idx}>{renderInline({ text: item, onNavigateRoute, knownRoutes })}</li>
+            <li key={idx}>{renderInline({ text: item, onNavigateRoute, knownRoutes, astroBase })}</li>
           ))}
         </ol>,
       );
@@ -204,7 +255,7 @@ export function ChatMessageContent({
     }
     blocks.push(
       <p key={blocks.length} className="whitespace-pre-wrap">
-        {renderInline({ text: paraLines.join('\n'), onNavigateRoute, knownRoutes })}
+        {renderInline({ text: paraLines.join('\n'), onNavigateRoute, knownRoutes, astroBase })}
       </p>,
     );
   }
@@ -223,6 +274,9 @@ export function parseUserMessageDisplay(raw: string): {
   const badges: string[] = [];
   const bodyLines: string[] = [];
   for (const line of raw.split('\n')) {
+    if (line.startsWith('[Current Preview] ')) {
+      continue;
+    }
     const elMatch = line.match(/^\[Selected Element \d+\].*?tag=(<[^>]+>)\s+text=(".*")$/);
     if (elMatch) {
       let snippet = elMatch[2] ?? '';

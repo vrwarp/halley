@@ -115,6 +115,8 @@ export const api = {
       entries: import('@halley/shared').TranscriptEntryDto[];
       live: import('@halley/shared').LiveRunStateDto;
     }>(`/api/sessions/${id}/transcript`),
+  getDebugTrace: (id: string) =>
+    apiFetch<import('@halley/shared').DebugTraceDto>(`/api/sessions/${id}/debug-trace`),
 
   adminOverview: () =>
     apiFetch<{
