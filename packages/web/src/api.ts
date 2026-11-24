@@ -2,11 +2,16 @@ import type {
   AllowlistEntryDto,
   ChangeCardDto,
   CheckpointInfo,
+  CreatePageRequest,
+  CreatePageResultDto,
   EditorSessionDto,
   EscalationEstimateDto,
   GitFileChange,
   LiveHistoryEntryDto,
   MergeReviewStateDto,
+  PageCreationOptionsDto,
+  PageRequestMetadata,
+  SiteRouteEntryDto,
   SpendStatusDto,
   StagedAttachment,
   TranscriptEntryDto,
@@ -96,9 +101,46 @@ export const api = {
     apiFetch<{ ok: boolean }>(`/api/sessions/${id}`, { method: 'DELETE' }),
 
   getRoutes: (id: string) =>
-    apiFetch<{ routes: Array<{ route: string; label: string; unlisted?: boolean }> }>(
-      `/api/sessions/${id}/routes`,
+    apiFetch<{ routes: SiteRouteEntryDto[] }>(`/api/sessions/${id}/routes`),
+  getPageOptions: (id: string) =>
+    apiFetch<PageCreationOptionsDto>(`/api/sessions/${id}/page-options`),
+  createPage: (id: string, req: CreatePageRequest) =>
+    apiFetch<CreatePageResultDto>(`/api/sessions/${id}/pages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
+  retryPageRequest: (id: string, pageRequestId: string) =>
+    apiFetch<{ ok: boolean; pageRequest?: PageRequestMetadata }>(
+      `/api/sessions/${id}/pages/${encodeURIComponent(pageRequestId)}/retry`,
+      { method: 'POST' },
     ),
+  deletePage: (id: string, route: string) =>
+    apiFetch<{ ok: boolean; deletedFile: string }>(
+      `/api/sessions/${id}/pages?route=${encodeURIComponent(route)}`,
+      { method: 'DELETE' },
+    ),
+  setPageVisibility: (id: string, route: string, unlisted: boolean) =>
+    apiFetch<{ ok: boolean; route: string; unlisted: boolean; file: string }>(
+      `/api/sessions/${id}/pages/visibility`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route, unlisted }),
+      },
+    ),
+  renamePage: (id: string, fromRoute: string, toSection: string, toSlug: string) =>
+    apiFetch<{
+      ok: boolean;
+      fromRoute: string;
+      toRoute: string;
+      file: string;
+      updatedReferencesCount: number;
+    }>(`/api/sessions/${id}/pages/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromRoute, toSection, toSlug }),
+    }),
   getChanges: (id: string) =>
     apiFetch<{ changes: GitFileChange[]; checkpoints: CheckpointInfo[] }>(`/api/sessions/${id}/changes`),
   getReview: (id: string, screenshots = false) =>
@@ -211,6 +253,7 @@ export const api = {
       live: import('@halley/shared').LiveRunStateDto;
       volumeExpired?: boolean;
       priorThread?: PriorThreadDto | null;
+      pageRequests?: PageRequestMetadata[];
     }>(`/api/sessions/${id}/transcript`),
   getDebugTrace: (id: string) =>
     apiFetch<import('@halley/shared').DebugTraceDto>(`/api/sessions/${id}/debug-trace`),

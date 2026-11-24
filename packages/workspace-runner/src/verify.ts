@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { discoverSiteRoutes } from '@halley/astro-dev-edit';
 import {
+  HALLEY_PLACEHOLDER_ATTR,
   HalleyRepoConfigSchema,
   type HalleyRepoConfig,
   type VerificationCheckResult,
@@ -143,6 +145,172 @@ export async function runAstroHygieneGuard(
   };
 }
 
+export async function runUnfinishedPagesCheck(repoRoot: string): Promise<VerificationCheckResult> {
+  const start = Date.now();
+  const issues: string[] = [];
+
+  const srcFiles = await walkFiles(path.join(repoRoot, 'src'), new Set(['.astro', '.md', '.mdx']));
+  for (const file of srcFiles) {
+    try {
+      const text = await fs.readFile(file, 'utf8');
+      if (text.includes(HALLEY_PLACEHOLDER_ATTR)) {
+        issues.push(`${path.relative(repoRoot, file)}: still contains an unfinished Halley placeholder`);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const distFiles = await walkFiles(path.join(repoRoot, 'dist'), new Set(['.html']));
+  for (const file of distFiles) {
+    try {
+      const text = await fs.readFile(file, 'utf8');
+      if (text.includes(HALLEY_PLACEHOLDER_ATTR)) {
+        issues.push(`${path.relative(repoRoot, file)}: built HTML still contains an unfinished Halley placeholder`);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    name: 'No unfinished pages',
+    command: 'halley-unfinished-pages',
+    passed: issues.length === 0,
+    durationMs: Date.now() - start,
+    output:
+      issues.length === 0
+        ? 'No unfinished page placeholders found.'
+        : issues.join('\n'),
+  };
+}
+
+export async function runUnlistedIntegrityCheck(
+  repoRoot: string,
+  originalBase: string,
+): Promise<VerificationCheckResult> {
+  const start = Date.now();
+  const issues: string[] = [];
+
+  const routes = await discoverSiteRoutes(repoRoot);
+  const unlisted = routes.filter((r) => r.unlisted);
+
+  if (unlisted.length === 0) {
+    return {
+      name: 'Unlisted page integrity',
+      command: 'halley-unlisted-integrity',
+      passed: true,
+      durationMs: Date.now() - start,
+      output: 'No unlisted pages to verify.',
+    };
+  }
+
+  const distDir = path.join(repoRoot, 'dist');
+  const distExists = await fs
+    .access(distDir)
+    .then(() => true)
+    .catch(() => false);
+
+  if (!distExists) {
+    return {
+      name: 'Unlisted page integrity',
+      command: 'halley-unlisted-integrity',
+      passed: true,
+      durationMs: Date.now() - start,
+      output: 'Skipped (dist/ not built yet).',
+    };
+  }
+
+  // Read all sitemap*.xml files in dist/
+  const sitemapContents: Array<{ name: string; text: string }> = [];
+  try {
+    const distEntries = await fs.readdir(distDir, { withFileTypes: true });
+    for (const e of distEntries) {
+      if (e.isFile() && /^sitemap.*\.xml$/i.test(e.name)) {
+        const text = await fs.readFile(path.join(distDir, e.name), 'utf8');
+        sitemapContents.push({ name: e.name, text });
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // Read header/nav/footer markup from dist/index.html
+  let chromeHtml = '';
+  try {
+    const indexHtml = await fs.readFile(path.join(distDir, 'index.html'), 'utf8');
+    const blocks = [
+      ...(indexHtml.match(/<header\b[\s\S]*?<\/header>/gi) ?? []),
+      ...(indexHtml.match(/<nav\b[\s\S]*?<\/nav>/gi) ?? []),
+      ...(indexHtml.match(/<footer\b[\s\S]*?<\/footer>/gi) ?? []),
+    ];
+    chromeHtml = blocks.join('\n');
+  } catch {
+    // ignore
+  }
+
+  const basePrefix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
+
+  for (const page of unlisted) {
+    const clean = page.route.replace(/^\/+/, '').replace(/\/+$/, '');
+    const htmlCandidates = [
+      path.join(distDir, clean, 'index.html'),
+      path.join(distDir, `${clean}.html`),
+    ];
+    let builtHtml: string | null = null;
+    for (const c of htmlCandidates) {
+      try {
+        builtHtml = await fs.readFile(c, 'utf8');
+        break;
+      } catch {
+        // try next
+      }
+    }
+
+    if (builtHtml !== null) {
+      const hasNoindex =
+        /<meta\b[^>]*name=["']robots["'][^>]*content=["'][^"']*noindex/i.test(builtHtml) ||
+        /<meta\b[^>]*content=["'][^"']*noindex[^"']*["'][^>]*name=["']robots["']/i.test(builtHtml);
+      if (!hasNoindex) {
+        issues.push(`${page.route}: built HTML is missing a <meta name="robots" content="noindex"> tag`);
+      }
+    }
+
+    const fullRoutePath = `${basePrefix}${page.route}`;
+    const routePattern = new RegExp(
+      `${fullRoutePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\/?(?:<|"|'|\\s))`,
+      'i',
+    );
+
+    for (const sm of sitemapContents) {
+      if (routePattern.test(sm.text)) {
+        issues.push(`${page.route}: unlisted page still appears in dist/${sm.name}`);
+      }
+    }
+
+    if (chromeHtml) {
+      const hrefRe = new RegExp(
+        `href=["'](?:https?:\\/\\/[^"']*)?${fullRoutePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/?["']`,
+        'i',
+      );
+      if (hrefRe.test(chromeHtml)) {
+        issues.push(`${page.route}: unlisted page is linked from the site header/nav/footer`);
+      }
+    }
+  }
+
+  return {
+    name: 'Unlisted page integrity',
+    command: 'halley-unlisted-integrity',
+    passed: issues.length === 0,
+    durationMs: Date.now() - start,
+    output:
+      issues.length === 0
+        ? `Verified ${unlisted.length} unlisted page(s): noindex present, excluded from sitemaps and navigation.`
+        : issues.join('\n'),
+  };
+}
+
 export async function runAllVerificationChecks(
   repoRoot: string,
 ): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
@@ -158,11 +326,15 @@ export async function runAllVerificationChecks(
   }
 
   results.push(await runAstroHygieneGuard(repoRoot, originalBase, halleyConfig));
+  results.push(await runUnfinishedPagesCheck(repoRoot));
+
+  let buildSucceeded = true;
 
   if (halleyConfig?.checks && halleyConfig.checks.length > 0) {
     for (const c of halleyConfig.checks) {
       const res = await runShell(repoRoot, c.command);
       results.push({ name: c.name, command: c.command, ...res });
+      if (!res.passed) buildSucceeded = false;
     }
   } else {
     let scripts: Record<string, string> = {};
@@ -188,10 +360,15 @@ export async function runAllVerificationChecks(
       const res = await runShell(repoRoot, item.script);
       results.push({ name: item.name, command: item.script, ...res });
       if (!res.passed && item.script === 'npm run build') {
+        buildSucceeded = false;
         // Skip verify:* if build itself failed
         break;
       }
     }
+  }
+
+  if (buildSucceeded) {
+    results.push(await runUnlistedIntegrityCheck(repoRoot, originalBase));
   }
 
   return {
@@ -199,3 +376,4 @@ export async function runAllVerificationChecks(
     results,
   };
 }
+

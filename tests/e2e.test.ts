@@ -714,20 +714,38 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       await pEl.evaluate((el) => el.blur());
       await page.waitForTimeout(800);
 
-      // 4. Open Page Switcher and create an unlisted page
-      await page.click('button[title="Switch or create page"]');
-      await page.click('button:has-text("New page (or unlisted page)")');
-      await page.fill('input[placeholder="e.g., spring-retreat"]', 'womens-gathering');
+      // 4. Open New Page wizard via toolbar "+ New page" button and create an unlisted page
+      await page.click('button[title="Create a new page"]');
+      await page.fill('#new-page-title', "Women's Gathering");
+      await page.fill('#new-page-purpose', 'Monthly coffee, prayer, and encouragement for women.');
+      await page.click('button:has-text("More options")');
       await page.click('label:has-text("Keep unlisted")');
-      await page.click('button:has-text("Create with Halley")');
+      await page.click('button:has-text("Create page")');
 
-      // Wait for Turn 1 Pi reply
-      await page.waitForSelector('text=unlisted Women', { timeout: 30_000 });
+      // Preview auto-navigates immediately to /womens-gathering and Pi fills real content
+      await page.waitForSelector('text=Page ready', { timeout: 30_000 });
+      await frameLocator.locator('h1:has-text("Women\'s Gathering")').waitFor({ timeout: 15_000 });
 
-      // Verify Page Switcher lists the new unlisted page
+      // Verify Page Switcher lists the new unlisted page with Unlisted badge
       await page.click('button[title="Switch or create page"]');
-      await page.waitForSelector('text=Unlisted');
+      await page.waitForSelector('button:has-text("/womens-gathering")');
       await page.click('button:has-text("/womens-gathering")');
+
+      // 4b. Test toolbar visibility toggle (Unlisted -> Public -> Unlisted)
+      await page.click('button[title*="Page is unlisted"]');
+      await page.click('button:has-text("Make public")');
+      await page.waitForSelector('button[title*="Page is public"]', { timeout: 10_000 });
+      await page.click('button[title*="Page is public"]');
+      await page.click('button:has-text("Make unlisted")');
+      await page.waitForSelector('button[title*="Page is unlisted"]', { timeout: 10_000 });
+
+      // 4c. Test toolbar URL rename (/womens-gathering -> /womens-fellowship)
+      await page.click('button[title="Change page URL"]');
+      await page.fill('#rename-slug', 'womens-fellowship');
+      await page.click('button:has-text("Update URL")');
+      await page.waitForSelector('button[title="Switch or create page"]:has-text("/womens-fellowship")', {
+        timeout: 15_000,
+      });
       await frameLocator.locator('h1:has-text("Women\'s Gathering")').waitFor({ timeout: 15_000 });
 
       // 5. Pi Turn 2: Add Thanksgiving Potluck event, update /im-new, delete /events/summer-picnic

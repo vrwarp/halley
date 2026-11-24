@@ -28,18 +28,22 @@ import {
   createWriteTool,
   imageLimits,
 } from '@earendil-works/pi-durable/tools';
-import { num, obj, oneOf, opt, str } from '@earendil-works/pi-schema';
+import { bool, num, obj, oneOf, opt, str } from '@earendil-works/pi-schema';
 import type { AsyncFileLock } from '@halley/astro-dev-edit';
-import type {
-  DebugTraceDto,
-  DebugTraceEntryDto,
-  EditorContext,
-  ElementContext,
-  LiveRunStateDto,
-  StagedAttachment,
-  TranscriptEntryDto,
+import {
+  HALLEY_PLACEHOLDER_ATTR,
+  slugifyPagePath,
+  type DebugTraceDto,
+  type DebugTraceEntryDto,
+  type EditorContext,
+  type ElementContext,
+  type LiveRunStateDto,
+  type PageRequestMetadata,
+  type StagedAttachment,
+  type TranscriptEntryDto,
 } from '@halley/shared';
 import sharp from 'sharp';
+import type { PageCreationService } from './pages.js';
 import { runAllVerificationChecks } from './verify.js';
 import type { UploadManager } from './uploads.js';
 
@@ -56,6 +60,7 @@ export interface PiRuntimeOptions {
   getPersona?: () => 'non-technical' | 'developer';
   fileLock: AsyncFileLock;
   uploadManager: UploadManager;
+  pageService?: PageCreationService;
   onLockChange: (locked: boolean, file?: string) => void;
   onRunFinishedWithEdits: (summary: string) => Promise<void>;
   onTranscriptUpdate: (snapshot: {
@@ -122,6 +127,7 @@ export class HalleyPiRuntime {
   private agentsMdText: string | null = null;
   private systemContextNotes: string[] = [];
   private availableModelIds: Array<{ id: string }> = [];
+  private trackedPageRequestIds = new Set<string>();
 
   constructor(private opts: PiRuntimeOptions) {}
 
@@ -248,7 +254,25 @@ export class HalleyPiRuntime {
     this.opts.onTranscriptUpdate(this.mapWatchValue(this.watchHandle.value));
     this.watchHandle.start(async (call) => {
       if (call.kind === 'value') {
-        this.opts.onTranscriptUpdate(this.mapWatchValue(call.value));
+        const snapshot = this.mapWatchValue(call.value);
+        if (snapshot.live.runFailure && !snapshot.live.busy && this.opts.pageService && this.trackedPageRequestIds.size > 0) {
+          const reason = snapshot.live.runFailure.detail || snapshot.live.runFailure.reason || 'Run failed';
+          for (const id of Array.from(this.trackedPageRequestIds)) {
+            const pr = this.opts.pageService.getPageRequest(id);
+            if (!pr) {
+              this.trackedPageRequestIds.delete(id);
+              continue;
+            }
+            const stillPlaceholder = await this.opts.pageService.fileStillHasPlaceholder(pr.file);
+            if (stillPlaceholder) {
+              await this.opts.pageService.updateStatus(id, 'failed', reason);
+            } else {
+              await this.opts.pageService.updateStatus(id, 'done');
+            }
+            this.trackedPageRequestIds.delete(id);
+          }
+        }
+        this.opts.onTranscriptUpdate(snapshot);
       }
     });
 
@@ -386,6 +410,62 @@ export class HalleyPiRuntime {
       },
     });
 
+    const createPageTool = defineTool({
+      name: 'create_page',
+      description:
+        'Create a new starter page on the site with validated URL, layout skeleton, unlisted noindex flags, and an automatic git checkpoint, and immediately open it in the live preview. Always call this before writing a brand-new page requested in chat.',
+      parameters: obj({
+        title: str({ description: 'Human-readable page title, e.g. "Spring Retreat"' }),
+        slug: opt(str({ description: 'Optional URL slug (defaults to slugified title), e.g. "spring-retreat"' })),
+        section: opt(str({ description: 'Optional section folder, e.g. "/events" or "/" (default "/")' })),
+        purpose: opt(str({ description: 'Brief description of what the page is for' })),
+        styleLikeRoute: opt(
+          str({ description: 'Optional existing route to match visually, e.g. "/events/mens-retreat", or "__blank__"' }),
+        ),
+        navGroup: opt(str({ description: 'Optional navigation group name if adding to the site menu' })),
+        unlisted: opt(bool({ description: 'True to keep the page hidden from menus, search engines, and sitemap' })),
+      }),
+      execute: async (args) => {
+        if (!opts.pageService) {
+          return { output: [{ type: 'text', text: 'Page creation service is unavailable.' }], isError: true };
+        }
+        try {
+          const slug = (args.slug && args.slug.trim()) || slugifyPagePath(args.title);
+          const result = await opts.pageService.createPage(
+            {
+              title: args.title,
+              slug,
+              section: args.section || '/',
+              purpose: args.purpose,
+              styleLikeRoute: args.styleLikeRoute,
+              nav: args.navGroup && !args.unlisted ? { mode: 'group', group: args.navGroup } : { mode: 'none' },
+              unlisted: Boolean(args.unlisted),
+            },
+            { fromPiTool: true },
+          );
+          this.trackedPageRequestIds.add(result.pageRequest.pageRequestId);
+          return {
+            output: [
+              {
+                type: 'text',
+                text: `Created starter page at ${result.file} (route ${result.route}).\n\n${result.instructions}`,
+              },
+            ],
+          };
+        } catch (err) {
+          return {
+            output: [
+              {
+                type: 'text',
+                text: err instanceof Error ? err.message : 'Failed to create page',
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    });
+
     const editToolDef = createEditTool();
     const writeToolDef = createWriteTool();
 
@@ -410,7 +490,7 @@ export class HalleyPiRuntime {
 
     return defineExtension({
       name: 'halley',
-      tools: [processImageTool, screenshotPageTool, runChecksTool],
+      tools: [processImageTool, screenshotPageTool, runChecksTool, createPageTool],
       wraps: [wrapFileTool(editToolDef), wrapFileTool(writeToolDef)],
       sections: [
         section('halley_role', () => this.buildHalleyRolePrompt()),
@@ -432,6 +512,28 @@ export class HalleyPiRuntime {
               if (p && isProtectedPath(opts.repoRoot, p)) {
                 return { block: '`.github/**` workflows are protected and cannot be modified.' };
               }
+              if (opts.pageService && this.trackedPageRequestIds.size > 0 && p) {
+                const rel = path
+                  .relative(opts.repoRoot, path.resolve(opts.repoRoot, p))
+                  .split(path.sep)
+                  .join('/');
+                for (const id of this.trackedPageRequestIds) {
+                  const pr = opts.pageService.getPageRequest(id);
+                  if (!pr) continue;
+                  if (rel === pr.file) {
+                    void opts.pageService.updateStatus(id, 'writing');
+                  } else if (/(?:site\.ts|header\.astro|nav)/i.test(rel)) {
+                    void opts.pageService.updateStatus(id, 'menu');
+                  }
+                }
+              }
+            } else if (call.name === 'process_image' && opts.pageService && this.trackedPageRequestIds.size > 0) {
+              for (const id of this.trackedPageRequestIds) {
+                const pr = opts.pageService.getPageRequest(id);
+                if (pr && pr.status !== 'done' && pr.status !== 'failed') {
+                  void opts.pageService.updateStatus(id, 'photo');
+                }
+              }
             }
             return undefined;
           },
@@ -452,6 +554,27 @@ export class HalleyPiRuntime {
             });
             if (mutated) {
               await opts.onRunFinishedWithEdits('Update via Halley chat');
+            }
+            if (opts.pageService && this.trackedPageRequestIds.size > 0) {
+              for (const id of Array.from(this.trackedPageRequestIds)) {
+                const pr = opts.pageService.getPageRequest(id);
+                if (!pr) {
+                  this.trackedPageRequestIds.delete(id);
+                  continue;
+                }
+                const stillPlaceholder = await opts.pageService.fileStillHasPlaceholder(pr.file);
+                if (!stillPlaceholder) {
+                  await opts.pageService.updateStatus(id, 'done');
+                  this.trackedPageRequestIds.delete(id);
+                } else if (pr.status !== 'queued') {
+                  await opts.pageService.updateStatus(
+                    id,
+                    'failed',
+                    'Halley finished without replacing the placeholder content.',
+                  );
+                  this.trackedPageRequestIds.delete(id);
+                }
+              }
             }
             return undefined;
           },
@@ -489,7 +612,8 @@ export class HalleyPiRuntime {
       ...editorCtxLines,
       'Whenever you mention a page on the site or the user asks for a link to a page (including pages you just created or edited), ALWAYS format it as an internal markdown link using the page\'s route, like `[Our Staff](/im-new/our-staff)` or `[Events](/events)`. NEVER give a full live-site URL (like `https://...github.io/...`) — the editor automatically turns internal `[Page Name](/route)` links into clickable buttons that open the page directly in the live preview pane.',
       'Never attempt to modify files under `.github/`. They are protected and read-only.',
-      'When asked to create an unlisted or hidden page, create the `.astro` page under `src/pages/...`, do NOT link it in navigation menus, and mark it `indexable={false}` (or add `<meta name="robots" content="noindex" />`) and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used.',
+      `When the user asks in chat to create a brand-new page, ALWAYS call the \`create_page\` tool first to scaffold and validate the page, then edit the generated file to replace the \`${HALLEY_PLACEHOLDER_ATTR}\` section with complete content. Never leave \`${HALLEY_PLACEHOLDER_ATTR}\` in a finished page.`,
+      'When creating an unlisted or hidden page, keep `indexable={false}` (or `<meta name="robots" content="noindex" />`), do NOT link it in navigation menus or footer, and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used.',
       'When images are attached with a `stagedId`, use `process_image` to convert and save them cleanly into `public/images/...`.',
       'After significant layout or visual changes, use `screenshot_page` (desktop and mobile) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
     ].join('\n');
@@ -631,11 +755,26 @@ export class HalleyPiRuntime {
                   .map((b) => b.text)
                   .join('\n')
               : '';
+        let pageRequest: PageRequestMetadata | undefined;
+        const firstLine = display.split('\n')[0] ?? '';
+        if (firstLine.startsWith('[Halley Page Request] ')) {
+          try {
+            const parsed = JSON.parse(firstLine.slice('[Halley Page Request] '.length)) as {
+              pageRequestId?: string;
+            };
+            if (parsed.pageRequestId && this.opts.pageService) {
+              pageRequest = this.opts.pageService.getPageRequest(parsed.pageRequestId);
+            }
+          } catch {
+            // ignore malformed marker
+          }
+        }
         entries.push({
           id: String(entry.id),
           kind: entry.kind,
           role: 'user',
           text: display,
+          ...(pageRequest ? { pageRequest } : {}),
         });
       } else if (AssistantEntry.is(entry)) {
         const msg = entry.model?.[0];
@@ -789,6 +928,49 @@ export class HalleyPiRuntime {
     );
   }
 
+  async submitPageCreationRequest(
+    pageRequest: PageRequestMetadata,
+    instructions: string,
+    whenBusy?: 'followUp',
+  ): Promise<void> {
+    this.trackedPageRequestIds.add(pageRequest.pageRequestId);
+    const header = `[Halley Page Request] ${JSON.stringify({ pageRequestId: pageRequest.pageRequestId })}`;
+    const ctxLine = `[Current Preview] route=${pageRequest.route} viewport=desktop mode=browse`;
+    const parts: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
+
+    let enrichedText = `${header}\n${ctxLine}\n\n${instructions}`;
+
+    if (pageRequest.attachment) {
+      const att = pageRequest.attachment;
+      const model = this.models.getModel('anthropic', this.resolvedModelId);
+      const limits = imageLimits(model);
+      const resolved = await this.opts.uploadManager.resolveStagedFile(att.stagedId);
+      if (resolved) {
+        const fitted = await fitImage(resolved.bytes, att.mimeType, limits, this.images);
+        if (fitted.kind === 'fitted') {
+          parts.push({
+            type: 'image',
+            data: fitted.image.data,
+            mimeType: fitted.image.mimeType,
+          });
+        }
+      }
+      enrichedText = `${header}\n${ctxLine}\n[Uploaded Image] stagedId=${att.stagedId} filename=${JSON.stringify(att.filename)} mime=${att.mimeType}\n\n${instructions}`;
+    }
+
+    parts.unshift({ type: 'text', text: enrichedText });
+
+    await this.root.submit(
+      {
+        type: 'input',
+        requestId: `page-create-${pageRequest.pageRequestId}-${Date.now()}`,
+        content: parts,
+        whenBusy,
+      },
+      BACKGROUND_CONTEXT,
+    );
+  }
+
   async submitConflictResolutionPrompt(conflictedFiles: string[]): Promise<boolean> {
     const sub = await this.root.submit(
       {
@@ -807,6 +989,12 @@ export class HalleyPiRuntime {
 
   async abort(): Promise<void> {
     await this.root.abort(BACKGROUND_CONTEXT);
+    if (this.opts.pageService && this.trackedPageRequestIds.size > 0) {
+      for (const id of Array.from(this.trackedPageRequestIds)) {
+        await this.opts.pageService.updateStatus(id, 'failed', 'Stopped before finishing this page.');
+        this.trackedPageRequestIds.delete(id);
+      }
+    }
   }
 
   async continueRun(): Promise<void> {
