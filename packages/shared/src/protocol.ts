@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
-export const PreviewModeSchema = z.enum(['browse', 'edit', 'select']);
+// Browse = the real site (links work). Edit = clicks select elements; editable
+// static text gets an inline caret, and anything can be explicitly sent to chat.
+export const PreviewModeSchema = z.enum(['browse', 'edit']);
 export type PreviewMode = z.infer<typeof PreviewModeSchema>;
 
 export const ElementContextSchema = z.object({
@@ -11,19 +13,61 @@ export const ElementContextSchema = z.object({
   renderedText: z.string(),
   outerHTML: z.string(),
   reason: z.enum(['dynamic', 'selected']),
+  /** Exact phrase the user highlighted inside the element, if any. */
+  selectedText: z.string().optional(),
 });
 export type ElementContext = z.infer<typeof ElementContextSchema>;
 
+/** Stable identity of a source-mapped element inside the preview. */
+export const elementKey = (c: { file: string; loc: string }) => `${c.file}:${c.loc}`;
+
+/** Plain-English element kind for non-technical maintainers (no raw HTML tags). */
+export function friendlyElementKind(tagName: string): string {
+  const t = tagName.toLowerCase();
+  if (/^h[1-6]$/.test(t)) return 'Heading';
+  if (t === 'p' || t === 'span' || t === 'strong' || t === 'em' || t === 'small') return 'Text';
+  if (t === 'blockquote') return 'Quote';
+  if (t === 'a') return 'Link';
+  if (t === 'button') return 'Button';
+  if (t === 'img' || t === 'picture' || t === 'svg') return 'Image';
+  if (t === 'figure' || t === 'figcaption') return 'Caption';
+  if (t === 'ul' || t === 'ol') return 'List';
+  if (t === 'li') return 'List item';
+  if (t === 'nav') return 'Navigation';
+  if (t === 'header') return 'Header';
+  if (t === 'footer') return 'Footer';
+  if (t === 'table' || t === 'tr' || t === 'td' || t === 'th') return 'Table';
+  if (t === 'form' || t === 'input' || t === 'textarea' || t === 'select') return 'Form';
+  return 'Section';
+}
+
+export interface PreviewRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 // Parent -> Preview Iframe
 export type PostMessageToPreview =
-  | { type: 'halley:set-mode'; mode: PreviewMode; readOnly: boolean }
+  | {
+      type: 'halley:set-mode';
+      mode: PreviewMode;
+      readOnly: boolean;
+      persona?: 'non-technical' | 'developer';
+    }
   | { type: 'halley:lock'; locked: boolean; reason?: string }
-  | { type: 'halley:reload' };
+  | { type: 'halley:reload'; force?: boolean }
+  /** Numbered markers for elements currently attached to the chat composer. */
+  | { type: 'halley:pins'; pins: Array<{ key: string; n: number }> }
+  /** Temporarily highlight an attached element (e.g. while hovering its chip). */
+  | { type: 'halley:highlight'; key: string | null };
 
 // Preview Iframe -> Parent
 export type PostMessageFromPreview =
   | { type: 'halley:ready'; route: string }
-  | { type: 'halley:element-context'; context: ElementContext }
+  /** Sent only when the user explicitly presses "Ask Halley…". `rect` is in iframe viewport coords. */
+  | { type: 'halley:element-context'; context: ElementContext; rect?: PreviewRect }
   | { type: 'halley:patch-saved'; file: string; loc: string; summary: string }
   | { type: 'halley:route-changed'; route: string; fullPath: string; title: string }
   | { type: 'halley:edit-error'; message: string };
@@ -130,7 +174,7 @@ export type StagedAttachment = z.infer<typeof StagedAttachmentSchema>;
 export const EditorContextSchema = z.object({
   currentRoute: z.string(),
   viewport: z.enum(['desktop', 'tablet', 'mobile']).optional(),
-  mode: z.enum(['browse', 'edit', 'select']).optional(),
+  mode: PreviewModeSchema.optional(),
 });
 export type EditorContext = z.infer<typeof EditorContextSchema>;
 

@@ -1,5 +1,6 @@
-import React from 'react';
+import { friendlyElementKind } from '@halley/shared';
 import { ArrowUpRight, ExternalLink } from 'lucide-react';
+import React from 'react';
 
 const IGNORED_PATH_PREFIXES = ['/images/', '/api/', '/p/', '/src/', '/public/', '/node_modules/', '/internal/', '/ws/'];
 const FILE_EXT_RE = /\.(?:astro|tsx?|jsx?|mjs|cjs|json|css|scss|html|md|mdx|webp|png|jpe?g|gif|svg|pdf|yml|yaml|sh|lock|txt)$/i;
@@ -277,15 +278,24 @@ export function parseUserMessageDisplay(raw: string): {
     if (line.startsWith('[Current Preview] ')) {
       continue;
     }
-    const elMatch = line.match(/^\[Selected Element \d+\].*?tag=(<[^>]+>)\s+text=(".*")$/);
+    const elMatch = line.match(
+      /^\[Selected Element \d+\].*?tag=<([^>]+)>\s+text=("(?:\\.|[^"\\])*")(?:\s+highlighted=("(?:\\.|[^"\\])*"))?$/,
+    );
     if (elMatch) {
-      let snippet = elMatch[2] ?? '';
+      const kind = friendlyElementKind(elMatch[1] ?? 'div');
+      let snippet = elMatch[3] ?? elMatch[2] ?? '';
       try {
         snippet = JSON.parse(snippet) as string;
       } catch {
         // keep raw
       }
-      badges.push(`${elMatch[1]} ${snippet.slice(0, 42)}`);
+      badges.push(
+        elMatch[3]
+          ? `“${snippet.slice(0, 42)}”`
+          : snippet
+            ? `${kind}: ${snippet.slice(0, 42)}`
+            : kind,
+      );
       continue;
     }
     const imgMatch = line.match(/^\[Uploaded Image\].*?filename=(".*?")/);

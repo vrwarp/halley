@@ -7,6 +7,7 @@ import type {
   LiveRunStateDto,
   PostMessageFromPreview,
   PreviewMode,
+  PreviewRect,
   PublishProgressPayload,
   SpendStatusDto,
   StagedAttachment,
@@ -35,12 +36,22 @@ import {
   Undo2,
   X,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { elementKey, friendlyElementKind } from '@halley/shared';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
+import { flyToChip } from '../components/attachFlight.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
 import { PublishModal } from '../components/PublishModal.js';
 import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
+
+/** Chips are unique per element + highlighted phrase. */
+const chipKeyOf = (c: ElementContext) => `${elementKey(c)}|${c.selectedText ?? ''}`;
+const chipLabelOf = (c: ElementContext, persona: 'non-technical' | 'developer' = 'non-technical') => {
+  if (c.selectedText) return `“${c.selectedText}”`;
+  const kind = persona === 'developer' ? `<${c.tagName}>` : friendlyElementKind(c.tagName);
+  return c.renderedText ? `${kind}: ${c.renderedText}` : kind;
+};
 
 interface Props {
   sessionId: string;
@@ -121,6 +132,12 @@ export function EditorPage({
   const prevBusyRef = useRef(false);
   const hadMutatingToolRef = useRef(false);
   const wakeRequestedRef = useRef(false);
+  const chipRowRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pendingFlightRef = useRef<{ chipKey: string; from: PreviewRect | null; label: string } | null>(null);
+  const pendingHighlightKeyRef = useRef<string | null>(null);
+  const [flightNonce, setFlightNonce] = useState(0);
 
   const reloadPreview = (force = false) => {
     const now = Date.now();
@@ -303,10 +320,49 @@ export function EditorPage({
   useEffect(() => {
     if (!session) return;
     iframeRef.current?.contentWindow?.postMessage(
-      { type: 'halley:set-mode', mode, readOnly: !session.canEdit },
+      { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona },
       '*',
     );
-  }, [mode, session?.canEdit]);
+  }, [mode, session?.canEdit, persona]);
+
+  // Numbered markers in the preview for attached elements on the *current* route
+  // (keeps global chip numbers consistent even across multi-page selections).
+  const pinsRef = useRef<Array<{ key: string; n: number }>>([]);
+  useEffect(() => {
+    const seen = new Set<string>();
+    const pins: Array<{ key: string; n: number }> = [];
+    chips.forEach((c, i) => {
+      if (c.route !== currentRoute) return;
+      const key = elementKey(c);
+      if (seen.has(key)) return;
+      seen.add(key);
+      pins.push({ key, n: i + 1 });
+    });
+    pinsRef.current = pins;
+    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:pins', pins }, '*');
+  }, [chips, currentRoute]);
+
+  const highlightInPreview = (key: string | null) => {
+    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key }, '*');
+  };
+
+  // Play the fly-to-chat animation once the (new or existing) chip is in the DOM.
+  useLayoutEffect(() => {
+    const pending = pendingFlightRef.current;
+    if (!pending) return;
+    pendingFlightRef.current = null;
+    const chipEl = chipRowRef.current?.querySelector<HTMLElement>(
+      `[data-chip-key="${CSS.escape(pending.chipKey)}"]`,
+    );
+    if (!chipEl) return;
+    flyToChip({
+      from: pending.from,
+      chipEl,
+      composerEl: composerRef.current,
+      label: pending.label,
+      onLanded: () => textareaRef.current?.focus(),
+    });
+  }, [flightNonce]);
 
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
@@ -319,9 +375,18 @@ export function EditorPage({
         setCurrentRoute(data.route);
         if (session) {
           iframeRef.current?.contentWindow?.postMessage(
-            { type: 'halley:set-mode', mode, readOnly: !session.canEdit },
+            { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona },
             '*',
           );
+        }
+        iframeRef.current?.contentWindow?.postMessage({ type: 'halley:pins', pins: pinsRef.current }, '*');
+        if (pendingHighlightKeyRef.current) {
+          const k = pendingHighlightKeyRef.current;
+          pendingHighlightKeyRef.current = null;
+          iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key: k }, '*');
+          setTimeout(() => {
+            iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key: null }, '*');
+          }, 1400);
         }
       } else if (data.type === 'halley:route-changed') {
         if (pendingRouteRef.current === data.route) {
@@ -329,17 +394,29 @@ export function EditorPage({
         }
         setCurrentRoute(data.route);
       } else if (data.type === 'halley:element-context') {
-        setChips((prev) => {
-          const exists = prev.some((c) => c.file === data.context.file && c.loc === data.context.loc);
-          return exists ? prev : [...prev, data.context];
-        });
+        // Only sent when the user explicitly presses "Ask Halley…" in the preview.
+        const ctx = data.context;
+        const chipKey = chipKeyOf(ctx);
+        const frame = iframeRef.current?.getBoundingClientRect();
+        let from: PreviewRect | null = null;
+        if (data.rect && frame) {
+          // Convert iframe-viewport coords to page coords, clipped to the visible frame.
+          const left = Math.max(frame.left, frame.left + data.rect.left);
+          const top = Math.max(frame.top, frame.top + data.rect.top);
+          const right = Math.min(frame.right, frame.left + data.rect.left + data.rect.width);
+          const bottom = Math.min(frame.bottom, frame.top + data.rect.top + data.rect.height);
+          if (right > left && bottom > top) from = { left, top, width: right - left, height: bottom - top };
+        }
+        pendingFlightRef.current = { chipKey, from, label: chipLabelOf(ctx, persona) };
+        setChips((prev) => (prev.some((c) => chipKeyOf(c) === chipKey) ? prev : [...prev, ctx]));
+        setFlightNonce((n) => n + 1);
       } else if (data.type === 'halley:patch-saved') {
         void loadSessionMeta();
       }
     };
     window.addEventListener('message', onMsg);
     return () => window.removeEventListener('message', onMsg);
-  }, [mode, session]);
+  }, [mode, session, persona]);
 
   const dispatchClientMessage = (payload: Record<string, unknown>) => {
     const ws = wsRef.current;
@@ -363,14 +440,31 @@ export function EditorPage({
     setShowPageSwitcher(false);
   };
 
+  const focusChipInPreview = (c: ElementContext) => {
+    const key = elementKey(c);
+    if (c.route !== currentRoute) {
+      pendingHighlightKeyRef.current = key;
+      navigatePreview(c.route);
+      return;
+    }
+    highlightInPreview(key);
+    setTimeout(() => highlightInPreview(null), 1200);
+  };
+
   const sendPrompt = (whenBusy?: 'steer' | 'followUp', overrideText?: string) => {
     if (!session?.canEdit) return;
     const textToSend = (overrideText ?? input).trim();
     if (!textToSend && attachments.length === 0 && chips.length === 0) return;
+    const defaultEmptyPrompt =
+      attachments.length > 0 && chips.length === 0
+        ? 'Please use the attached photo.'
+        : chips.length === 1
+          ? 'What is this section on the page and how could I update or improve it?'
+          : 'How could I update or improve these selected sections?';
     dispatchClientMessage({
       type: 'submit_input',
       requestId: crypto.randomUUID(),
-      text: textToSend || 'Please use the attached context/image.',
+      text: textToSend || defaultEmptyPrompt,
       contextChips: chips,
       attachments,
       editorContext: {
@@ -733,7 +827,7 @@ export function EditorPage({
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-[11px] text-stone-500">
                     <span>
-                      {chips.length} {chips.length === 1 ? 'element' : 'elements'} selected
+                      {chips.length} {chips.length === 1 ? 'selection' : 'selections'} attached
                     </span>
                     <button
                       type="button"
@@ -743,28 +837,92 @@ export function EditorPage({
                       Clear all
                     </button>
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {chips.map((c) => (
-                      <span
-                        key={`${c.file}:${c.loc}`}
-                        title={`${c.route} · <${c.tagName}>`}
-                        className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-medium text-amber-900"
-                      >
-                        <span className="truncate max-w-[180px]">
-                          &lt;{c.tagName}&gt; {c.renderedText || c.file}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setChips((prev) => prev.filter((x) => !(x.file === c.file && x.loc === c.loc)))
-                          }
-                          className="hover:text-red-700"
+                  <div ref={chipRowRef} className="flex flex-wrap gap-1.5">
+                    {chips.map((c) => {
+                      const onOtherPage = c.route !== currentRoute;
+                      const tooltip =
+                        persona === 'developer'
+                          ? `${c.route} · <${c.tagName}> · ${c.file}`
+                          : onOtherPage
+                            ? `On ${c.route} — click to view on page`
+                            : `On ${c.route}`;
+                      return (
+                        <span
+                          key={chipKeyOf(c)}
+                          data-chip-key={chipKeyOf(c)}
+                          title={tooltip}
+                          onMouseEnter={() => !onOtherPage && highlightInPreview(elementKey(c))}
+                          onMouseLeave={() => highlightInPreview(null)}
+                          className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 py-0.5 pl-0.5 pr-2 text-[11px] font-medium text-amber-900"
                         >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </span>
-                    ))}
+                          <button
+                            type="button"
+                            onClick={() => focusChipInPreview(c)}
+                            className="inline-flex items-center gap-1 hover:underline"
+                          >
+                            <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-600 px-1 text-[10px] font-bold text-white">
+                              {chips.findIndex((x) => elementKey(x) === elementKey(c)) + 1}
+                            </span>
+                            <span className="truncate max-w-[170px]">{chipLabelOf(c, persona)}</span>
+                            {onOtherPage && (
+                              <span className="rounded bg-amber-100/80 px-1 text-[10px] text-amber-800">
+                                {c.route}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="Remove from chat"
+                            onClick={() => {
+                              highlightInPreview(null);
+                              setChips((prev) => prev.filter((x) => chipKeyOf(x) !== chipKeyOf(c)));
+                            }}
+                            className="ml-0.5 hover:text-red-700"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })}
                   </div>
+                  {!input.trim() && !live.busy && !spend.capped && (
+                    <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                      {(
+                        [
+                          {
+                            label: 'Rewrite clearer',
+                            prompt:
+                              chips.length === 1
+                                ? 'Rewrite this so it reads more clearly and warmly while keeping all factual details.'
+                                : 'Rewrite these selected sections so they read more clearly and warmly while keeping all factual details.',
+                          },
+                          {
+                            label: 'Explain this',
+                            prompt:
+                              chips.length === 1
+                                ? 'Explain where this content comes from and how it works.'
+                                : 'Explain where these selected sections come from and how they work.',
+                          },
+                          {
+                            label: 'Remove this',
+                            prompt:
+                              chips.length === 1
+                                ? 'Remove this from the page cleanly.'
+                                : 'Remove these selected items from the page cleanly.',
+                          },
+                        ] as const
+                      ).map((q) => (
+                        <button
+                          key={q.label}
+                          type="button"
+                          onClick={() => sendPrompt(undefined, q.prompt)}
+                          className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-0.5 text-[11px] font-medium text-stone-600 transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
+                        >
+                          {q.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -806,8 +964,12 @@ export function EditorPage({
                 </div>
               )}
 
-              <div className="rounded-xl border border-stone-300 bg-[#FAF9F7] p-2 focus-within:border-amber-600 focus-within:bg-white">
+              <div
+                ref={composerRef}
+                className="rounded-xl border border-stone-300 bg-[#FAF9F7] p-2 focus-within:border-amber-600 focus-within:bg-white"
+              >
                 <textarea
+                  ref={textareaRef}
                   rows={2}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
@@ -820,7 +982,9 @@ export function EditorPage({
                   placeholder={
                     live.busy
                       ? 'Send a redirect or queue your next request…'
-                      : `Ask Halley about ${currentRoute}, or drop an image…`
+                      : chips.length > 0
+                        ? `What should Halley change about ${chips.length === 1 ? 'this' : 'these'}?`
+                        : `Ask Halley about ${currentRoute}, or drop an image…`
                   }
                   className="w-full resize-none bg-transparent text-sm text-stone-900 placeholder:text-stone-400 outline-none"
                 />
@@ -1053,7 +1217,6 @@ export function EditorPage({
                   [
                     { id: 'browse', label: 'Browse', Icon: MousePointer },
                     { id: 'edit', label: 'Edit', Icon: PenLine },
-                    { id: 'select', label: 'Select', Icon: MousePointer },
                   ] as const
                 ).map(({ id, label, Icon }) => (
                   <button

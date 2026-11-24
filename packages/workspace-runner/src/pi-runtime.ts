@@ -701,7 +701,8 @@ export class HalleyPiRuntime {
     if (input.contextChips && input.contextChips.length > 0) {
       const chipLines = input.contextChips.map(
         (c, i) =>
-          `[Selected Element ${i + 1}] file=${c.file} loc=${c.loc} route=${c.route} tag=<${c.tagName}> text=${JSON.stringify(c.renderedText)}`,
+          `[Selected Element ${i + 1}] file=${c.file} loc=${c.loc} route=${c.route} tag=<${c.tagName}> text=${JSON.stringify(c.renderedText)}` +
+          (c.selectedText ? ` highlighted=${JSON.stringify(c.selectedText)}` : ''),
       );
       enrichedText = `${chipLines.join('\n')}\n\n${enrichedText}`;
     }

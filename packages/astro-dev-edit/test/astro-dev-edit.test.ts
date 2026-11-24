@@ -103,3 +103,25 @@ const title = 'Home';
     }
   });
 });
+
+describe('client-bridge script', () => {
+  it('parses cleanly and enforces zero-hover, explicit Ask Halley, × close, and save-on-Esc invariants', async () => {
+    const { buildClientBridgeScript, EARLY_OBSERVER_SCRIPT } = await import('../src/client-bridge.js');
+    const bridge = buildClientBridgeScript('/thecrossing.website');
+    expect(() => new Function(EARLY_OBSERVER_SCRIPT)).not.toThrow();
+    expect(() => new Function(bridge)).not.toThrow();
+
+    // No hover-box or mousemove highlight
+    expect(bridge).not.toContain('hover-box');
+    expect(bridge).not.toContain("addEventListener('mousemove'");
+
+    // Explicit toolbar actions: ↑ Parent, Ask Halley…, and × close
+    expect(bridge).toContain('data-act="parent"');
+    expect(bridge).toContain('data-act="ask"');
+    expect(bridge).toContain('data-act="close"');
+
+    // Esc saves edits rather than discarding
+    expect(bridge).not.toContain('clearSelection(false)');
+  });
+});
+
