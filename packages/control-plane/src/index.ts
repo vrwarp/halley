@@ -70,10 +70,23 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
 
   const app = new Hono<Env>();
 
-  // Health
+  // Health & Doctor preflight diagnostics
   app.get('/api/health', (c) =>
     c.json({ ok: true, repo: config.repo, baseBranch: config.baseBranch }),
   );
+
+  app.get('/api/health/doctor', async (c) => {
+    if ('runDoctorChecks' in driver && typeof driver.runDoctorChecks === 'function') {
+      const report = await (driver as DockerWorkspaceDriver).runDoctorChecks();
+      return c.json(report, report.ok ? 200 : 503);
+    }
+    return c.json({
+      ok: true,
+      warnings: [],
+      errors: [],
+      details: { workspaceDriver: config.workspaceDriver, dataDir: config.dataDir },
+    });
+  });
 
   // LLM Proxy (authenticated via WORKSPACE_TOKEN, no user cookie)
   app.all(
