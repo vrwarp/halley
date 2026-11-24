@@ -5,8 +5,11 @@ import path from 'node:path';
 import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
-import { createControlPlane } from '../src/index.js';
+import { DockerWorkspaceDriver, hasEmptyWorkspaceToken } from '../src/drivers/docker-driver.js';
+import { LocalWorkspaceDriver } from '../src/drivers/local-driver.js';
 import type { WorkspaceDriver } from '../src/drivers/workspace-driver.js';
+import { createControlPlane } from '../src/index.js';
+import { hashWorkspaceToken } from '../src/proxy/llm-proxy.js';
 import { ScreenshotService } from '../src/screenshot-service.js';
 
 function createMockDriver(tokens?: Map<string, string>): WorkspaceDriver & {
@@ -254,6 +257,61 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       expect(wakeRes.status).toBe(200);
       const wakeData = (await wakeRes.json()) as { session: { status: string } };
       expect(wakeData.session.status).toBe('starting');
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('detects empty WORKSPACE_TOKEN env and mints/persists a fresh token after control-plane restart', async () => {
+    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN='])).toBe(true);
+    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN=   '])).toBe(true);
+    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1'])).toBe(true);
+    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN=abc123'])).toBe(false);
+    expect(hasEmptyWorkspaceToken(undefined)).toBe(false);
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-token-test-'));
+    try {
+      const cfg = {
+        ...loadConfig(),
+        dataDir: tmp,
+        adminEmails: ['admin@thecrossing.website'],
+        devLoginEnabled: true,
+      };
+      const cp = createControlPlane(cfg, createMockDriver());
+      const user = cp.db.upsertUser({
+        email: 'admin@thecrossing.website',
+        name: 'Admin',
+        picture: null,
+        isAdmin: true,
+      });
+      const initialToken = 'initial-token-before-restart';
+      const session = cp.db.createSession({
+        id: '8c758298-cf3e-4fee-a4fc-a7f2731e6dae',
+        title: 'Test6',
+        slug: 'test6',
+        ownerUserId: user.id,
+        repo: cfg.targetRepo || 'vrwarp/thecrossing.website',
+        baseBranch: 'main',
+        workingBranch: 'halley/test6-8c7582',
+        volumeName: 'halley-ws-8c758298-cf3e-4fee-a4fc-a7f2731e6dae',
+        workspaceTokenHash: hashWorkspaceToken(initialToken),
+      });
+
+      // Fresh DockerWorkspaceDriver simulating a control-plane restart (empty in-memory sessionTokens)
+      const dockerDriver = new DockerWorkspaceDriver(cfg, cp.db, {} as never);
+      const rotated = dockerDriver.ensureSessionToken(session.id);
+      expect(rotated.length).toBeGreaterThanOrEqual(32);
+      expect(rotated).not.toBe(initialToken);
+      expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(rotated))?.id).toBe(session.id);
+      expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(initialToken))).toBeNull();
+      // Subsequent call returns the cached token without rotating again
+      expect(dockerDriver.ensureSessionToken(session.id)).toBe(rotated);
+
+      // Fresh LocalWorkspaceDriver also rotates & persists cleanly
+      const localDriver = new LocalWorkspaceDriver(cfg, cp.db, {} as never);
+      const localRotated = localDriver.ensureSessionToken(session.id);
+      expect(localRotated.length).toBeGreaterThanOrEqual(32);
+      expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(localRotated))?.id).toBe(session.id);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
