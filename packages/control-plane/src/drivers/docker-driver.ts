@@ -7,6 +7,7 @@ import type { BootProgressDto, BootStage } from '@halley/shared';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { GitHubService } from '../github/client.js';
+import { hashWorkspaceToken } from '../proxy/llm-proxy.js';
 import {
   ensureBareMirror,
   runGit,
@@ -19,6 +20,14 @@ import {
 } from './workspace-driver.js';
 
 const execFileAsync = promisify(execFile);
+
+/** Returns true if a container's Env array is missing WORKSPACE_TOKEN or has an empty value. */
+export function hasEmptyWorkspaceToken(env?: string[]): boolean {
+  if (!Array.isArray(env)) return false;
+  const entry = env.find((e) => e.startsWith('WORKSPACE_TOKEN='));
+  if (entry === undefined) return true;
+  return entry.slice('WORKSPACE_TOKEN='.length).trim().length === 0;
+}
 
 const BOOT_STAGE_MESSAGES: Partial<Record<BootStage, string>> = {
   cloning_repo: 'Cloning website files…',
@@ -118,6 +127,20 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
 
   setRawWorkspaceToken(sessionId: string, token: string): void {
     this.sessionTokens.set(sessionId, token);
+  }
+
+  /**
+   * Returns the cached raw WORKSPACE_TOKEN for a session, or mints a fresh one
+   * and updates workspace_token_hash in SQLite (e.g. when recreating a container
+   * after a control-plane restart wiped the in-memory token map).
+   */
+  ensureSessionToken(sessionId: string): string {
+    const existing = this.sessionTokens.get(sessionId);
+    if (existing && existing.trim().length > 0) return existing;
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    this.db.updateSession(sessionId, { workspace_token_hash: hashWorkspaceToken(rawToken) });
+    this.sessionTokens.set(sessionId, rawToken);
+    return rawToken;
   }
 
   setBootProgressListener(listener: BootProgressListener): void {
@@ -799,14 +822,19 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
 
     const name = this.containerName(session.id);
     try {
-      // Fast-path: if container is already running & healthy, return immediately
+      // Fast-path: if container is already running & healthy (and has a valid WORKSPACE_TOKEN), return immediately
       let inspect = await dockerRequest<{
         State?: { Running?: boolean; Status?: string; ExitCode?: number };
+        Config?: { Env?: string[] };
         Image?: string;
         Id?: string;
       }>('GET', `/containers/${name}/json`);
 
-      if (inspect.status === 200 && inspect.data?.State?.Running) {
+      if (
+        inspect.status === 200 &&
+        inspect.data?.State?.Running &&
+        !hasEmptyWorkspaceToken(inspect.data?.Config?.Env)
+      ) {
         const runnerUrl = `http://${name}:4100`;
         const astroUrl = `http://${name}:4321`;
         try {
@@ -858,11 +886,12 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       // Re-inspect after mirror/image check
       inspect = await dockerRequest<{
         State?: { Running?: boolean; Status?: string; ExitCode?: number };
+        Config?: { Env?: string[] };
         Image?: string;
         Id?: string;
       }>('GET', `/containers/${name}/json`);
 
-      // Self-heal stale, broken, or outdated stopped containers while preserving the session volume
+      // Self-heal stale, broken, tokenless, or outdated stopped containers while preserving the session volume
       if (inspect.status === 200) {
         const state = inspect.data?.State;
         const status = state?.Status || '';
@@ -878,9 +907,10 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           targetImageId &&
           inspect.data?.Image &&
           inspect.data.Image !== targetImageId;
-        if (isBrokenState || isOutdatedStopped) {
+        const hasMissingToken = hasEmptyWorkspaceToken(inspect.data?.Config?.Env);
+        if (isBrokenState || isOutdatedStopped || hasMissingToken) {
           console.log(
-            `[halley-docker] Recreating container ${name} (status=${status}, exit=${state?.ExitCode ?? 0}, outdated=${Boolean(isOutdatedStopped)}) while preserving volume ${session.volume_name}`,
+            `[halley-docker] Recreating container ${name} (status=${status}, exit=${state?.ExitCode ?? 0}, outdated=${Boolean(isOutdatedStopped)}, missingToken=${hasMissingToken}) while preserving volume ${session.volume_name}`,
           );
           await dockerRequest('DELETE', `/containers/${name}?force=true`).catch(() => {});
           inspect = { status: 404, data: {} };
@@ -893,6 +923,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
         await dockerRequest('POST', '/volumes/create', { Name: 'halley-pkg-cache' });
         await dockerRequest('POST', '/volumes/create', { Name: 'halley-git-mirror' });
 
+        const workspaceToken = this.ensureSessionToken(session.id);
         const env = [
           `HALLEY_SESSION_ID=${session.id}`,
           `HALLEY_REPO=${session.repo}`,
@@ -903,7 +934,7 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
           `RUNNER_PORT=4100`,
           `ASTRO_PORT=4321`,
           `CONTROL_PLANE_INTERNAL_URL=${this.config.controlPlaneInternalUrl}`,
-          `WORKSPACE_TOKEN=${this.sessionTokens.get(session.id) || ''}`,
+          `WORKSPACE_TOKEN=${workspaceToken}`,
           `HALLEY_MODEL_ID=${this.config.modelId}`,
           `HALLEY_THINKING_LEVEL=${this.config.thinkingLevel}`,
           `HALLEY_PERSONA=${this.db.getUserById(session.owner_user_id)?.persona ?? 'non-technical'}`,

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import type { BootProgressDto, BootStage } from '@halley/shared';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { GitHubService } from '../github/client.js';
+import { hashWorkspaceToken } from '../proxy/llm-proxy.js';
 import {
   ensureBareMirror,
   runGit,
@@ -49,6 +51,15 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
 
   setRawWorkspaceToken(sessionId: string, token: string): void {
     this.sessionTokens.set(sessionId, token);
+  }
+
+  ensureSessionToken(sessionId: string): string {
+    const existing = this.sessionTokens.get(sessionId);
+    if (existing && existing.trim().length > 0) return existing;
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    this.db.updateSession(sessionId, { workspace_token_hash: hashWorkspaceToken(rawToken) });
+    this.sessionTokens.set(sessionId, rawToken);
+    return rawToken;
   }
 
   setBootProgressListener(listener: BootProgressListener): void {
@@ -183,7 +194,7 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
         '../../../workspace-runner/dist/index.js',
       );
     }
-    const workspaceToken = this.sessionTokens.get(session.id) || 'dev-token';
+    const workspaceToken = this.ensureSessionToken(session.id);
 
     const child = spawn(process.execPath, [runnerEntry], {
       cwd: workspaceDir,
