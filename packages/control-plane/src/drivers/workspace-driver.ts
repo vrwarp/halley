@@ -60,7 +60,7 @@ export async function runGit(
   args: string[],
   extraEnv?: Record<string, string>,
 ): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, {
+  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', ...args], {
     cwd,
     env: { ...process.env, ...extraEnv },
     maxBuffer: 16 * 1024 * 1024,
