@@ -209,6 +209,8 @@ export interface TranscriptEntryDto {
   kind: string;
   role: 'user' | 'assistant' | 'tool' | 'system' | 'activity';
   text: string;
+  /** True for assistant commentary emitted alongside tool calls (stopReason === 'toolUse'). */
+  isIntermediate?: boolean;
   toolName?: string;
   toolArgsSummary?: string;
   toolStatus?: 'running' | 'done' | 'error';

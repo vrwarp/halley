@@ -147,9 +147,11 @@ export function createControlPlane(
     const body = (await c.req.json().catch(() => ({}))) as {
       route?: unknown;
       viewport?: unknown;
+      fullPage?: unknown;
     };
     const rawRoute = typeof body.route === 'string' ? body.route.trim() : '/';
     const viewport: ScreenshotViewport = body.viewport === 'mobile' ? 'mobile' : 'desktop';
+    const fullPage = body.fullPage === true;
     let cleanRoute = rawRoute.startsWith('/') ? rawRoute : `/${rawRoute}`;
 
     const astroOrigin = new URL(astroUrl);
@@ -172,6 +174,7 @@ export function createControlPlane(
       const result = await screenshotService.capture({
         url: targetUrl.toString(),
         viewport,
+        fullPage,
       });
       return new Response(new Uint8Array(result.png), {
         status: 200,

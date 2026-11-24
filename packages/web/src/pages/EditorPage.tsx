@@ -72,6 +72,36 @@ interface Props {
   onOpenSession: (id: string, opts?: { openPublish?: boolean }) => void;
 }
 
+const MUTATING_TOOLS = new Set(['edit', 'write', 'bash', 'process_image', 'undo_last_change']);
+
+type TranscriptDisplayBlock =
+  | { kind: 'entry'; entry: TranscriptEntryDto }
+  | { kind: 'steps'; id: string; items: TranscriptEntryDto[] };
+
+function groupTranscriptEntries(
+  entries: TranscriptEntryDto[],
+  collapseIntermediate: boolean,
+): TranscriptDisplayBlock[] {
+  if (!collapseIntermediate) {
+    return entries.map((entry) => ({ kind: 'entry', entry }));
+  }
+  const blocks: TranscriptDisplayBlock[] = [];
+  for (const entry of entries) {
+    const isStep = entry.role === 'tool' || (entry.role === 'assistant' && entry.isIntermediate);
+    if (isStep) {
+      const prev = blocks.at(-1);
+      if (prev && prev.kind === 'steps') {
+        prev.items.push(entry);
+      } else {
+        blocks.push({ kind: 'steps', id: `steps-${entry.id}`, items: [entry] });
+      }
+    } else {
+      blocks.push({ kind: 'entry', entry });
+    }
+  }
+  return blocks;
+}
+
 function friendlyToolLabel(name?: string): string {
   switch (name) {
     case 'read':
@@ -156,6 +186,9 @@ export function EditorPage({
   const pendingRouteRef = useRef<string | null>(null);
   const prevBusyRef = useRef(false);
   const hadMutatingToolRef = useRef(false);
+  const runStartEntryCountRef = useRef(0);
+  const runStartRoutesRef = useRef<Set<string> | null>(null);
+  const runStartedAtRef = useRef(0);
   const wakeRequestedRef = useRef(false);
   const chipRowRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
@@ -175,7 +208,7 @@ export function EditorPage({
     iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload', force }, '*');
   };
 
-  const loadSessionMeta = async () => {
+  const loadSessionMeta = async (): Promise<Array<{ route: string; label: string; unlisted?: boolean }> | null> => {
     const res = await api.getSession(sessionId);
     setSession(res.session);
     if (res.session.bootProgress) {
@@ -189,10 +222,12 @@ export function EditorPage({
         const [ch, rt] = await Promise.all([api.getChanges(sessionId), api.getRoutes(sessionId)]);
         setChangesFromServer(ch.changes.length, ch.checkpoints);
         setSiteRoutes(rt.routes);
+        return rt.routes;
       } catch {
         // runner may still be initializing
       }
     }
+    return null;
   };
 
   const handleRetryBoot = async () => {
@@ -429,21 +464,43 @@ export function EditorPage({
     return () => clearInterval(timer);
   }, [sessionId, wsConnected, session?.status]);
 
-  // Track mutating tools during an agent run and refresh preview + session metadata when the run completes
+  // Track mutating tools during an agent run, refresh preview/metadata when the run completes,
+  // and auto-navigate to a newly created single route if the user hasn't navigated away.
   useEffect(() => {
     if (live.busy) {
-      if (live.activeTools.some((t) => ['edit', 'write', 'bash', 'undo_last_change'].includes(t.name))) {
+      if (!prevBusyRef.current) {
+        runStartEntryCountRef.current = entries.length;
+        runStartRoutesRef.current = siteRoutes.length > 0 ? new Set(siteRoutes.map((r) => r.route)) : null;
+        runStartedAtRef.current = Date.now();
+      }
+      if (live.activeTools.some((t) => MUTATING_TOOLS.has(t.name))) {
         hadMutatingToolRef.current = true;
       }
     } else if (prevBusyRef.current) {
-      void loadSessionMeta();
-      if (hadMutatingToolRef.current || !wsConnected) {
-        reloadPreview();
-      }
+      const completedMutatingTool = entries
+        .slice(runStartEntryCountRef.current)
+        .some((e) => e.role === 'tool' && e.toolName && MUTATING_TOOLS.has(e.toolName));
+      const shouldReload = hadMutatingToolRef.current || completedMutatingTool || !wsConnected;
+      const beforeRoutes = runStartRoutesRef.current;
+      const startedAt = runStartedAtRef.current;
       hadMutatingToolRef.current = false;
+      runStartRoutesRef.current = null;
+
+      void loadSessionMeta().then((updatedRoutes) => {
+        if (beforeRoutes && updatedRoutes && lastNavigationAtRef.current < startedAt) {
+          const added = updatedRoutes.filter((r) => !beforeRoutes.has(r.route));
+          if (added.length === 1 && added[0] && added[0].route !== currentRoute) {
+            navigatePreview(added[0].route);
+            return;
+          }
+        }
+        if (shouldReload) {
+          reloadPreview();
+        }
+      });
     }
     prevBusyRef.current = live.busy;
-  }, [live.busy, live.activeTools, wsConnected]);
+  }, [live.busy, live.activeTools, entries.length, wsConnected]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1101,7 +1158,47 @@ export function EditorPage({
               </div>
             )}
 
-            {entries.map((entry) => {
+            {groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
+              if (block.kind === 'steps') {
+                const isOpen = expandedTool === block.id;
+                const toolSteps = block.items.filter((i) => i.role === 'tool');
+                const stepCount = toolSteps.length || block.items.length;
+                return (
+                  <div key={block.id} className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-1.5 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setExpandedTool(isOpen ? null : block.id)}
+                      className="flex w-full items-center justify-between text-stone-600"
+                    >
+                      <span className="font-medium">
+                        {stepCount === 1
+                          ? friendlyToolLabel(toolSteps[0]?.toolName)
+                          : `Completed ${stepCount} steps`}
+                      </span>
+                      <ChevronDown className={`h-3.5 w-3.5 transition ${isOpen ? 'rotate-180' : ''}`} />
+                    </button>
+                    {isOpen && (
+                      <div className="mt-2 space-y-1.5 border-t border-stone-200/70 pt-2 text-[11px] text-stone-500">
+                        {block.items.map((step) =>
+                          step.role === 'tool' ? (
+                            <div key={step.id} className="flex items-center justify-between gap-2">
+                              <span className="font-medium text-stone-600">{friendlyToolLabel(step.toolName)}</span>
+                              {step.toolStatus === 'error' && (
+                                <span className="text-red-600 font-medium">issue</span>
+                              )}
+                            </div>
+                          ) : (
+                            <p key={step.id} className="text-stone-500 leading-relaxed">
+                              {step.text}
+                            </p>
+                          ),
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+              const entry = block.entry;
               if (entry.role === 'user') {
                 if (entry.pageRequest) {
                   const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
@@ -1705,7 +1802,9 @@ export function EditorPage({
             await api.fixWithPi(session.id, summary, logs);
           }}
           onStartNewEdit={onBack}
-          onChangedFilesUpdated={loadSessionMeta}
+          onChangedFilesUpdated={async () => {
+            await loadSessionMeta();
+          }}
         />
       )}
 

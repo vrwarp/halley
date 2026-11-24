@@ -10,6 +10,40 @@ import {
 } from '@halley/shared';
 import { detectAstroBase } from './astro-manager.js';
 
+const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_RE, '');
+}
+
+/**
+ * Formats verification results compactly for LLM tool output: passing checks
+ * get a single concise summary line (avoiding 14KB+ of static-route build logs
+ * bloating every subsequent turn), while failing checks include full output.
+ */
+export function formatCompactCheckSummary(results: VerificationCheckResult[]): string {
+  return results
+    .map((r) => {
+      const clean = stripAnsi(r.output).trim();
+      if (!r.passed) {
+        return `[FAIL] ${r.name} (${r.durationMs}ms)\n${clean}`;
+      }
+      const lines = clean
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const summaryHints = lines.filter((l) =>
+        /(?:verified|Result \(|errors|warnings|page\(s\) built|Indexed \d+ pages|verification passed)/i.test(l),
+      );
+      const tail =
+        summaryHints.length > 0
+          ? summaryHints.slice(-3).join(' · ')
+          : lines.at(-1) ?? 'OK';
+      return `[PASS] ${r.name} (${r.durationMs}ms) — ${tail}`;
+    })
+    .join('\n');
+}
+
 async function runShell(
   cwd: string,
   command: string,
@@ -23,6 +57,8 @@ async function runShell(
         ...process.env,
         WORKSPACE_TOKEN: '',
         FORCE_COLOR: '0',
+        NO_COLOR: '1',
+        CI: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -49,7 +85,7 @@ async function runShell(
       resolve({
         passed: code === 0,
         durationMs: Date.now() - start,
-        output: chunks.join('').trim(),
+        output: stripAnsi(chunks.join('')).trim(),
       });
     });
   });

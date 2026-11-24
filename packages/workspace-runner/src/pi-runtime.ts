@@ -23,6 +23,7 @@ import { createFitImagesExtension, fitImage } from '@earendil-works/pi-durable/i
 import { createNodePhotonImages } from '@earendil-works/pi-durable/images/node';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import {
+  createBashTool,
   createCodingTools,
   createEditTool,
   createWriteTool,
@@ -43,8 +44,9 @@ import {
   type TranscriptEntryDto,
 } from '@halley/shared';
 import sharp from 'sharp';
+import { sanitizeProtectedPaths } from './checkpoints-and-git.js';
 import type { PageCreationService } from './pages.js';
-import { runAllVerificationChecks } from './verify.js';
+import { formatCompactCheckSummary, runAllVerificationChecks } from './verify.js';
 import type { UploadManager } from './uploads.js';
 
 export interface PiRuntimeOptions {
@@ -282,6 +284,34 @@ export class HalleyPiRuntime {
   private buildHalleyExtension(agentsMdText: string) {
     const opts = this.opts;
 
+    // Track in-flight file mutations so parallel screenshot_page / run_checks calls
+    // emitted in the same assistant turn always wait for writes + Vite watcher settle.
+    const inFlightMutations = new Set<Promise<unknown>>();
+    let lastMutationFinishedAt = 0;
+
+    const trackMutation = async <T>(fn: () => Promise<T>): Promise<T> => {
+      const p = fn();
+      inFlightMutations.add(p);
+      try {
+        return await p;
+      } finally {
+        inFlightMutations.delete(p);
+        lastMutationFinishedAt = Date.now();
+      }
+    };
+
+    const waitForPendingMutations = async (watcherSettleMs = 0): Promise<void> => {
+      while (inFlightMutations.size > 0) {
+        await Promise.allSettled([...inFlightMutations]);
+      }
+      if (watcherSettleMs > 0 && lastMutationFinishedAt > 0) {
+        const elapsed = Date.now() - lastMutationFinishedAt;
+        if (elapsed < watcherSettleMs) {
+          await new Promise((r) => setTimeout(r, watcherSettleMs - elapsed));
+        }
+      }
+    };
+
     const processImageTool = defineTool({
       name: 'process_image',
       description:
@@ -311,20 +341,22 @@ export class HalleyPiRuntime {
           return { output: [{ type: 'text', text: 'Invalid destination path.' }], isError: true };
         }
 
-        await opts.fileLock.withLock(args.destPath, async () => {
-          await fs.mkdir(path.dirname(destAbs), { recursive: true });
-          const maxWidth = args.maxWidth ?? 2400;
-          const quality = args.quality ?? 84;
-          // .rotate() auto-orients from EXIF; omitting .withMetadata() strips all EXIF/GPS
-          const webpBuf = await sharp(staged.bytes)
-            .rotate()
-            .resize({ width: maxWidth, withoutEnlargement: true })
-            .webp({ quality })
-            .toBuffer();
-          const tmp = `${destAbs}.tmp-${Date.now()}`;
-          await fs.writeFile(tmp, webpBuf);
-          await fs.rename(tmp, destAbs);
-        });
+        await trackMutation(() =>
+          opts.fileLock.withLock(args.destPath, async () => {
+            await fs.mkdir(path.dirname(destAbs), { recursive: true });
+            const maxWidth = args.maxWidth ?? 2400;
+            const quality = args.quality ?? 84;
+            // .rotate() auto-orients from EXIF; omitting .withMetadata() strips all EXIF/GPS
+            const webpBuf = await sharp(staged.bytes)
+              .rotate()
+              .resize({ width: maxWidth, withoutEnlargement: true })
+              .webp({ quality })
+              .toBuffer();
+            const tmp = `${destAbs}.tmp-${Date.now()}`;
+            await fs.writeFile(tmp, webpBuf);
+            await fs.rename(tmp, destAbs);
+          }),
+        );
 
         const meta = await sharp(destAbs).metadata();
         return {
@@ -341,55 +373,71 @@ export class HalleyPiRuntime {
     const screenshotPageTool = defineTool({
       name: 'screenshot_page',
       description:
-        'Capture a live browser screenshot of a route on the running astro dev preview to visually inspect layout, contrast, face cropping, and mobile responsiveness.',
+        'Capture a live browser screenshot of a route on the running astro dev preview to visually inspect layout, contrast, face cropping, and mobile responsiveness. Use viewport="both" to capture desktop and mobile together, and fullPage=true to inspect below the fold.',
       parameters: obj({
         route: str({ description: 'Site route to capture, e.g. "/" or "/im-new" or "/sermons"' }),
-        viewport: oneOf(['desktop', 'mobile']),
+        viewport: oneOf(['desktop', 'mobile', 'both']),
+        fullPage: opt(
+          bool({ description: 'Capture full page height (capped at 3600px) instead of above-the-fold only' }),
+        ),
       }),
       execute: async (args) => {
+        // Ensure any parallel edit/write/bash in the same turn finishes and Vite invalidates CSS first
+        await waitForPendingMutations(200);
+
         const cleanRoute = args.route.startsWith('/') ? args.route : `/${args.route}`;
-        const size = args.viewport === 'mobile' ? { width: 390, height: 844 } : { width: 1440, height: 900 };
         const endpoint = `${opts.controlPlaneInternalUrl.replace(/\/$/, '')}/internal/screenshot`;
+        const viewports: Array<'desktop' | 'mobile'> =
+          args.viewport === 'both' ? ['desktop', 'mobile'] : [args.viewport];
+        const output: Array<
+          { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+        > = [];
 
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${opts.workspaceToken}`,
-          },
-          body: JSON.stringify({
-            route: cleanRoute,
-            viewport: args.viewport,
-          }),
-        });
+        for (const vp of viewports) {
+          const fallbackSize = vp === 'mobile' ? { width: 390, height: 844 } : { width: 1440, height: 900 };
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${opts.workspaceToken}`,
+            },
+            body: JSON.stringify({
+              route: cleanRoute,
+              viewport: vp,
+              ...(args.fullPage ? { fullPage: true } : {}),
+            }),
+          });
 
-        if (!res.ok) {
-          const errText = await res.text().catch(() => res.statusText);
-          return {
-            output: [
-              {
-                type: 'text',
-                text: `Screenshot failed (${res.status}): ${errText}`,
-              },
-            ],
-            isError: true,
-          };
-        }
+          if (!res.ok) {
+            const errText = await res.text().catch(() => res.statusText);
+            return {
+              output: [
+                {
+                  type: 'text',
+                  text: `Screenshot failed (${res.status}): ${errText}`,
+                },
+              ],
+              isError: true,
+            };
+          }
 
-        const png = Buffer.from(await res.arrayBuffer());
-        return {
-          output: [
+          const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
+          const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
+          const png = Buffer.from(await res.arrayBuffer());
+          output.push(
             {
               type: 'text',
-              text: `Captured ${args.viewport} (${size.width}x${size.height}) screenshot of ${cleanRoute}`,
+              text: `Captured ${vp} (${width}x${height}${args.fullPage ? ', fullPage' : ''}) screenshot of ${cleanRoute}`,
             },
             {
               type: 'image',
               data: png.toString('base64'),
               mimeType: 'image/png',
             },
-          ],
-        };
+          );
+        }
+
+        return { output };
       },
     });
 
@@ -399,10 +447,9 @@ export class HalleyPiRuntime {
         'Run the full pre-publish verification suite (Astro Hygiene Guard, astro check, production build, verify:seo, etc.) against the repository.',
       parameters: obj({}),
       execute: async () => {
+        await waitForPendingMutations(0);
         const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot);
-        const summary = results
-          .map((r) => `[${r.passed ? 'PASS' : 'FAIL'}] ${r.name} (${r.durationMs}ms)\n${r.output}`)
-          .join('\n\n');
+        const summary = formatCompactCheckSummary(results);
         return {
           output: [{ type: 'text', text: summary }],
           isError: !allPassed,
@@ -468,6 +515,7 @@ export class HalleyPiRuntime {
 
     const editToolDef = createEditTool();
     const writeToolDef = createWriteTool();
+    const bashToolDef = createBashTool();
 
     const wrapFileTool = <T extends typeof editToolDef | typeof writeToolDef>(toolDef: T) =>
       wrapTool(toolDef, (base) => ({
@@ -481,17 +529,39 @@ export class HalleyPiRuntime {
           const rel = path.relative(opts.repoRoot, path.resolve(opts.repoRoot, target)).split(path.sep).join('/');
           opts.onLockChange(true, rel);
           try {
-            return await opts.fileLock.withLock(rel, () => base.execute(args as never, api, ctx));
+            return await trackMutation(() =>
+              opts.fileLock.withLock(rel, () => base.execute(args as never, api, ctx)),
+            );
           } finally {
             opts.onLockChange(false, rel);
           }
         },
       }));
 
+    const wrapBashTool = wrapTool(bashToolDef, (base) => ({
+      ...base,
+      execute: async (
+        args: Parameters<typeof base.execute>[0],
+        api: Parameters<typeof base.execute>[1],
+        ctx: Parameters<typeof base.execute>[2],
+      ) => {
+        opts.onLockChange(true, 'shell');
+        try {
+          return await trackMutation(async () => {
+            const res = await base.execute(args as never, api, ctx);
+            await sanitizeProtectedPaths(opts.repoRoot).catch(() => {});
+            return res;
+          });
+        } finally {
+          opts.onLockChange(false, 'shell');
+        }
+      },
+    }));
+
     return defineExtension({
       name: 'halley',
       tools: [processImageTool, screenshotPageTool, runChecksTool, createPageTool],
-      wraps: [wrapFileTool(editToolDef), wrapFileTool(writeToolDef)],
+      wraps: [wrapFileTool(editToolDef), wrapFileTool(writeToolDef), wrapBashTool],
       sections: [
         section('halley_role', () => this.buildHalleyRolePrompt()),
         section('repo_agents_md', () =>
@@ -594,7 +664,8 @@ export class HalleyPiRuntime {
         : [
             'User Persona: Non-technical site maintainer (church staff / volunteer).',
             'Prioritize ONLY the most important information the user needs to know—keep responses short (2–4 sentences or a couple of brief bullets).',
-            'Speak in warm, plain, everyday English about pages, sections, photos, and what visitors will see. NEVER mention technical details or lingo (no file paths like `src/pages/...`, no Astro/HTML/CSS/TypeScript/JSON/git terms, no component or script names, and no sitemap/robots internals) unless the user explicitly asks.',
+            'Speak in warm, plain, everyday English about pages, sections, photos, and what visitors will see. NEVER mention technical details or lingo (no file paths like `src/pages/...`, no Astro/HTML/CSS/TypeScript/JSON/git/Python terms, no stylesheets/breakpoints/grid classes/dev-server details, no component or script names, and no sitemap/robots internals) unless the user explicitly asks.',
+            'While running tools, do NOT narrate technical debugging steps to the user; either invoke tools silently or share a brief plain-English update ("Checking how the page looks on desktop and mobile…").',
             'State what changed and any next step or question clearly (e.g., "I added your Spring Retreat page and kept it unlisted so it won\'t appear in menus or search. Take a look in the preview and let me know if you\'d like to add dates or photos!").',
             'Summarize verification in plain terms ("Everything passed our site checks and is ready to publish").',
           ];
@@ -611,11 +682,12 @@ export class HalleyPiRuntime {
       ...personaGuidance,
       ...editorCtxLines,
       'Whenever you mention a page on the site or the user asks for a link to a page (including pages you just created or edited), ALWAYS format it as an internal markdown link using the page\'s route, like `[Our Staff](/im-new/our-staff)` or `[Events](/events)`. NEVER give a full live-site URL (like `https://...github.io/...`) — the editor automatically turns internal `[Page Name](/route)` links into clickable buttons that open the page directly in the live preview pane.',
+      'Prefer `read`, `edit`, and `write` for inspecting and editing individual files; use `bash` (`rg`, `jq`, `python3`, `node`) for multi-file searches or bulk structured data updates.',
       'Never attempt to modify files under `.github/`. They are protected and read-only.',
       `When the user asks in chat to create a brand-new page, ALWAYS call the \`create_page\` tool first to scaffold and validate the page, then edit the generated file to replace the \`${HALLEY_PLACEHOLDER_ATTR}\` section with complete content. Never leave \`${HALLEY_PLACEHOLDER_ATTR}\` in a finished page.`,
-      'When creating an unlisted or hidden page, keep `indexable={false}` (or `<meta name="robots" content="noindex" />`), do NOT link it in navigation menus or footer, and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used.',
+      'When creating an unlisted, hidden, or placeholder ("coming soon") page without real visitor content yet, keep `indexable={false}` (or `<meta name="robots" content="noindex" />`), do NOT link it in navigation menus or footer, and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used. Once real visitor content is added, offer or switch it to indexable.',
       'When images are attached with a `stagedId`, use `process_image` to convert and save them cleanly into `public/images/...`.',
-      'After significant layout or visual changes, use `screenshot_page` (desktop and mobile) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
+      'After significant layout or visual changes, use `screenshot_page` (you can pass `viewport: "both"` and `fullPage: true` to inspect desktop and mobile in one step) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
     ].join('\n');
   }
 
@@ -777,7 +849,9 @@ export class HalleyPiRuntime {
           ...(pageRequest ? { pageRequest } : {}),
         });
       } else if (AssistantEntry.is(entry)) {
-        const msg = entry.model?.[0];
+        const msg = entry.model?.[0] as
+          | { content?: Array<{ type: string; text?: string }>; stopReason?: string }
+          | undefined;
         const blocks = Array.isArray(msg?.content) ? msg.content : [];
         const text = blocks
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
@@ -789,6 +863,7 @@ export class HalleyPiRuntime {
             kind: entry.kind,
             role: 'assistant',
             text,
+            ...(msg?.stopReason === 'toolUse' ? { isIntermediate: true } : {}),
           });
         }
       } else if (ToolResultEntry.is(entry)) {

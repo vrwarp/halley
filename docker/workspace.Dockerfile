@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     ripgrep \
+    python3 \
+    jq \
   && rm -rf /var/lib/apt/lists/*
 
 # Ensure Node 22 + pnpm are available and prepare directories for unprivileged node user

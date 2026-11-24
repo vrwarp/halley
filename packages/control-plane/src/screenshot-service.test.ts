@@ -163,4 +163,46 @@ describe('ScreenshotService', () => {
       await svc.close();
     }
   });
+
+  it('supports fullPage screenshots clipped to a safe max height (3600px)', async () => {
+    let capturedOpts: Record<string, unknown> | undefined;
+    const svc = new ScreenshotService({
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      launchBrowser: async () =>
+        Object.assign(new EventEmitter(), {
+          isConnected: () => true,
+          newContext: async () => ({
+            newPage: async () => ({
+              goto: async () => {},
+              waitForTimeout: async () => {},
+              evaluate: async () => 5200,
+              screenshot: async (opts: Record<string, unknown>) => {
+                capturedOpts = opts;
+                return Buffer.from('full-png');
+              },
+            }),
+            close: async () => {},
+          }),
+          close: async () => {},
+        }) as unknown as Browser,
+    });
+
+    try {
+      const res = await svc.capture({
+        url: 'http://ws-1:4321/p/s1/poetry',
+        viewport: 'desktop',
+        fullPage: true,
+      });
+      expect(res.width).toBe(1440);
+      expect(res.height).toBe(3600);
+      expect(capturedOpts).toEqual({
+        type: 'png',
+        fullPage: true,
+        clip: { x: 0, y: 0, width: 1440, height: 3600 },
+      });
+    } finally {
+      await svc.close();
+    }
+  });
 });

@@ -11,7 +11,10 @@ export const VIEWPORT_SIZES: Record<ScreenshotViewport, { width: number; height:
 export interface ScreenshotRequest {
   url: string;
   viewport: ScreenshotViewport;
+  fullPage?: boolean;
 }
+
+const MAX_FULL_PAGE_HEIGHT = 3600;
 
 export interface ScreenshotResult {
   png: Buffer;
@@ -136,6 +139,23 @@ export class ScreenshotService {
           await page.goto(req.url, { waitUntil: 'networkidle', timeout: 25_000 });
           if (this.settleWaitMs > 0) {
             await page.waitForTimeout(this.settleWaitMs);
+          }
+          if (req.fullPage) {
+            let captureHeight = size.height;
+            if (typeof page.evaluate === 'function') {
+              const docHeight = await page
+                .evaluate<number>(
+                  'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
+                )
+                .catch(() => size.height);
+              captureHeight = Math.min(Math.max(docHeight || size.height, size.height), MAX_FULL_PAGE_HEIGHT);
+            }
+            const png = await page.screenshot({
+              type: 'png',
+              fullPage: true,
+              clip: { x: 0, y: 0, width: size.width, height: captureHeight },
+            });
+            return { png, width: size.width, height: captureHeight };
           }
           const png = await page.screenshot({ type: 'png', fullPage: false });
           return { png, width: size.width, height: size.height };

@@ -125,3 +125,44 @@ describe('client-bridge script', () => {
   });
 });
 
+describe('invalidateCssModulesForFile', () => {
+  it('invalidates .css modules across moduleGraph and Vite environments for template/content files only', async () => {
+    const { invalidateCssModulesForFile } = await import('../src/index.js');
+    const cssClientMod = { id: '/repo/src/styles/global.css' };
+    const cssSsrMod = { id: '/repo/src/styles/global.css?ssr' };
+    const jsMod = { id: '/repo/src/lib/url.ts' };
+    const invalidated: unknown[] = [];
+
+    const server = {
+      moduleGraph: {
+        idToModuleMap: new Map<string, unknown>([
+          [cssClientMod.id, cssClientMod],
+          [jsMod.id, jsMod],
+        ]),
+        invalidateModule: (mod: unknown) => invalidated.push(mod),
+      },
+      environments: {
+        ssr: {
+          moduleGraph: {
+            idToModuleMap: new Map<string, unknown>([
+              [cssSsrMod.id, cssSsrMod],
+              [jsMod.id, jsMod],
+            ]),
+            invalidateModule: (mod: unknown) => invalidated.push(mod),
+          },
+        },
+      },
+    };
+
+    expect(invalidateCssModulesForFile(server, '/repo', '/repo/src/pages/poetry.astro')).toBe(2);
+    expect(invalidated).toEqual([cssClientMod, cssSsrMod]);
+
+    invalidated.length = 0;
+    expect(invalidateCssModulesForFile(server, '/repo', '/repo/node_modules/pkg/index.astro')).toBe(0);
+    expect(invalidateCssModulesForFile(server, '/repo', '/repo/dist/poetry/index.html')).toBe(0);
+    expect(invalidateCssModulesForFile(server, '/repo', '/repo/public/images/hero.webp')).toBe(0);
+    expect(invalidated).toEqual([]);
+  });
+});
+
+
