@@ -63,10 +63,11 @@ export function createPreviewProxy(
     }
 
     const url = new URL(c.req.url);
+    const targetBase = new URL(endpoint.astroUrl);
     const targetUrl = `${endpoint.astroUrl}${url.pathname}${url.search}`;
 
     const reqHeaders = new Headers(c.req.raw.headers);
-    reqHeaders.delete('host');
+    reqHeaders.set('host', `localhost:${targetBase.port || '4321'}`);
 
     try {
       const upstream = await fetch(targetUrl, {
@@ -110,7 +111,7 @@ export function createPreviewProxy(
       method: req.method,
       headers: {
         ...req.headers,
-        host: target.host,
+        host: `localhost:${target.port || '4321'}`,
       },
     });
 
