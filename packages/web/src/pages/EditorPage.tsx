@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
+import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { PublishModal } from '../components/PublishModal.js';
 
 interface Props {
@@ -269,18 +270,35 @@ export function EditorPage({
     }
   };
 
-  const sendPrompt = (whenBusy?: 'steer' | 'followUp') => {
+  const navigatePreview = (route: string) => {
+    if (!session) return;
+    const clean = route.startsWith('/') ? route : `/${route}`;
+    const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
+    if (iframeRef.current) {
+      iframeRef.current.src = `/p/${session.id}${baseSuffixVal}${clean}`;
+    }
+    setCurrentRoute(clean);
+    setShowPageSwitcher(false);
+  };
+
+  const sendPrompt = (whenBusy?: 'steer' | 'followUp', overrideText?: string) => {
     if (!session?.canEdit) return;
-    if (!input.trim() && attachments.length === 0 && chips.length === 0) return;
+    const textToSend = (overrideText ?? input).trim();
+    if (!textToSend && attachments.length === 0 && chips.length === 0) return;
     dispatchClientMessage({
       type: 'submit_input',
       requestId: crypto.randomUUID(),
-      text: input.trim() || 'Please use the attached context/image.',
+      text: textToSend || 'Please use the attached context/image.',
       contextChips: chips,
       attachments,
+      editorContext: {
+        currentRoute,
+        viewport,
+        mode,
+      },
       whenBusy,
     });
-    setInput('');
+    if (overrideText === undefined) setInput('');
     setChips([]);
     setAttachments([]);
   };
@@ -474,20 +492,53 @@ export function EditorPage({
         >
           <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
             {entries.length === 0 && !live.busy && (
-              <div className="rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
-                <p className="font-medium text-stone-900">Ready when you are.</p>
-                <p className="mt-1 text-xs leading-relaxed text-stone-500">
-                  Ask Halley to update schedules, add sermon series, upload photos, or click any text in the preview using <strong>Edit</strong> mode to tweak copy directly.
-                </p>
+              <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
+                <div>
+                  <p className="font-medium text-stone-900">Ready when you are.</p>
+                  <p className="mt-1 text-xs leading-relaxed text-stone-500">
+                    Ask Halley to update schedules, add pages, or upload photos — or click any text in the preview using <strong>Edit</strong> mode to tweak copy directly.
+                  </p>
+                </div>
+                {session.canEdit && (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {[
+                      `What's on this page (${currentRoute})?`,
+                      'Add a new upcoming event',
+                      'Check this page on desktop and mobile',
+                    ].map((starter) => (
+                      <button
+                        key={starter}
+                        type="button"
+                        onClick={() => sendPrompt(undefined, starter)}
+                        className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-left text-[11px] font-medium text-stone-700 transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
+                      >
+                        {starter}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
             {entries.map((entry) => {
               if (entry.role === 'user') {
+                const parsed = parseUserMessageDisplay(entry.text);
                 return (
-                  <div key={entry.id} className="flex justify-end">
+                  <div key={entry.id} className="flex flex-col items-end gap-1">
+                    {parsed.badges.length > 0 && (
+                      <div className="flex max-w-[85%] flex-wrap justify-end gap-1">
+                        {parsed.badges.map((b, idx) => (
+                          <span
+                            key={idx}
+                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-900"
+                          >
+                            {b}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-stone-900 px-3.5 py-2.5 text-sm text-white whitespace-pre-wrap">
-                      {entry.text}
+                      {parsed.body}
                     </div>
                   </div>
                 );
@@ -513,8 +564,12 @@ export function EditorPage({
                 );
               }
               return (
-                <div key={entry.id} className="text-sm leading-relaxed text-stone-800 whitespace-pre-wrap">
-                  {entry.text}
+                <div key={entry.id}>
+                  <ChatMessageContent
+                    text={entry.text}
+                    onNavigateRoute={navigatePreview}
+                    knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                  />
                 </div>
               );
             })}
@@ -530,8 +585,12 @@ export function EditorPage({
             ))}
 
             {live.streamingText && (
-              <div className="text-sm leading-relaxed text-stone-800 whitespace-pre-wrap">
-                {live.streamingText}
+              <div>
+                <ChatMessageContent
+                  text={live.streamingText}
+                  onNavigateRoute={navigatePreview}
+                  knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                />
                 <span className="inline-block h-3.5 w-1.5 ml-0.5 animate-pulse bg-amber-600 align-middle" />
               </div>
             )}
@@ -563,31 +622,46 @@ export function EditorPage({
               )}
 
               {chips.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
-                  {chips.map((c) => (
-                    <span
-                      key={`${c.file}:${c.loc}`}
-                      className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-medium text-amber-900"
-                    >
-                      <span className="truncate max-w-[180px]">
-                        &lt;{c.tagName}&gt; {c.renderedText || c.file}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setChips((prev) => prev.filter((x) => !(x.file === c.file && x.loc === c.loc)))
-                        }
-                        className="hover:text-red-700"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] text-stone-500">
+                    <span>
+                      {chips.length} {chips.length === 1 ? 'element' : 'elements'} selected
                     </span>
-                  ))}
+                    <button
+                      type="button"
+                      onClick={() => setChips([])}
+                      className="font-medium text-stone-500 underline decoration-stone-300 underline-offset-2 hover:text-red-700"
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {chips.map((c) => (
+                      <span
+                        key={`${c.file}:${c.loc}`}
+                        title={`${c.route} · <${c.tagName}>`}
+                        className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-medium text-amber-900"
+                      >
+                        <span className="truncate max-w-[180px]">
+                          &lt;{c.tagName}&gt; {c.renderedText || c.file}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setChips((prev) => prev.filter((x) => !(x.file === c.file && x.loc === c.loc)))
+                          }
+                          className="hover:text-red-700"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
                 </div>
               )}
 
               {attachments.length > 0 && (
-                <div className="flex flex-wrap gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   {attachments.map((a) => (
                     <div key={a.stagedId} className="relative group">
                       {a.thumbnailDataUrl ? (
@@ -612,6 +686,15 @@ export function EditorPage({
                       </button>
                     </div>
                   ))}
+                  {attachments.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setAttachments([])}
+                      className="text-[11px] font-medium text-stone-500 underline decoration-stone-300 underline-offset-2 hover:text-red-700"
+                    >
+                      Clear photos
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -629,7 +712,7 @@ export function EditorPage({
                   placeholder={
                     live.busy
                       ? 'Send a redirect or queue your next request…'
-                      : 'Tell Halley what to change, or drop an image…'
+                      : `Ask Halley about ${currentRoute}, or drop an image…`
                   }
                   className="w-full resize-none bg-transparent text-sm text-stone-900 placeholder:text-stone-400 outline-none"
                 />
@@ -752,14 +835,7 @@ export function EditorPage({
                         <button
                           key={r.route}
                           type="button"
-                          onClick={() => {
-                            const clean = r.route === '/' ? '/' : r.route;
-                            if (iframeRef.current) {
-                              iframeRef.current.src = `/p/${session.id}${baseSuffix}${clean}`;
-                            }
-                            setCurrentRoute(clean);
-                            setShowPageSwitcher(false);
-                          }}
+                          onClick={() => navigatePreview(r.route)}
                           className={`flex w-full items-center justify-between px-2.5 py-2 text-left text-xs hover:bg-stone-50 ${
                             currentRoute === r.route ? 'font-semibold text-amber-800 bg-amber-50/40' : 'text-stone-700'
                           }`}
@@ -803,6 +879,11 @@ export function EditorPage({
                               text: prompt,
                               contextChips: [],
                               attachments: [],
+                              editorContext: {
+                                currentRoute,
+                                viewport,
+                                mode,
+                              },
                             });
                             setNewPagePath('');
                             setNewPageUnlisted(false);

@@ -101,6 +101,13 @@ export const StagedAttachmentSchema = z.object({
 });
 export type StagedAttachment = z.infer<typeof StagedAttachmentSchema>;
 
+export const EditorContextSchema = z.object({
+  currentRoute: z.string(),
+  viewport: z.enum(['desktop', 'tablet', 'mobile']).optional(),
+  mode: z.enum(['browse', 'edit', 'select']).optional(),
+});
+export type EditorContext = z.infer<typeof EditorContextSchema>;
+
 export const ChatClientMessageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('submit_input'),
@@ -108,6 +115,7 @@ export const ChatClientMessageSchema = z.discriminatedUnion('type', [
     text: z.string(),
     contextChips: z.array(ElementContextSchema).default([]),
     attachments: z.array(StagedAttachmentSchema).default([]),
+    editorContext: EditorContextSchema.optional(),
     whenBusy: z.enum(['steer', 'followUp']).optional(),
   }),
   z.object({
