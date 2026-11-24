@@ -22,11 +22,15 @@ export async function runReaperPass(
   const retentionMs = config.archiveRetentionDays * 24 * 60 * 60 * 1000;
 
   for (const s of sessions) {
-    // 1. Stop idle running containers (keep volume intact for cold resume)
-    if (s.status === 'running' && !IN_FLIGHT_PUBLISH_STATES.has(s.publish_state)) {
+    // 1. Stop idle running containers (and published/merged containers woken for read-only viewing)
+    if (
+      (s.status === 'running' ||
+        ((s.status === 'published' || s.status === 'merged') && Boolean(s.runner_url))) &&
+      !IN_FLIGHT_PUBLISH_STATES.has(s.publish_state)
+    ) {
       const lastActive = new Date(s.last_active_at).getTime();
       if (now - lastActive > config.workspaceIdleTimeoutMs) {
-        console.log(`[reaper] Putting idle session ${s.id} to sleep`);
+        console.log(`[reaper] Putting idle ${s.status} session ${s.id} to sleep`);
         await driver.stop(s).catch(() => {});
       }
     }

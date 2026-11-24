@@ -40,6 +40,8 @@ export async function findAstroConfigFile(repoRoot: string): Promise<string> {
   throw new Error('No astro.config.{mjs,ts,js} found in repository');
 }
 
+export type AstroDevState = 'starting' | 'ready' | 'paused' | 'crashed';
+
 export interface AstroDevManagerOptions {
   repoRoot: string;
   sessionId: string;
@@ -47,29 +49,63 @@ export interface AstroDevManagerOptions {
   runnerPort: number;
   isReadOnly: () => boolean;
   onPatched: (evt: { file: string; loc: string }) => void;
+  /** Backoff delays (ms) for unexpected-exit auto-restarts. Default: [2000, 5000, 15000]. */
+  restartDelaysMs?: number[];
+  /** Window (ms) in which unexpected exits count toward the restart limit. Default: 5 min. */
+  crashWindowMs?: number;
+  /** Optional custom spawner for unit testing. */
+  spawnAstro?: () => ChildProcess;
+  /** Optional readiness probe override for unit testing. */
+  probeReady?: () => Promise<boolean>;
 }
+
+const DEFAULT_RESTART_DELAYS_MS = [2_000, 5_000, 15_000];
+const DEFAULT_CRASH_WINDOW_MS = 5 * 60_000;
 
 export class AstroDevManager {
   private proc: ChildProcess | null = null;
   private ready = false;
+  private state: AstroDevState = 'starting';
   private originalBase = '/';
   private previewBase = '/';
   private wrapperConfigPath = '';
   private recentLogs: string[] = [];
+  private intentionalStop = false;
+  private paused = false;
+  private crashTimestamps: number[] = [];
+  private crashCount = 0;
+  private lastExitCode: number | null = null;
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly restartDelaysMs: number[];
+  private readonly crashWindowMs: number;
 
-  constructor(private opts: AstroDevManagerOptions) {}
+  constructor(private opts: AstroDevManagerOptions) {
+    this.restartDelaysMs = opts.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
+    this.crashWindowMs = opts.crashWindowMs ?? DEFAULT_CRASH_WINDOW_MS;
+  }
 
   getStatus() {
     return {
       ready: this.ready,
+      state: this.state,
       originalBase: this.originalBase,
       previewBase: this.previewBase,
       port: this.opts.astroPort,
+      crashCount: this.crashCount,
+      lastExitCode: this.lastExitCode,
       logs: this.recentLogs.slice(-40),
     };
   }
 
-  async start(): Promise<{ originalBase: string; previewBase: string }> {
+  private clearRestartTimer(): void {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+  }
+
+  private async ensureWrapperConfig(): Promise<void> {
+    if (this.opts.spawnAstro) return;
     this.originalBase = await detectAstroBase(this.opts.repoRoot);
     this.previewBase = computePreviewBase(this.opts.sessionId, this.originalBase);
     const userConfigPath = await findAstroConfigFile(this.opts.repoRoot);
@@ -121,21 +157,37 @@ export default {
 };
 `;
     await fs.writeFile(this.wrapperConfigPath, configContent, 'utf8');
+  }
 
-    const astroBin = path.join(this.opts.repoRoot, 'node_modules', '.bin', 'astro');
-    const relConfigPath = path.relative(this.opts.repoRoot, this.wrapperConfigPath);
-    this.proc = spawn(
-      astroBin,
-      ['dev', '--config', relConfigPath, '--host', '0.0.0.0', '--port', String(this.opts.astroPort), '--allowed-hosts'],
-      {
-        cwd: this.opts.repoRoot,
-        env: {
-          ...process.env,
-          FORCE_COLOR: '0',
+  private async spawnAndWait(): Promise<void> {
+    this.clearRestartTimer();
+    this.intentionalStop = false;
+    this.paused = false;
+    this.ready = false;
+    this.state = 'starting';
+
+    let child: ChildProcess;
+    if (this.opts.spawnAstro) {
+      child = this.opts.spawnAstro();
+    } else {
+      const rawAstroBin = path.join(this.opts.repoRoot, 'node_modules', '.bin', 'astro');
+      const astroBin = await fs.realpath(rawAstroBin).catch(() => rawAstroBin);
+      const relConfigPath = path.relative(this.opts.repoRoot, this.wrapperConfigPath);
+      child = spawn(
+        astroBin,
+        ['dev', '--config', relConfigPath, '--host', '0.0.0.0', '--port', String(this.opts.astroPort), '--allowed-hosts'],
+        {
+          cwd: this.opts.repoRoot,
+          env: {
+            ...process.env,
+            FORCE_COLOR: '0',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
         },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+      );
+    }
+
+    this.proc = child;
 
     const pushLog = (chunk: Buffer) => {
       const lines = chunk.toString('utf8').split(/\r?\n/).filter(Boolean);
@@ -144,25 +196,68 @@ export default {
         if (this.recentLogs.length > 200) this.recentLogs.shift();
         if (l.includes('Local') || l.includes(`:${this.opts.astroPort}`) || l.includes('watching for file changes')) {
           this.ready = true;
+          this.state = 'ready';
         }
       }
     };
 
-    this.proc.stdout?.on('data', pushLog);
-    this.proc.stderr?.on('data', pushLog);
-    this.proc.on('exit', (code) => {
+    child.stdout?.on('data', pushLog);
+    child.stderr?.on('data', pushLog);
+    child.on('exit', (code, signal) => {
+      if (this.proc !== child) return;
       this.ready = false;
-      this.recentLogs.push(`[astro dev exited with code ${code}]`);
+      this.lastExitCode = code;
+      this.recentLogs.push(`[astro dev exited with code ${code}${signal ? ` (${signal})` : ''}]`);
+
+      if (this.paused) {
+        this.state = 'paused';
+        return;
+      }
+      if (this.intentionalStop) {
+        return;
+      }
+
+      this.crashCount += 1;
+      const now = Date.now();
+      this.crashTimestamps = this.crashTimestamps.filter((ts) => now - ts < this.crashWindowMs);
+      this.crashTimestamps.push(now);
+
+      if (this.crashTimestamps.length <= this.restartDelaysMs.length) {
+        const delay = this.restartDelaysMs[this.crashTimestamps.length - 1] ?? 15_000;
+        this.state = 'starting';
+        this.recentLogs.push(
+          `[astro dev crashed (${this.crashTimestamps.length}/${this.restartDelaysMs.length}); restarting in ${delay}ms]`,
+        );
+        this.clearRestartTimer();
+        this.restartTimer = setTimeout(() => {
+          this.restartTimer = null;
+          if (!this.intentionalStop && !this.paused) {
+            void this.spawnAndWait().catch((err) => {
+              this.recentLogs.push(`[astro dev auto-restart failed: ${err instanceof Error ? err.message : String(err)}]`);
+              this.state = 'crashed';
+            });
+          }
+        }, delay);
+        this.restartTimer.unref?.();
+      } else {
+        this.state = 'crashed';
+        this.recentLogs.push('[astro dev exceeded restart limit; marked crashed]');
+      }
     });
 
     // Poll local HTTP until ready (up to 30s)
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
-      if (this.proc.exitCode !== null) break;
+      if (this.proc !== child || child.exitCode !== null || this.paused || this.intentionalStop) break;
       try {
-        const res = await fetch(`http://127.0.0.1:${this.opts.astroPort}${this.previewBase}/`);
-        if (res.status < 500) {
+        const ok = this.opts.probeReady
+          ? await this.opts.probeReady()
+          : await fetch(`http://127.0.0.1:${this.opts.astroPort}${this.previewBase}/`).then(
+              (res) => res.status < 500,
+            );
+        if (ok) {
           this.ready = true;
+          this.state = 'ready';
           break;
         }
       } catch {
@@ -170,16 +265,66 @@ export default {
       }
       await new Promise((r) => setTimeout(r, 400));
     }
+  }
 
+  private async killCurrentProc(): Promise<void> {
+    const p = this.proc;
+    if (p && p.exitCode === null) {
+      p.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 500));
+      if (p.exitCode === null) p.kill('SIGKILL');
+    }
+    if (this.proc === p) {
+      this.proc = null;
+    }
+  }
+
+  async start(): Promise<{ originalBase: string; previewBase: string }> {
+    await this.ensureWrapperConfig();
+    await this.spawnAndWait();
     return { originalBase: this.originalBase, previewBase: this.previewBase };
   }
 
-  async stop(): Promise<void> {
-    if (this.proc && this.proc.exitCode === null) {
-      this.proc.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 500));
-      if (this.proc.exitCode === null) this.proc.kill('SIGKILL');
+  /**
+   * Temporarily stops `astro dev` to free memory during production builds / verification checks.
+   * Preserves the wrapper config file so `resume()` can restart cleanly.
+   */
+  async pause(): Promise<void> {
+    this.clearRestartTimer();
+    this.paused = true;
+    this.intentionalStop = true;
+    this.ready = false;
+    this.state = 'paused';
+    await this.killCurrentProc();
+  }
+
+  /** Resumes `astro dev` after `pause()`. */
+  async resume(): Promise<void> {
+    if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
+      await this.ensureWrapperConfig();
     }
+    this.paused = false;
+    await this.spawnAndWait();
+  }
+
+  /** Resets crash history and performs a clean restart of `astro dev`. */
+  async restart(): Promise<void> {
+    this.clearRestartTimer();
+    this.crashTimestamps = [];
+    this.intentionalStop = true;
+    this.paused = false;
+    await this.killCurrentProc();
+    if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
+      await this.ensureWrapperConfig();
+    }
+    await this.spawnAndWait();
+  }
+
+  async stop(): Promise<void> {
+    this.clearRestartTimer();
+    this.intentionalStop = true;
+    this.paused = false;
+    await this.killCurrentProc();
     this.ready = false;
     if (this.wrapperConfigPath) {
       await fs.rm(this.wrapperConfigPath, { force: true }).catch(() => {});

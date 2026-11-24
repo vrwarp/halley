@@ -76,6 +76,8 @@ export const api = {
     apiFetch<{ session: EditorSessionDto; spend: SpendStatusDto }>(`/api/sessions/${id}`),
   wakeSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/wake`, { method: 'POST' }),
+  restartSession: (id: string) =>
+    apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/restart`, { method: 'POST' }),
   duplicateSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/duplicate`, { method: 'POST' }),
   revertPublication: (body: {

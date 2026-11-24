@@ -7,7 +7,11 @@ import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { DockerWorkspaceDriver, hasEmptyWorkspaceToken } from '../src/drivers/docker-driver.js';
 import { LocalWorkspaceDriver } from '../src/drivers/local-driver.js';
-import type { WorkspaceDriver } from '../src/drivers/workspace-driver.js';
+import {
+  CrashLoopTracker,
+  WorkspaceCrashLoopError,
+  type WorkspaceDriver,
+} from '../src/drivers/workspace-driver.js';
 import { createControlPlane } from '../src/index.js';
 import { hashWorkspaceToken } from '../src/proxy/llm-proxy.js';
 import { ScreenshotService } from '../src/screenshot-service.js';
@@ -51,7 +55,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
                 capturedUrls.push(url);
               },
               waitForTimeout: async () => {},
-              screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+              screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]),
             }),
             close: async () => {},
           }),
@@ -125,7 +129,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       });
       expect(traversalShot.status).toBe(400);
 
-      // /internal/screenshot streams PNG and deduplicates base prefix if included
+      // /internal/screenshot streams JPEG and deduplicates base prefix if included
       const validShot = await cp.app.request('/internal/screenshot', {
         method: 'POST',
         headers: {
@@ -135,10 +139,11 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         body: JSON.stringify({ route: '/thecrossing.website/im-new', viewport: 'mobile' }),
       });
       expect(validShot.status).toBe(200);
-      expect(validShot.headers.get('content-type')).toBe('image/png');
+      expect(validShot.headers.get('content-type')).toBe('image/jpeg');
       expect(validShot.headers.get('x-screenshot-width')).toBe('390');
-      const pngBytes = Buffer.from(await validShot.arrayBuffer());
-      expect(pngBytes[0]).toBe(0x89);
+      const jpegBytes = Buffer.from(await validShot.arrayBuffer());
+      expect(jpegBytes[0]).toBe(0xff);
+      expect(jpegBytes[1]).toBe(0xd8);
       expect(capturedUrls).toEqual([
         `http://127.0.0.1:49998/p/${session.id}/thecrossing.website/im-new`,
       ]);
@@ -604,5 +609,104 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       cache_creation_input_tokens: 119789,
     });
     expect(cost).toBeCloseTo(0.037420145, 6);
+  });
+
+  it('opens crash-loop circuit breaker after 3 failures, makes transcript non-waking, and supports /restart', async () => {
+    const tracker = new CrashLoopTracker({
+      threshold: 3,
+      windowMs: 60_000,
+      cooldownsMs: [10_000, 30_000],
+    });
+    const t0 = 1_000_000;
+    tracker.recordFailure('s1', 'exit 137', { oom: true, now: t0 });
+    tracker.assertCanAttempt('s1', t0 + 100);
+    tracker.recordFailure('s1', 'exit 137', { oom: true, now: t0 + 1000 });
+    tracker.assertCanAttempt('s1', t0 + 1100);
+    const info = tracker.recordFailure('s1', 'OOMKilled', { oom: true, now: t0 + 2000 });
+    expect(info.crashLoop).toBe(true);
+    expect(info.oom).toBe(true);
+
+    expect(() => tracker.assertCanAttempt('s1', t0 + 3000)).toThrow(WorkspaceCrashLoopError);
+    tracker.reset('s1');
+    expect(() => tracker.assertCanAttempt('s1', t0 + 3000)).not.toThrow();
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-breaker-test-'));
+    try {
+      let ensureCalls = 0;
+      let restartCalls = 0;
+      const driver: WorkspaceDriver = {
+        ...createMockDriver(),
+        ensureRunning: async () => {
+          ensureCalls += 1;
+          return {
+            runnerUrl: 'http://127.0.0.1:49999',
+            astroUrl: 'http://127.0.0.1:49998',
+            astroBase: '/',
+            baseSha: 'abc1234',
+          };
+        },
+        restart: async () => {
+          restartCalls += 1;
+          return {
+            runnerUrl: 'http://127.0.0.1:49999',
+            astroUrl: 'http://127.0.0.1:49998',
+            astroBase: '/',
+            baseSha: 'abc1234',
+          };
+        },
+      };
+      const cfg = {
+        ...loadConfig(),
+        dataDir: tmp,
+        adminEmails: ['admin@thecrossing.website'],
+        allowedDomains: ['thecrossing.website'],
+        devLoginEnabled: true,
+      };
+      const cp = createControlPlane(cfg, driver);
+      const login = await cp.app.request('/api/auth/dev-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sarah@thecrossing.website', name: 'Sarah' }),
+      });
+      const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+      const createRes = await cp.app.request('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ title: 'Crash Test' }),
+      });
+      const { session } = (await createRes.json()) as { session: { id: string } };
+      cp.db.updateSession(session.id, { status: 'error', runner_url: null });
+      const before = ensureCalls;
+
+      // Transcript endpoint must NOT wake a stopped/errored session
+      const trRes = await cp.app.request(`/api/sessions/${session.id}/transcript`, {
+        headers: { Cookie: cookie },
+      });
+      expect(trRes.status).toBe(503);
+      expect(ensureCalls).toBe(before);
+
+      // Teammate cannot restart Sarah's session
+      const login2 = await cp.app.request('/api/auth/dev-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'david@thecrossing.website', name: 'David' }),
+      });
+      const cookie2 = login2.headers.get('set-cookie')!.split(';')[0]!;
+      const forbidRestart = await cp.app.request(`/api/sessions/${session.id}/restart`, {
+        method: 'POST',
+        headers: { Cookie: cookie2 },
+      });
+      expect(forbidRestart.status).toBe(403);
+
+      // Owner can restart
+      const okRestart = await cp.app.request(`/api/sessions/${session.id}/restart`, {
+        method: 'POST',
+        headers: { Cookie: cookie },
+      });
+      expect(okRestart.status).toBe(200);
+      expect(restartCalls).toBe(1);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
   });
 });

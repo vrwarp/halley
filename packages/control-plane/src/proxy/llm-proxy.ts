@@ -148,11 +148,12 @@ export function createLlmProxyHandler(
 
     const bodyText = await c.req.text();
     let requestedModel = config.modelId;
-    try {
-      const parsed = JSON.parse(bodyText) as { model?: string };
-      if (parsed.model) requestedModel = parsed.model;
-    } catch {
-      // ignore
+    const headModelMatch = bodyText.slice(0, 4096).match(/"model"\s*:\s*"([^"]+)"/);
+    if (headModelMatch?.[1]) {
+      requestedModel = headModelMatch[1];
+    } else if (bodyText.length > 4096) {
+      const tailModelMatch = bodyText.slice(-4096).match(/"model"\s*:\s*"([^"]+)"/);
+      if (tailModelMatch?.[1]) requestedModel = tailModelMatch[1];
     }
 
     // F15: Enforce model allowlist (count_tokens is allowed for escalation model estimation)

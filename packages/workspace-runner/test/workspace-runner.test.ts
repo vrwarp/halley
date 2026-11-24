@@ -1,10 +1,12 @@
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
+import { AstroDevManager } from '../src/astro-manager.js';
 import {
   createCheckpoint,
   hasProtectedPathChanges,
@@ -15,7 +17,7 @@ import {
   undoToCheckpoint,
 } from '../src/checkpoints-and-git.js';
 import { UploadManager } from '../src/uploads.js';
-import { runAstroHygieneGuard } from '../src/verify.js';
+import { runAllVerificationChecks, runAstroHygieneGuard } from '../src/verify.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -252,6 +254,96 @@ describe('workspace-runner git, protection & hygiene', () => {
     expect(summary).toContain('[PASS] Production build (9500ms) — 08:50:02 [build] 95 page(s) built in 6.21s · Indexed 89 pages');
     expect(summary).not.toContain('/poetry/index.html');
     expect(summary).toContain('[FAIL] Verify (seo) (400ms)\nMissing meta description on /poetry\nLine 2 detail');
+  });
+
+  it('serializes concurrent runAllVerificationChecks invocations via single-flight lock', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-verify-lock-'));
+    try {
+      const logFile = path.join(tmp, 'events.log');
+      await fs.writeFile(
+        path.join(tmp, '.halley.json'),
+        JSON.stringify({
+          checks: [
+            {
+              name: 'Overlap detector',
+              command: `echo start >> ${logFile}; sleep 0.08; echo end >> ${logFile}`,
+            },
+          ],
+        }),
+      );
+      const [r1, r2] = await Promise.all([
+        runAllVerificationChecks(tmp),
+        runAllVerificationChecks(tmp),
+      ]);
+      expect(r1.allPassed).toBe(true);
+      expect(r2.allPassed).toBe(true);
+      const lines = (await fs.readFile(logFile, 'utf8')).trim().split(/\r?\n/);
+      expect(lines).toEqual(['start', 'end', 'start', 'end']);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('auto-restarts AstroDevManager on unexpected exit, pauses/resumes cleanly, and marks crashed after budget exhausted', async () => {
+    const procs: Array<EventEmitter & { exitCode: number | null; kill: () => boolean }> = [];
+    const mgr = new AstroDevManager({
+      repoRoot: '/tmp',
+      sessionId: 'test-astro',
+      astroPort: 4321,
+      runnerPort: 4100,
+      isReadOnly: () => false,
+      onPatched: () => {},
+      restartDelaysMs: [20, 20],
+      crashWindowMs: 60_000,
+      spawnAstro: () => {
+        const fake = Object.assign(new EventEmitter(), {
+          exitCode: null as number | null,
+          stdout: new EventEmitter(),
+          stderr: new EventEmitter(),
+          kill: () => {
+            if (fake.exitCode === null) {
+              fake.exitCode = 0;
+              fake.emit('exit', 0, 'SIGTERM');
+            }
+            return true;
+          },
+        });
+        procs.push(fake);
+        return fake as unknown as ChildProcess;
+      },
+      probeReady: async () => true,
+    });
+
+    await mgr.start();
+    expect(mgr.getStatus().ready).toBe(true);
+    expect(mgr.getStatus().state).toBe('ready');
+    expect(procs.length).toBe(1);
+
+    await mgr.pause();
+    expect(mgr.getStatus().state).toBe('paused');
+    expect(mgr.getStatus().crashCount).toBe(0);
+    await mgr.resume();
+    expect(mgr.getStatus().state).toBe('ready');
+    expect(procs.length).toBe(2);
+
+    procs[1]!.exitCode = 137;
+    procs[1]!.emit('exit', 137, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 60));
+    expect(procs.length).toBe(3);
+    expect(mgr.getStatus().state).toBe('ready');
+
+    procs[2]!.exitCode = 137;
+    procs[2]!.emit('exit', 137, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 60));
+    expect(procs.length).toBe(4);
+
+    procs[3]!.exitCode = 137;
+    procs[3]!.emit('exit', 137, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 60));
+    expect(mgr.getStatus().state).toBe('crashed');
+    expect(procs.length).toBe(4);
+
+    await mgr.stop();
   });
 });
 

@@ -53,6 +53,7 @@ import { NewPageCard, pageStatusText } from '../components/NewPageCard.js';
 import { NewPageModal } from '../components/NewPageModal.js';
 import { PageToolbarControls } from '../components/PageToolbarControls.js';
 import { PublishModal } from '../components/PublishModal.js';
+import { PreviewVerifyingOverlay } from '../components/PreviewVerifyingOverlay.js';
 import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
 
 /** Chips are unique per element + highlighted phrase. */
@@ -146,6 +147,12 @@ export function EditorPage({
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
   const [changedCount, setChangedCount] = useState(0);
   const [publishProgress, setPublishProgress] = useState<PublishProgressPayload | null>(null);
+  const [previewPaused, setPreviewPaused] = useState<{ paused: boolean; reason?: string }>({
+    paused: false,
+  });
+  const [wsReconnectNonce, setWsReconnectNonce] = useState(0);
+  const crashLoopHaltedRef = useRef(false);
+  const prevPreviewPausedRef = useRef(false);
   const [syncing, setSyncing] = useState(false);
   const [syncToast, setSyncToast] = useState<string | null>(null);
   const [syncReview, setSyncReview] = useState<MergeReviewStateDto | null>(null);
@@ -213,6 +220,9 @@ export function EditorPage({
     setSession(res.session);
     if (res.session.bootProgress) {
       setBootProgress(res.session.bootProgress);
+      if (res.session.bootProgress.crashLoop) {
+        crashLoopHaltedRef.current = true;
+      }
     }
     setSpend(res.spend);
     setChangedCount(res.session.changedFilesCount);
@@ -231,10 +241,15 @@ export function EditorPage({
   };
 
   const handleRetryBoot = async () => {
+    crashLoopHaltedRef.current = false;
     setBootProgress(null);
-    const { session: woken } = await api.wakeSession(sessionId);
+    const shouldHardRestart = Boolean(bootProgress?.crashLoop) || session?.status === 'error';
+    const { session: woken } = shouldHardRestart
+      ? await api.restartSession(sessionId)
+      : await api.wakeSession(sessionId);
     setSession(woken);
     if (woken.bootProgress) setBootProgress(woken.bootProgress);
+    setWsReconnectNonce((n) => n + 1);
   };
 
   const setChangesFromServer = (count: number, ckpts: CheckpointInfo[]) => {
@@ -244,7 +259,9 @@ export function EditorPage({
 
   useEffect(() => {
     wakeRequestedRef.current = false;
+    crashLoopHaltedRef.current = false;
     setBootProgress(null);
+    setPreviewPaused({ paused: false });
     void loadSessionMeta();
     api
       .getTranscript(sessionId)
@@ -350,14 +367,16 @@ export function EditorPage({
   useEffect(() => {
     let disposed = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
 
     const connect = () => {
-      if (disposed) return;
+      if (disposed || crashLoopHaltedRef.current) return;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${proto}//${window.location.host}/ws/sessions/${sessionId}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        attempt = 0;
         if (!disposed) setWsConnected(true);
       };
 
@@ -365,9 +384,14 @@ export function EditorPage({
         const msg = JSON.parse(evt.data) as ChatServerMessage;
         if (msg.type === 'boot_progress') {
           setBootProgress(msg.progress);
+          if (msg.progress.crashLoop) {
+            crashLoopHaltedRef.current = true;
+          }
           if (msg.progress.stage === 'ready' || msg.progress.stage === 'error') {
             void loadSessionMeta();
           }
+        } else if (msg.type === 'preview_paused') {
+          setPreviewPaused({ paused: msg.paused, reason: msg.reason });
         } else if (msg.type === 'transcript_state') {
           setEntries(msg.entries);
           setLive(msg.live);
@@ -425,7 +449,11 @@ export function EditorPage({
       ws.onclose = () => {
         if (disposed) return;
         setWsConnected(false);
-        reconnectTimer = setTimeout(connect, 2000);
+        if (crashLoopHaltedRef.current) return;
+        attempt += 1;
+        const baseDelay = Math.min(30_000, 2000 * 2 ** Math.min(attempt - 1, 4));
+        const jitter = Math.floor(Math.random() * 500);
+        reconnectTimer = setTimeout(connect, baseDelay + jitter);
       };
 
       ws.onerror = () => {
@@ -439,11 +467,21 @@ export function EditorPage({
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [sessionId]);
+  }, [sessionId, wsReconnectNonce]);
+
+  // Reload iframe smoothly once Astro dev resumes after pre-publish verification
+  const isPreviewPaused = previewPaused.paused || publishProgress?.state === 'verifying';
+  useEffect(() => {
+    if (prevPreviewPausedRef.current && !isPreviewPaused) {
+      reloadPreview(true);
+    }
+    prevPreviewPausedRef.current = isPreviewPaused;
+  }, [isPreviewPaused]);
 
   // Fallback HTTP transcript polling whenever WebSocket is disconnected (e.g. reverse proxy without WS headers)
   useEffect(() => {
     if (wsConnected) return;
+    if (bootProgress?.crashLoop) return;
     if (!session || (session.status !== 'running' && session.status !== 'published')) return;
     const poll = () => {
       void api
@@ -460,9 +498,9 @@ export function EditorPage({
         .catch(() => {});
     };
     poll();
-    const timer = setInterval(poll, 2000);
+    const timer = setInterval(poll, 5000);
     return () => clearInterval(timer);
-  }, [sessionId, wsConnected, session?.status]);
+  }, [sessionId, wsConnected, session?.status, bootProgress?.crashLoop]);
 
   // Track mutating tools during an agent run, refresh preview/metadata when the run completes,
   // and auto-navigate to a newly created single route if the user hasn't navigated away.
@@ -1752,7 +1790,7 @@ export function EditorPage({
 
           <div className="flex flex-1 items-center justify-center overflow-auto p-4">
             <div
-              className="h-full overflow-hidden rounded-xl border border-[#E7E5E4] bg-white shadow-sm transition-all duration-200"
+              className="relative h-full overflow-hidden rounded-xl border border-[#E7E5E4] bg-white shadow-sm transition-all duration-200"
               style={{
                 width:
                   viewport === 'mobile' ? '390px' : viewport === 'tablet' ? '768px' : '100%',
@@ -1764,6 +1802,9 @@ export function EditorPage({
                 title="Live Astro Preview"
                 className="h-full w-full border-0"
               />
+              {isPreviewPaused && (
+                <PreviewVerifyingOverlay reason={previewPaused.reason} />
+              )}
             </div>
           </div>
         </main>

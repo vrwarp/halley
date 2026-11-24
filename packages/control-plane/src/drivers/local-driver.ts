@@ -10,10 +10,13 @@ import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { GitHubService } from '../github/client.js';
 import { hashWorkspaceToken } from '../proxy/llm-proxy.js';
 import {
+  CrashLoopTracker,
+  WorkspaceCrashLoopError,
   ensureBareMirror,
   runGit,
   withGitAskPass,
   type BootProgressListener,
+  type WorkspaceCrashInfo,
   type WorkspaceDriver,
   type WorkspaceEndpoint,
 } from './workspace-driver.js';
@@ -42,6 +45,7 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
   private sessionTokens = new Map<string, string>();
   private bootProgress = new Map<string, BootProgressDto>();
   private bootProgressListener: BootProgressListener | null = null;
+  private crashTracker = new CrashLoopTracker();
 
   constructor(
     private config: HalleyConfig,
@@ -70,11 +74,16 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
     return this.bootProgress.get(sessionId) ?? null;
   }
 
+  getCrashInfo(sessionId: string): WorkspaceCrashInfo | null {
+    return this.crashTracker.getInfo(sessionId);
+  }
+
   private emitProgress(
     sessionId: string,
     stage: BootStage,
     message: string,
     detail?: string,
+    extra?: { crashLoop?: boolean; oom?: boolean; retryAfterSec?: number },
   ): void {
     const prev = this.bootProgress.get(sessionId);
     const now = new Date().toISOString();
@@ -84,6 +93,9 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
       detail,
       startedAt: prev?.startedAt ?? now,
       updatedAt: now,
+      crashLoop: extra?.crashLoop,
+      oom: extra?.oom,
+      retryAfterSec: extra?.retryAfterSec,
     };
     this.bootProgress.set(sessionId, progress);
     this.bootProgressListener?.(sessionId, progress);
@@ -96,6 +108,19 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
   async ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint> {
     const existing = this.booting.get(session.id);
     if (existing) return existing;
+
+    try {
+      this.crashTracker.assertCanAttempt(session.id);
+    } catch (err) {
+      if (err instanceof WorkspaceCrashLoopError) {
+        this.emitProgress(session.id, 'error', 'Workspace paused after repeated crashes', err.message, {
+          crashLoop: true,
+          oom: err.oom,
+          retryAfterSec: err.retryAfterSec,
+        });
+      }
+      throw err;
+    }
 
     if (session.status === 'running' && session.runner_url && session.astro_url && this.procs.has(session.id)) {
       return {
@@ -111,6 +136,14 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
     });
     this.booting.set(session.id, p);
     return p;
+  }
+
+  async restart(session: SessionRecord): Promise<WorkspaceEndpoint> {
+    this.crashTracker.reset(session.id);
+    await this.stop(session);
+    this.db.updateSession(session.id, { status: 'starting' });
+    const fresh = this.db.getSession(session.id) ?? session;
+    return this.ensureRunning(fresh);
   }
 
   private async bootSession(session: SessionRecord): Promise<WorkspaceEndpoint> {
@@ -263,15 +296,22 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
       last_active_at: new Date().toISOString(),
     });
 
+    this.crashTracker.recordSuccess(session.id);
     this.emitProgress(session.id, 'ready', 'Workspace ready!');
     return { runnerUrl, astroUrl, astroBase, baseSha };
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const info = this.crashTracker.recordFailure(session.id, msg);
       this.emitProgress(
         session.id,
         'error',
-        'Workspace failed to start',
-        err instanceof Error ? err.message : String(err),
+        info.crashLoop ? 'Workspace paused after repeated crashes' : 'Workspace failed to start',
+        msg,
+        { crashLoop: info.crashLoop, oom: info.oom, retryAfterSec: info.retryAfterSec },
       );
+      if (info.crashLoop) {
+        this.db.updateSession(session.id, { status: 'error', runner_url: null, astro_url: null });
+      }
       throw err;
     }
   }

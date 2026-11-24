@@ -48,9 +48,13 @@ export class PublishService {
         body: JSON.stringify({ summary: 'Ready to publish' }),
       }).catch(() => {});
 
-      // 1. Hard-gate verification checks (astro hygiene, check, build, verify:*)
+      // 1. Hard-gate verification checks (pause Astro dev server to free memory during production build)
       this.setState(session.id, 'verifying');
-      const verifyRes = await fetch(`${runnerUrl}/internal/verify`, { method: 'POST' });
+      const verifyRes = await fetch(`${runnerUrl}/internal/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pausePreview: true }),
+      });
       const verifyData = (await verifyRes.json()) as {
         allPassed: boolean;
         results: VerificationCheckResult[];
@@ -139,7 +143,11 @@ export class PublishService {
       if (syncData.review && !syncData.review.alreadyUpToDate) {
         // Non-overlapping mid-publish update merged cleanly: re-verify before pushing
         this.setState(session.id, 'verifying');
-        const reVerify = await fetch(`${runnerUrl}/internal/verify`, { method: 'POST' });
+        const reVerify = await fetch(`${runnerUrl}/internal/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pausePreview: true }),
+        });
         const reData = (await reVerify.json()) as {
           allPassed: boolean;
           results: VerificationCheckResult[];
@@ -227,8 +235,18 @@ export class PublishService {
 
       await this.waitForPagesDeploy(session.id, mergedSha, pr.number, pr.url);
     } catch (err) {
+      const rawMsg = err instanceof Error ? err.message : 'Publish failed unexpectedly';
+      const crashInfo = this.driver.getCrashInfo?.(session.id);
+      const isRunnerDisconnect =
+        /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg);
+      const friendlyError =
+        crashInfo?.oom
+          ? 'The workspace ran out of memory while running publish checks. Restart the workspace and try publishing again.'
+          : isRunnerDisconnect
+            ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
+            : rawMsg;
       this.setState(session.id, 'failed_checks', {
-        error: err instanceof Error ? err.message : 'Publish failed unexpectedly',
+        error: friendlyError,
       });
     }
   }
@@ -372,6 +390,10 @@ export class PublishService {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ readOnly: true }),
           }).catch(() => {});
+        }
+        const updated = this.db.getSession(sessionId);
+        if (updated) {
+          await this.driver.stop(updated).catch(() => {});
         }
         this.setState(sessionId, 'published', { prNumber, prUrl });
         return;
