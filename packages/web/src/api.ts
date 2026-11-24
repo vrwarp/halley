@@ -54,6 +54,8 @@ export const api = {
     }),
   getSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto; spend: SpendStatusDto }>(`/api/sessions/${id}`),
+  wakeSession: (id: string) =>
+    apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/wake`, { method: 'POST' }),
   duplicateSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/duplicate`, { method: 'POST' }),
   takeoverSession: (id: string) =>

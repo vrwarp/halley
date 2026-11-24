@@ -31,6 +31,7 @@ export interface HalleyConfig {
   controlPlaneInternalUrl: string;
   workspaceIdleTimeoutMs: number;
   archiveRetentionDays: number;
+  warmPoolSize: number;
   devLoginEnabled: boolean;
   devLocalRepo: string;
   webDistDir: string;
@@ -45,6 +46,15 @@ function splitCsv(val: string | undefined): string[] {
 
 export function loadConfig(): HalleyConfig {
   const port = Number(process.env.PORT || 3000);
+  const workspaceDriver: 'docker' | 'local' =
+    process.env.WORKSPACE_DRIVER === 'local' ? 'local' : 'docker';
+  const warmPoolRaw = process.env.HALLEY_WARM_POOL_SIZE;
+  const warmPoolSize =
+    warmPoolRaw !== undefined && warmPoolRaw !== ''
+      ? Math.max(0, Math.min(3, Number(warmPoolRaw) || 0))
+      : workspaceDriver === 'docker'
+        ? 1
+        : 0;
   return {
     port,
     publicUrl: (process.env.HALLEY_PUBLIC_URL || `http://localhost:${port}`).replace(/\/$/, ''),
@@ -70,13 +80,14 @@ export function loadConfig(): HalleyConfig {
     modelId: process.env.HALLEY_MODEL_ID || 'haiku-latest',
     thinkingLevel: (process.env.HALLEY_THINKING_LEVEL || 'high') as 'off' | 'low' | 'medium' | 'high',
     dailyCostCapUsd: Number(process.env.HALLEY_DAILY_COST_CAP_USD || 10),
-    workspaceDriver: process.env.WORKSPACE_DRIVER === 'local' ? 'local' : 'docker',
+    workspaceDriver,
     workspaceImage: process.env.WORKSPACE_IMAGE || 'vrwarp/halley-workspace:latest',
     workspaceDockerNetwork: process.env.WORKSPACE_DOCKER_NETWORK || '',
     controlPlaneInternalUrl:
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),
     archiveRetentionDays: Number(process.env.ARCHIVE_RETENTION_DAYS || 7),
+    warmPoolSize,
     devLoginEnabled: process.env.HALLEY_DEV_LOGIN === 'true',
     devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || '',
     webDistDir: path.resolve(process.env.HALLEY_WEB_DIST || '../web/dist'),

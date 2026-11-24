@@ -1,4 +1,5 @@
 import type {
+  BootProgressDto,
   ChatServerMessage,
   CheckpointInfo,
   EditorSessionDto,
@@ -39,6 +40,7 @@ import { api } from '../api.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
 import { PublishModal } from '../components/PublishModal.js';
+import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
 
 interface Props {
   sessionId: string;
@@ -76,6 +78,7 @@ export function EditorPage({
   onOpenSession,
 }: Props) {
   const [session, setSession] = useState<EditorSessionDto | null>(null);
+  const [bootProgress, setBootProgress] = useState<BootProgressDto | null>(null);
   const [spend, setSpend] = useState<SpendStatusDto>(initialSpend);
   const [entries, setEntries] = useState<TranscriptEntryDto[]>([]);
   const [live, setLive] = useState<LiveRunStateDto>({
@@ -117,6 +120,7 @@ export function EditorPage({
   const pendingRouteRef = useRef<string | null>(null);
   const prevBusyRef = useRef(false);
   const hadMutatingToolRef = useRef(false);
+  const wakeRequestedRef = useRef(false);
 
   const reloadPreview = (force = false) => {
     const now = Date.now();
@@ -132,16 +136,28 @@ export function EditorPage({
   const loadSessionMeta = async () => {
     const res = await api.getSession(sessionId);
     setSession(res.session);
+    if (res.session.bootProgress) {
+      setBootProgress(res.session.bootProgress);
+    }
     setSpend(res.spend);
     setChangedCount(res.session.changedFilesCount);
     if (!res.session.canEdit) setMode('browse');
-    try {
-      const [ch, rt] = await Promise.all([api.getChanges(sessionId), api.getRoutes(sessionId)]);
-      setChangesFromServer(ch.changes.length, ch.checkpoints);
-      setSiteRoutes(rt.routes);
-    } catch {
-      // runner may still be booting
+    if (res.session.status === 'running' || res.session.status === 'published') {
+      try {
+        const [ch, rt] = await Promise.all([api.getChanges(sessionId), api.getRoutes(sessionId)]);
+        setChangesFromServer(ch.changes.length, ch.checkpoints);
+        setSiteRoutes(rt.routes);
+      } catch {
+        // runner may still be initializing
+      }
     }
+  };
+
+  const handleRetryBoot = async () => {
+    setBootProgress(null);
+    const { session: woken } = await api.wakeSession(sessionId);
+    setSession(woken);
+    if (woken.bootProgress) setBootProgress(woken.bootProgress);
   };
 
   const setChangesFromServer = (count: number, ckpts: CheckpointInfo[]) => {
@@ -150,14 +166,28 @@ export function EditorPage({
   };
 
   useEffect(() => {
+    wakeRequestedRef.current = false;
+    setBootProgress(null);
     void loadSessionMeta();
   }, [sessionId]);
 
   useEffect(() => {
-    if (!session || session.status !== 'starting') return;
+    if (!session) return;
+    if (session.status === 'sleeping' && !wakeRequestedRef.current) {
+      wakeRequestedRef.current = true;
+      void api
+        .wakeSession(sessionId)
+        .then(({ session: woken }) => {
+          setSession(woken);
+          if (woken.bootProgress) setBootProgress(woken.bootProgress);
+        })
+        .catch(() => {});
+      return;
+    }
+    if (session.status !== 'starting') return;
     const timer = setInterval(() => {
       void loadSessionMeta();
-    }, 2000);
+    }, 1500);
     return () => clearInterval(timer);
   }, [sessionId, session?.status]);
 
@@ -179,7 +209,12 @@ export function EditorPage({
 
       ws.onmessage = (evt) => {
         const msg = JSON.parse(evt.data) as ChatServerMessage;
-        if (msg.type === 'transcript_state') {
+        if (msg.type === 'boot_progress') {
+          setBootProgress(msg.progress);
+          if (msg.progress.stage === 'ready' || msg.progress.stage === 'error') {
+            void loadSessionMeta();
+          }
+        } else if (msg.type === 'transcript_state') {
           setEntries(msg.entries);
           setLive(msg.live);
         } else if (msg.type === 'workspace_lock') {
@@ -230,6 +265,7 @@ export function EditorPage({
   // Fallback HTTP transcript polling whenever WebSocket is disconnected (e.g. reverse proxy without WS headers)
   useEffect(() => {
     if (wsConnected) return;
+    if (!session || (session.status !== 'running' && session.status !== 'published')) return;
     const poll = () => {
       void api
         .getTranscript(sessionId)
@@ -242,7 +278,7 @@ export function EditorPage({
     poll();
     const timer = setInterval(poll, 2000);
     return () => clearInterval(timer);
-  }, [sessionId, wsConnected]);
+  }, [sessionId, wsConnected, session?.status]);
 
   // Track mutating tools during an agent run and refresh preview + session metadata when the run completes
   useEffect(() => {
@@ -382,12 +418,17 @@ export function EditorPage({
 
   if (!session) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[#FAF9F7] text-sm text-stone-500">
-        Loading workspace…
+      <div className="flex h-screen flex-col items-center justify-center gap-3 bg-[#FAF9F7] text-sm text-stone-500">
+        <Loader2 className="h-5 w-5 animate-spin text-amber-600" />
+        <span>Loading workspace…</span>
       </div>
     );
   }
 
+  const isWorkspaceBooting =
+    session.status === 'starting' ||
+    session.status === 'sleeping' ||
+    session.status === 'error';
   const baseSuffix = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
   const previewSrc = `/p/${session.id}${baseSuffix}/`;
   const spendPct = Math.min(100, (spend.spentTodayUsd / Math.max(0.01, spend.dailyCapUsd + spend.extraGrantedUsd)) * 100);
@@ -529,7 +570,15 @@ export function EditorPage({
         </div>
       </header>
 
-      {/* Split Workspace */}
+      {/* Workspace Loading or Split Workspace */}
+      {isWorkspaceBooting ? (
+        <WorkspaceLoadingScreen
+          session={session}
+          bootProgress={bootProgress}
+          onRetry={handleRetryBoot}
+          onBack={onBack}
+        />
+      ) : (
       <div className="flex flex-1 min-h-0">
         {/* Left Chat Sidebar */}
         <aside
@@ -1067,6 +1116,7 @@ export function EditorPage({
           </div>
         </main>
       </div>
+      )}
 
       {showPublish && (
         <PublishModal

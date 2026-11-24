@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import type { BootProgressDto } from '@halley/shared';
 import type { SessionRecord } from '../db.js';
 
 const execFileAsync = promisify(execFile);
@@ -15,6 +16,22 @@ export interface WorkspaceEndpoint {
   baseSha: string;
 }
 
+export interface WarmReservation {
+  id: string;
+  volumeName: string;
+  rawToken: string;
+  adoptedWarming: boolean;
+}
+
+export interface WarmPoolStatus {
+  enabled: boolean;
+  target: number;
+  ready: number;
+  warming: number;
+}
+
+export type BootProgressListener = (sessionId: string, progress: BootProgressDto) => void;
+
 export interface WorkspaceDriver {
   ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint>;
   stop(session: SessionRecord): Promise<void>;
@@ -22,6 +39,12 @@ export interface WorkspaceDriver {
   duplicateWorkspace(source: SessionRecord, target: SessionRecord): Promise<void>;
   pushSessionBranch(session: SessionRecord, token: string): Promise<void>;
   fetchIntoSession(session: SessionRecord, token: string): Promise<void>;
+  setBootProgressListener?(listener: BootProgressListener): void;
+  getBootProgress?(sessionId: string): BootProgressDto | null;
+  startWarmPool?(): void;
+  stopWarmPool?(): Promise<void>;
+  reserveWarmWorkspace?(): WarmReservation | null;
+  getWarmPoolStatus?(): WarmPoolStatus;
 }
 
 /**

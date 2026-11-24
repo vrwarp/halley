@@ -58,6 +58,15 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     }
   };
 
+  driver.setBootProgressListener?.((sessionId, progress) => {
+    broadcastToSession(sessionId, { type: 'boot_progress', progress });
+  });
+
+  const enrichSessionDto = (s: import('./db.js').SessionRecord, user: UserDto) => ({
+    ...db.toSessionDto(s, user),
+    bootProgress: driver.getBootProgress?.(s.id) ?? null,
+  });
+
   const publishService = new PublishService(
     config,
     db,
@@ -188,7 +197,7 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
   // Sessions
   app.get('/api/sessions', auth.requireAuth, (c) => {
     const user = c.get('user');
-    const sessions = db.listSessions().map((s) => db.toSessionDto(s, user));
+    const sessions = db.listSessions().map((s) => enrichSessionDto(s, user));
     return c.json({ sessions, spend: db.getSpendStatus(user.id) });
   });
 
@@ -196,11 +205,13 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
     const user = c.get('user');
     const body = (await c.req.json()) as { title?: string };
     const title = (body.title || 'Website update').trim();
-    const id = crypto.randomUUID();
+    const warm = driver.reserveWarmWorkspace?.() ?? null;
+    const id = warm ? warm.id : crypto.randomUUID();
     const short = id.slice(0, 6);
     const slug = slugify(title);
     const workingBranch = `halley/${slug}-${short}`;
-    const rawToken = crypto.randomBytes(24).toString('hex');
+    const rawToken = warm ? warm.rawToken : crypto.randomBytes(24).toString('hex');
+    const volumeName = warm ? warm.volumeName : `halley-ws-${id}`;
 
     const session = db.createSession({
       id,
@@ -210,7 +221,7 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
       repo: config.repo,
       baseBranch: config.baseBranch,
       workingBranch,
-      volumeName: `halley-ws-${id}`,
+      volumeName,
       workspaceTokenHash: hashWorkspaceToken(rawToken),
     });
 
@@ -218,28 +229,34 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
       (driver as LocalWorkspaceDriver).setRawWorkspaceToken(id, rawToken);
     }
 
-    // Start booting workspace asynchronously so the UI opens immediately
+    // Start booting (or claiming warm standby) workspace asynchronously so the UI opens immediately
     void driver.ensureRunning(session).catch((err) => {
       db.updateSession(id, { status: 'error', publish_error: String(err) });
     });
 
-    return c.json({ session: db.toSessionDto(session, user) }, 201);
+    return c.json({ session: enrichSessionDto(session, user) }, 201);
   });
 
   app.get('/api/sessions/:id', auth.requireAuth, (c) => {
     const user = c.get('user');
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
-    return c.json({ session: db.toSessionDto(s, user), spend: db.getSpendStatus(user.id) });
+    return c.json({ session: enrichSessionDto(s, user), spend: db.getSpendStatus(user.id) });
   });
 
   app.post('/api/sessions/:id/wake', auth.requireAuth, async (c) => {
     const user = c.get('user');
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
-    await driver.ensureRunning(s);
+
+    if (s.status === 'sleeping' || s.status === 'error') {
+      db.updateSession(s.id, { status: 'starting', publish_error: null });
+    }
     const updated = db.getSession(s.id)!;
-    return c.json({ session: db.toSessionDto(updated, user) });
+    void driver.ensureRunning(updated).catch((err) => {
+      db.updateSession(s.id, { status: 'error', publish_error: String(err) });
+    });
+    return c.json({ session: enrichSessionDto(updated, user) });
   });
 
   app.post('/api/sessions/:id/duplicate', auth.requireAuth, async (c) => {
@@ -583,7 +600,7 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
         }
       }, 20_000);
 
-      // Push current spend & publish status immediately
+      // Push current spend, publish status, and boot progress immediately
       const spend = db.getSpendStatus(session.owner_user_id);
       browserWs.send(JSON.stringify({ type: 'spend_status', ...spend }));
       browserWs.send(
@@ -597,6 +614,10 @@ export function createControlPlane(config: HalleyConfig, customDriver?: Workspac
           },
         }),
       );
+      const currentBootProgress = driver.getBootProgress?.(sessionId);
+      if (currentBootProgress) {
+        browserWs.send(JSON.stringify({ type: 'boot_progress', progress: currentBootProgress }));
+      }
 
       let runnerWs: WebSocket | null = null;
       const pendingMessages: string[] = [];
@@ -686,9 +707,14 @@ if (isMain) {
     cp.handleWsUpgrade(req, socket, head, wss);
   });
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     stopReaper();
-    process.exit(0);
+    void Promise.resolve(cp.driver.stopWarmPool?.())
+      .catch(() => {})
+      .finally(() => process.exit(0));
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
@@ -703,4 +729,5 @@ if (isMain) {
       })
       .catch(() => {});
   }
+  cp.driver.startWarmPool?.();
 }
