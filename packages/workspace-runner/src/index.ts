@@ -215,6 +215,14 @@ async function main() {
         });
       }
     },
+    pauseAstroForBuild: async () => {
+      broadcast({ type: 'preview_paused', paused: true, reason: 'Running site checks…' });
+      await astroManager.pause();
+    },
+    resumeAstroAfterBuild: async () => {
+      await astroManager.resume();
+      broadcast({ type: 'preview_paused', paused: false });
+    },
     onTranscriptUpdate: (snapshot) => {
       latestTranscript = {
         type: 'transcript_state',

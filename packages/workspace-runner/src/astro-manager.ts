@@ -185,6 +185,7 @@ export default {
     server: {
       ...((baseConfig.vite && baseConfig.vite.server) || {}),
       allowedHosts: true,
+      hmr: false,
     },
   },
 };
