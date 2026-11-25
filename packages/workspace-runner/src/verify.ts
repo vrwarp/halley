@@ -55,7 +55,7 @@ async function runShell(
     ? existingNodeOpts
     : `${existingNodeOpts} --max-old-space-size=1024`.trim();
   return new Promise((resolve) => {
-    const child = spawn('bash', ['-lc', command], {
+    const child = spawn('nice', ['-n', '10', 'bash', '-lc', command], {
       cwd,
       env: {
         ...process.env,
@@ -354,10 +354,108 @@ export async function runUnlistedIntegrityCheck(
 
 let verifyQueue: Promise<unknown> = Promise.resolve();
 
+export interface BuildLockClientOptions {
+  supervisorUrl?: string;
+  hostSecret?: string;
+  sessionId?: string;
+  onQueued?: (position: number, message: string) => void;
+  onAcquired?: () => void;
+}
+
+/**
+ * Acquires the container-wide FIFO build lock from the workspaces supervisor when
+ * `supervisorUrl` is configured, streaming queue position updates via NDJSON.
+ * Falls back to in-process execution if running standalone without a supervisor.
+ */
+export async function withSupervisorBuildLock<T>(
+  opts: BuildLockClientOptions | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const supervisorUrl = opts?.supervisorUrl?.replace(/\/+$/, '');
+  if (!supervisorUrl) {
+    return fn();
+  }
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (opts?.hostSecret) {
+    headers['Authorization'] = `Bearer ${opts.hostSecret}`;
+  }
+
+  const res = await fetch(`${supervisorUrl}/internal/build-lock/acquire`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ sessionId: opts?.sessionId || 'unknown' }),
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`Failed to acquire build lock (${res.status}): ${text}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let leaseId = '';
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: true });
+        let nl = buffer.indexOf('\n');
+        while (nl !== -1) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (line) {
+            const evt = JSON.parse(line) as {
+              event: 'queued' | 'acquired' | 'timeout' | 'error';
+              position?: number;
+              leaseId?: string;
+              message?: string;
+            };
+            if (evt.event === 'queued' && typeof evt.position === 'number') {
+              const msg =
+                evt.message ||
+                `Waiting for another editor's checks to finish (position ${evt.position})…`;
+              opts?.onQueued?.(evt.position, msg);
+            } else if (evt.event === 'acquired' && evt.leaseId) {
+              leaseId = evt.leaseId;
+              opts?.onAcquired?.();
+              break;
+            } else if (evt.event === 'timeout' || evt.event === 'error') {
+              throw new Error(evt.message || 'Timed out waiting for build queue');
+            }
+          }
+          nl = buffer.indexOf('\n');
+        }
+        if (leaseId) break;
+      }
+      if (done) break;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!leaseId) {
+    throw new Error('Build lock stream closed before lock was acquired');
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await fetch(`${supervisorUrl}/internal/build-lock/release`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ leaseId }),
+    }).catch(() => {});
+  }
+}
+
 export function runAllVerificationChecks(
   repoRoot: string,
+  lockOpts?: BuildLockClientOptions,
 ): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
-  const run = () => runAllVerificationChecksUnlocked(repoRoot);
+  const run = () => withSupervisorBuildLock(lockOpts, () => runAllVerificationChecksUnlocked(repoRoot));
   const result = verifyQueue.then(run, run);
   verifyQueue = result.then(
     () => undefined,
@@ -380,55 +478,61 @@ async function runAllVerificationChecksUnlocked(
     halleyConfig = undefined;
   }
 
-  results.push(await runAstroHygieneGuard(repoRoot, originalBase, halleyConfig));
-  results.push(await runUnfinishedPagesCheck(repoRoot));
+  try {
+    results.push(await runAstroHygieneGuard(repoRoot, originalBase, halleyConfig));
+    results.push(await runUnfinishedPagesCheck(repoRoot));
 
-  let buildSucceeded = true;
+    let buildSucceeded = true;
 
-  if (halleyConfig?.checks && halleyConfig.checks.length > 0) {
-    for (const c of halleyConfig.checks) {
-      const res = await runShell(repoRoot, c.command);
-      results.push({ name: c.name, command: c.command, ...res });
-      if (!res.passed) buildSucceeded = false;
-    }
-  } else {
-    let scripts: Record<string, string> = {};
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(repoRoot, 'package.json'), 'utf8')) as {
-        scripts?: Record<string, string>;
-      };
-      scripts = pkg.scripts ?? {};
-    } catch {
-      scripts = {};
-    }
+    if (halleyConfig?.checks && halleyConfig.checks.length > 0) {
+      for (const c of halleyConfig.checks) {
+        const res = await runShell(repoRoot, c.command);
+        results.push({ name: c.name, command: c.command, ...res });
+        if (!res.passed) buildSucceeded = false;
+      }
+    } else {
+      let scripts: Record<string, string> = {};
+      try {
+        const pkg = JSON.parse(await fs.readFile(path.join(repoRoot, 'package.json'), 'utf8')) as {
+          scripts?: Record<string, string>;
+        };
+        scripts = pkg.scripts ?? {};
+      } catch {
+        scripts = {};
+      }
 
-    const ordered: Array<{ name: string; script: string }> = [];
-    if (scripts.check) ordered.push({ name: 'Type & Astro check', script: 'npm run check' });
-    if (scripts.build) ordered.push({ name: 'Production build', script: 'npm run build' });
-    for (const key of Object.keys(scripts).sort()) {
-      if (key.startsWith('verify:')) {
-        ordered.push({ name: `Verify (${key.slice('verify:'.length)})`, script: `npm run ${key}` });
+      const ordered: Array<{ name: string; script: string }> = [];
+      if (scripts.check) ordered.push({ name: 'Type & Astro check', script: 'npm run check' });
+      if (scripts.build) ordered.push({ name: 'Production build', script: 'npm run build' });
+      for (const key of Object.keys(scripts).sort()) {
+        if (key.startsWith('verify:')) {
+          ordered.push({ name: `Verify (${key.slice('verify:'.length)})`, script: `npm run ${key}` });
+        }
+      }
+
+      for (const item of ordered) {
+        const res = await runShell(repoRoot, item.script);
+        results.push({ name: item.name, command: item.script, ...res });
+        if (!res.passed && item.script === 'npm run build') {
+          buildSucceeded = false;
+          // Skip verify:* if build itself failed
+          break;
+        }
       }
     }
 
-    for (const item of ordered) {
-      const res = await runShell(repoRoot, item.script);
-      results.push({ name: item.name, command: item.script, ...res });
-      if (!res.passed && item.script === 'npm run build') {
-        buildSucceeded = false;
-        // Skip verify:* if build itself failed
-        break;
-      }
+    if (buildSucceeded) {
+      results.push(await runUnlistedIntegrityCheck(repoRoot, originalBase));
     }
-  }
 
-  if (buildSucceeded) {
-    results.push(await runUnlistedIntegrityCheck(repoRoot, originalBase));
+    return {
+      allPassed: results.every((r) => r.passed),
+      results,
+    };
+  } finally {
+    // Reclaim disk space on the shared /workspaces volume after checks complete
+    await fs.rm(path.join(repoRoot, 'dist'), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(path.join(repoRoot, '.astro'), { recursive: true, force: true }).catch(() => {});
   }
-
-  return {
-    allPassed: results.every((r) => r.passed),
-    results,
-  };
 }
 

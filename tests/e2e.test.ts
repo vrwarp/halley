@@ -645,7 +645,6 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
         HALLEY_ADMIN_EMAILS: 'admin@thecrossing.website',
         HALLEY_ALLOWED_DOMAINS: 'thecrossing.website',
         HALLEY_WEB_DIST: path.resolve('packages/web/dist'),
-        WORKSPACE_DRIVER: 'local',
         HALLEY_DEV_LOGIN: 'true',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -833,6 +832,8 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
 
       // 2. Switch to Edit mode -> Tap 1 selects paragraph without opening contentEditable
       await page.click('button:has-text("Edit")');
+      await frameLocator.locator('#__halley-edit-cursor').waitFor({ state: 'attached', timeout: 5_000 });
+      await page.waitForTimeout(150);
       const pEl = frameLocator.locator('p').first();
       await pEl.click();
 

@@ -24,14 +24,9 @@ pnpm test:e2e   # Self-contained Playwright + Astro E2E suite using local fakes 
 
 ## Docker Setup & Deployment
 
-Halley separates its runtime into two container images for security and resource efficiency:
-- **`halley-control-plane`** (`docker/control-plane.Dockerfile`): Always-on gateway holding your API keys (`ANTHROPIC_API_KEY`, GitHub credentials, Google OAuth), SQLite state (`/data`), spend-capped LLM proxy, shared warm Playwright Chromium screenshot service (with 1-hour idle auto-close), and preview/HMR proxy.
-- **`halley-workspace`** (`docker/workspace.Dockerfile`): Slim ephemeral per-session sandbox (Node 22 + `astro dev` + durable Pi agent + `sharp`, running as unprivileged `node`). Spawned on demand via `/var/run/docker.sock` and stopped automatically when idle.
-
-`control-plane` automatically:
-1. **Pulls `WORKSPACE_IMAGE`** from Docker Hub on the first session if it isn't cached locally yet.
-2. **Detects its own user-defined Docker bridge network** (`halley-net`) so sibling `halley-ws-*` containers can resolve each other by name without manual `WORKSPACE_DOCKER_NETWORK` tuning.
-3. **Syncs the git mirror via named Docker volumes** (zero host filesystem bind-mount path dependencies) and **self-heals** stale or outdated stopped session containers while preserving session volumes.
+Halley runs as a static **two-container** Compose stack with **no `/var/run/docker.sock` mount**:
+- **`control-plane`** (`vrwarp/halley-control-plane`, `docker/control-plane.Dockerfile`): Always-on gateway holding all external secrets (`ANTHROPIC_API_KEY`, GitHub credentials, Google OAuth), SQLite state (`/data`), bare git mirror served over internal HTTP, spend-capped LLM proxy, shared warm Playwright Chromium screenshot service (with 1-hour idle auto-close), and preview/HMR proxy.
+- **`workspaces`** (`vrwarp/halley-workspace`, `docker/workspace.Dockerfile`): Always-on unprivileged `node` host with **zero external API or GitHub secrets**, running a thin supervisor that manages all editing sessions as isolated subdirectories and child processes under `/workspaces` (pooled `6g` RAM ceiling, hardlinked lockfile-hashed `node_modules` cache with copy-on-change isolation, optional warm standby subprocess, soft 5-session LRU cap, and a container-wide FIFO build queue under `nice -n 10`).
 
 ### Option A: Prebuilt Docker Hub Images (Recommended for Production & NAS)
 
@@ -57,9 +52,9 @@ Halley separates its runtime into two container images for security and resource
 ### Option B: Synology NAS (Container Manager + Reverse Proxy)
 
 1. Create `/volume1/docker/halley` and place [`docker-compose.prod.yml`](docker-compose.prod.yml) (renamed to `docker-compose.yml`) and `.env` inside it.
-   - To expose Halley on a custom host port (e.g. `2243`), set `ports: ["2243:3000"]` (`HOST:CONTAINER`). Keep `CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000` at `3000`.
-   - Keep `DATA_DIR` unset (defaults to `/data` inside the container) and map `/volume1/docker/halley/data:/data`.
-   - Leave **"Execute container using high privilege"** OFF and legacy **Links** empty; keep the user-defined `halley-net` bridge network (Docker's built-in default `bridge` disables container DNS).
+   - To expose Halley on a custom host port (e.g. `2243`), set `ports: ["2243:3000"]` (`HOST:CONTAINER`) on `control-plane`. Keep `CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000` and `WORKSPACE_HOST_URL=http://workspaces:4000`.
+   - Map persistent storage: `/volume1/docker/halley/data:/data` on `control-plane` and `/volume1/docker/halley/workspaces:/workspaces` on `workspaces`.
+   - Leave **"Execute container using high privilege"** OFF and do **not** mount `/var/run/docker.sock`.
 2. In **Container Manager → Project → Create**, point to `/volume1/docker/halley` and start the project.
 3. Configure HTTPS + WebSockets in **DSM → Control Panel → Login Portal → Advanced → Reverse Proxy → Create**:
    - **Source:** `HTTPS`, Hostname `halley.yourdomain.com`, Port `443`
@@ -70,14 +65,13 @@ Halley separates its runtime into two container images for security and resource
 
 ```bash
 cp .env.example .env
-# When using a locally built workspace image, set WORKSPACE_IMAGE=halley-workspace:latest in .env
 pnpm docker:build
 docker compose up -d
 ```
 
-### Preflight Diagnostics & Troubleshooting
+### Preflight Diagnostics & Updating
 
-- **`GET /api/health/doctor`**: Inspects `/var/run/docker.sock` connectivity, verifies `control-plane` is on a DNS-capable user-defined bridge network, checks whether `/data` is backed by a persistent mount, and reports whether `WORKSPACE_IMAGE` is cached locally.
-- **Updating to a newer `WORKSPACE_IMAGE`:** Pull the updated image (`docker pull vrwarp/halley-workspace:latest`). Any stopped session containers on an older image ID are automatically recreated on next wake while keeping their `/halley-volume` git branch and Pi history intact.
+- **`GET /api/health/doctor`**: Verifies `control-plane` ↔ `workspaces` connectivity, auth, and protocol version handshake, reports warm standby & active session counts, FIFO build queue status, `/workspaces` disk usage (warns above 80%), and LLM/GitHub config.
+- **Updating images:** Both services share `${HALLEY_TAG:-latest}`. Always pull and recreate both `control-plane` and `workspaces` together (`docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d`). If only one image is updated across a protocol change, `/api/health/doctor` reports a clear version mismatch error.
 
 See [`docs/prd-tdd.md`](docs/prd-tdd.md) for the full architecture PRD & Technical Design Document.

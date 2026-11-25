@@ -165,6 +165,9 @@ export const VerificationCheckResultSchema = z.object({
 });
 export type VerificationCheckResult = z.infer<typeof VerificationCheckResultSchema>;
 
+/** Internal protocol version negotiated between control-plane and workspaces supervisor. */
+export const WORKSPACE_HOST_PROTOCOL_VERSION = 1;
+
 export const PublishProgressPayloadSchema = z.object({
   state: PublishStateSchema,
   prNumber: z.number().nullable().optional(),
@@ -174,6 +177,8 @@ export const PublishProgressPayloadSchema = z.object({
   checks: z.array(VerificationCheckResultSchema).optional(),
   conflictedFiles: z.array(z.string()).optional(),
   ciLogs: z.string().nullable().optional(),
+  queuePosition: z.number().nullable().optional(),
+  queueMessage: z.string().nullable().optional(),
 });
 export type PublishProgressPayload = z.infer<typeof PublishProgressPayloadSchema>;
 
@@ -422,6 +427,7 @@ export interface DebugTraceDto {
   usageByModel: Record<string, unknown>;
   live: LiveRunStateDto;
   entries: DebugTraceEntryDto[];
+  recentLogs?: string[];
 }
 export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff';
 

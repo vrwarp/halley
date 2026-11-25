@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Ensure Node 22 + pnpm are available and prepare directories for unprivileged node user
 RUN node -v \
  && npm install -g pnpm@10 \
- && mkdir -p /app /halley-volume /halley-pkg-cache \
- && chown node:node /app /halley-volume /halley-pkg-cache
+ && mkdir -p /app /workspaces \
+ && chown node:node /app /workspaces
 
 COPY docker/workspace-entrypoint.sh /usr/local/bin/halley-workspace-entrypoint.sh
 RUN chmod +x /usr/local/bin/halley-workspace-entrypoint.sh
@@ -37,9 +37,11 @@ RUN pnpm --filter @halley/shared build \
  && pnpm --filter @halley/astro-dev-edit build \
  && pnpm --filter @halley/workspace-runner build
 
-EXPOSE 4100 4321
+ENV WORKSPACES_DIR=/workspaces
+ENV SUPERVISOR_PORT=4000
+EXPOSE 4000
 
-# Start entrypoint as root solely to self-heal volume ownership (e.g. volumes migrated from older UIDs),
+# Start entrypoint as root solely to self-heal /workspaces volume ownership (e.g. NAS bind mounts),
 # then immediately drop privileges to unprivileged `node` via gosu.
 USER root
 ENTRYPOINT ["/usr/local/bin/halley-workspace-entrypoint.sh"]

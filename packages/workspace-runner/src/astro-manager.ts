@@ -65,6 +65,7 @@ export type AstroDevState = 'starting' | 'ready' | 'paused' | 'crashed';
 
 export interface AstroDevManagerOptions {
   repoRoot: string;
+  stateDir?: string;
   sessionId: string;
   astroPort: number;
   runnerPort: number;
@@ -143,6 +144,15 @@ export class AstroDevManager {
       `halley-astro-${this.opts.sessionId}.config.mjs`,
     );
 
+    const astroCacheDir = this.opts.stateDir
+      ? path.join(this.opts.stateDir, 'astro-cache')
+      : path.join(os.tmpdir(), `halley-astro-cache-${this.opts.sessionId}`);
+    const viteCacheDir = this.opts.stateDir
+      ? path.join(this.opts.stateDir, 'vite-cache')
+      : path.join(os.tmpdir(), `halley-vite-cache-${this.opts.sessionId}`);
+    await fs.mkdir(astroCacheDir, { recursive: true });
+    await fs.mkdir(viteCacheDir, { recursive: true });
+
     const configContent = `
 import userConfig from ${JSON.stringify(userConfigPath)};
 import { halleyDevEdit } from ${JSON.stringify(devEditEntry)};
@@ -153,6 +163,7 @@ const existingIntegrations = Array.isArray(baseConfig.integrations) ? baseConfig
 export default {
   ...baseConfig,
   base: ${JSON.stringify(this.previewBase)},
+  cacheDir: ${JSON.stringify(astroCacheDir)},
   integrations: [
     ...existingIntegrations,
     halleyDevEdit({
@@ -170,6 +181,7 @@ export default {
   },
   vite: {
     ...(baseConfig.vite || {}),
+    cacheDir: ${JSON.stringify(viteCacheDir)},
     server: {
       ...((baseConfig.vite && baseConfig.vite.server) || {}),
       allowedHosts: true,

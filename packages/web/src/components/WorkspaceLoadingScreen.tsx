@@ -22,14 +22,9 @@ const COLD_STEPS: StepDef[] = [
     stages: ['queued', 'syncing_repo'],
   },
   {
-    id: 'container',
-    label: 'Prepare isolated workspace container',
-    stages: ['checking_image', 'pulling_image', 'creating_container', 'starting_container'],
-  },
-  {
     id: 'deps',
-    label: 'Clone files & install packages',
-    stages: ['cloning_repo', 'installing_deps'],
+    label: 'Prepare workspace files & packages',
+    stages: ['checking_image', 'pulling_image', 'creating_container', 'starting_container', 'cloning_repo', 'installing_deps'],
   },
   {
     id: 'preview',
@@ -41,7 +36,7 @@ const COLD_STEPS: StepDef[] = [
 const WARM_STEPS: StepDef[] = [
   {
     id: 'reserve',
-    label: 'Reserve pre-warmed container',
+    label: 'Reserve pre-warmed workspace',
     stages: ['queued'],
   },
   {

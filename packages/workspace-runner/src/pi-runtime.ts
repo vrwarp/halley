@@ -47,7 +47,9 @@ import {
   type TranscriptEntryDto,
 } from '@halley/shared';
 import sharp from 'sharp';
+import { checkSharedContainerBashCommand, isDependencyMutationCommand } from './bash-guard.js';
 import { sanitizeProtectedPaths } from './checkpoints-and-git.js';
+import { detachHardlinkedNodeModules } from './nm-cache.js';
 import type { PageCreationService } from './pages.js';
 import { formatCompactCheckSummary, runAllVerificationChecks } from './verify.js';
 import type { UploadManager } from './uploads.js';
@@ -60,6 +62,8 @@ export interface PiRuntimeOptions {
   astroPort: number;
   controlPlaneInternalUrl: string;
   workspaceToken: string;
+  supervisorUrl?: string;
+  hostSecret?: string;
   modelId: string;
   thinkingLevel: 'off' | 'low' | 'medium' | 'high';
   getPersona?: () => 'non-technical' | 'developer';
@@ -530,12 +534,34 @@ export class HalleyPiRuntime {
       parameters: obj({}),
       execute: async () => {
         await waitForPendingMutations(0);
-        const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot);
-        const summary = formatCompactCheckSummary(results);
-        return {
-          output: [{ type: 'text', text: summary }],
-          isError: !allPassed,
-        };
+        const queueNotes: string[] = [];
+        try {
+          const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot, {
+            supervisorUrl: opts.supervisorUrl,
+            hostSecret: opts.hostSecret,
+            sessionId: opts.sessionId,
+            onQueued: (_pos, msg) => {
+              queueNotes.push(msg);
+              console.log(`[halley-pi] ${msg}`);
+            },
+          });
+          const summary = formatCompactCheckSummary(results);
+          const prefix = queueNotes.length > 0 ? `${queueNotes[0]}\n` : '';
+          return {
+            output: [{ type: 'text', text: `${prefix}${summary}` }],
+            isError: !allPassed,
+          };
+        } catch (err) {
+          return {
+            output: [
+              {
+                type: 'text',
+                text: err instanceof Error ? err.message : 'Verification checks failed',
+              },
+            ],
+            isError: true,
+          };
+        }
       },
     });
 
@@ -627,9 +653,13 @@ export class HalleyPiRuntime {
         api: Parameters<typeof base.execute>[1],
         ctx: Parameters<typeof base.execute>[2],
       ) => {
+        const cmd = String((args as Record<string, unknown>).command ?? '');
         opts.onLockChange(true, 'shell');
         try {
           return await trackMutation(async () => {
+            if (cmd && isDependencyMutationCommand(cmd)) {
+              await detachHardlinkedNodeModules(opts.repoRoot, opts.stateDir).catch(() => {});
+            }
             const res = await base.execute(args as never, api, ctx);
             await sanitizeProtectedPaths(opts.repoRoot).catch(() => {});
             return res;
@@ -658,7 +688,14 @@ export class HalleyPiRuntime {
       hooks: [
         hook(ToolTask, {
           beforeTool: (call) => {
-            if (call.name === 'edit' || call.name === 'write') {
+            if (call.name === 'bash') {
+              const args = call.arguments as Record<string, unknown>;
+              const cmd = String(args.command ?? '');
+              const check = checkSharedContainerBashCommand(cmd, opts.repoRoot);
+              if (!check.allowed) {
+                return { block: check.reason };
+              }
+            } else if (call.name === 'edit' || call.name === 'write') {
               const args = call.arguments as Record<string, unknown>;
               const p = String(args.path ?? args.file_path ?? '');
               if (p && isProtectedPath(opts.repoRoot, p)) {
@@ -765,6 +802,7 @@ export class HalleyPiRuntime {
       ...editorCtxLines,
       'Whenever you mention a page on the site or the user asks for a link to a page (including pages you just created or edited), ALWAYS format it as an internal markdown link using the page\'s route, like `[Our Staff](/im-new/our-staff)` or `[Events](/events)`. NEVER give a full live-site URL (like `https://...github.io/...`) — the editor automatically turns internal `[Page Name](/route)` links into clickable buttons that open the page directly in the live preview pane.',
       'Prefer `read`, `edit`, and `write` for inspecting and editing individual files; use `bash` (`rg`, `jq`, `python3`, `node`) for multi-file searches or bulk structured data updates.',
+      'Shared server rule: this session shares a workspace container with other live editor sessions. Stay strictly inside your current working directory (`cwd`), never traverse parent directories (`..`), never run process-killing commands (`kill`, `pkill`, `killall`, `fuser`) or launch dev servers (`astro dev` is managed automatically by Halley), and always use `run_checks` instead of running `astro build` / `npm run build` / `npm run check` via `bash`.',
       'Never attempt to modify files under `.github/`. They are protected and read-only.',
       `When the user asks in chat to create a brand-new page, ALWAYS call the \`create_page\` tool first to scaffold and validate the page, then edit the generated file to replace the \`${HALLEY_PLACEHOLDER_ATTR}\` section with complete content. Never leave \`${HALLEY_PLACEHOLDER_ATTR}\` in a finished page.`,
       'When creating an unlisted, hidden, or placeholder ("coming soon") page without real visitor content yet, keep `indexable={false}` (or `<meta name="robots" content="noindex" />`), do NOT link it in navigation menus or footer, and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used. Once real visitor content is added, offer or switch it to indexable.',

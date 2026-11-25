@@ -38,6 +38,7 @@ import {
   type ConflictEvidencePack,
 } from './conflict-protocol.js';
 import { PageCreationService, PageValidationError } from './pages.js';
+import { detachHardlinkedNodeModules } from './nm-cache.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import { runAllVerificationChecks } from './verify.js';
@@ -54,10 +55,13 @@ const RUNNER_PORT = Number(process.env.RUNNER_PORT || 4100);
 const ASTRO_PORT = Number(process.env.ASTRO_PORT || 4321);
 const CONTROL_PLANE_INTERNAL_URL =
   process.env.CONTROL_PLANE_INTERNAL_URL || 'http://127.0.0.1:3000';
+const SUPERVISOR_URL = process.env.HALLEY_SUPERVISOR_URL || '';
+const WORKSPACE_HOST_SECRET = process.env.WORKSPACE_HOST_SECRET || '';
 const WORKSPACE_TOKEN = process.env.WORKSPACE_TOKEN || 'dev-token';
-// Scrub WORKSPACE_TOKEN from process.env immediately so child processes
-// (astro dev SSR code, agent bash commands, verification scripts) never inherit it.
+// Scrub WORKSPACE_TOKEN and WORKSPACE_HOST_SECRET from process.env immediately so child processes
+// (astro dev SSR code, agent bash commands, verification scripts) never inherit them.
 delete process.env.WORKSPACE_TOKEN;
+delete process.env.WORKSPACE_HOST_SECRET;
 const MODEL_ID = process.env.HALLEY_MODEL_ID || 'haiku-latest';
 const THINKING_LEVEL = (process.env.HALLEY_THINKING_LEVEL || 'high') as
   | 'off'
@@ -151,6 +155,7 @@ function scheduleInlineCheckpoint(summary: string): void {
 
 const astroManager = new AstroDevManager({
   repoRoot: REPO_ROOT,
+  stateDir: STATE_DIR,
   sessionId: SESSION_ID,
   astroPort: ASTRO_PORT,
   runnerPort: RUNNER_PORT,
@@ -188,6 +193,8 @@ async function main() {
     astroPort: ASTRO_PORT,
     controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
     workspaceToken: WORKSPACE_TOKEN,
+    supervisorUrl: SUPERVISOR_URL || undefined,
+    hostSecret: WORKSPACE_HOST_SECRET || undefined,
     modelId: MODEL_ID,
     thinkingLevel: THINKING_LEVEL,
     getPersona: () => persona,
@@ -231,6 +238,7 @@ async function main() {
       astroCrashCount: astro.crashCount,
       astroLastExitCode: astro.lastExitCode,
       astroPort: astro.port,
+      piBusy: piRuntime?.isBusy() ?? false,
       originalBase,
       previewBase,
       readOnly,
@@ -295,16 +303,18 @@ async function main() {
 
         const changedLocks = lockDiff.stdout.trim();
         if (changedLocks) {
+          await detachHardlinkedNodeModules(REPO_ROOT, STATE_DIR).catch(() => {});
+          const pkgCache = process.env.HALLEY_PKG_CACHE_DIR || '/workspaces/pkg-cache';
           if (changedLocks.includes('package-lock.json')) {
             await execFileAsync(
               'npm',
-              ['ci', '--cache', '/halley-pkg-cache/npm', '--prefer-offline', '--ignore-scripts'],
+              ['ci', '--cache', path.join(pkgCache, 'npm'), '--prefer-offline', '--ignore-scripts'],
               { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024 },
             );
           } else if (changedLocks.includes('pnpm-lock.yaml')) {
             await execFileAsync(
               'pnpm',
-              ['install', '--store-dir', '/halley-pkg-cache/pnpm', '--frozen-lockfile'],
+              ['install', '--store-dir', path.join(pkgCache, 'pnpm'), '--frozen-lockfile'],
               { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024 },
             );
           }
@@ -1141,8 +1151,48 @@ async function main() {
       await astroManager.pause();
     }
     try {
-      const result = await runAllVerificationChecks(REPO_ROOT);
+      const result = await runAllVerificationChecks(REPO_ROOT, {
+        supervisorUrl: SUPERVISOR_URL || undefined,
+        hostSecret: WORKSPACE_HOST_SECRET || undefined,
+        sessionId: SESSION_ID,
+        onQueued: (position, message) => {
+          broadcast({
+            type: 'publish_state',
+            payload: {
+              state: 'verifying',
+              queuePosition: position,
+              queueMessage: message,
+            },
+          });
+        },
+        onAcquired: () => {
+          broadcast({
+            type: 'publish_state',
+            payload: {
+              state: 'verifying',
+              queuePosition: null,
+              queueMessage: null,
+            },
+          });
+        },
+      });
       return c.json(result);
+    } catch (err) {
+      return c.json(
+        {
+          allPassed: false,
+          results: [
+            {
+              name: 'Build queue',
+              command: 'halley-build-queue',
+              passed: false,
+              durationMs: 0,
+              output: err instanceof Error ? err.message : 'Verification failed',
+            },
+          ],
+        },
+        200,
+      );
     } finally {
       if (shouldPause) {
         try {

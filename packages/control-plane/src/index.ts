@@ -11,9 +11,9 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from './auth/google.js';
 import { loadConfig, type HalleyConfig } from './config.js';
 import { ControlPlaneDb } from './db.js';
-import { DockerWorkspaceDriver } from './drivers/docker-driver.js';
-import { LocalWorkspaceDriver } from './drivers/local-driver.js';
 import { WorkspaceCrashLoopError, type WorkspaceDriver } from './drivers/workspace-driver.js';
+import { WorkspaceHostDriver } from './drivers/workspace-host-driver.js';
+import { createInternalGitHttpHandler } from './git-http.js';
 import { GitHubService } from './github/client.js';
 import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
 import { createPreviewProxy } from './proxy/preview-proxy.js';
@@ -46,11 +46,8 @@ export function createControlPlane(
   const auth = new AuthService(config, db);
   const github = new GitHubService(config);
 
-  const driver: WorkspaceDriver =
-    customDriver ??
-    (config.workspaceDriver === 'local'
-      ? new LocalWorkspaceDriver(config, db, github)
-      : new DockerWorkspaceDriver(config, db, github));
+  const hostDriver = customDriver ? null : new WorkspaceHostDriver(config, db, github);
+  const driver: WorkspaceDriver = customDriver ?? hostDriver!;
 
   const browserWsBySession = new Map<string, Set<WebSocket>>();
 
@@ -96,17 +93,26 @@ export function createControlPlane(
   );
 
   app.get('/api/health/doctor', async (c) => {
-    if ('runDoctorChecks' in driver && typeof driver.runDoctorChecks === 'function') {
-      const report = await (driver as DockerWorkspaceDriver).runDoctorChecks();
+    if (driver.runDoctorChecks) {
+      const report = await driver.runDoctorChecks();
       return c.json(report, report.ok ? 200 : 503);
     }
     return c.json({
       ok: true,
       warnings: [],
       errors: [],
-      details: { workspaceDriver: config.workspaceDriver, dataDir: config.dataDir },
+      details: { workspaceHostUrl: config.workspaceHostUrl || '(local)', dataDir: config.dataDir },
     });
   });
+
+  // Internal Git Smart-HTTP mirror (keeps GitHub credentials strictly inside control-plane)
+  const internalGitHandler = createInternalGitHttpHandler(config, db, async () => {
+    if (hostDriver) {
+      await hostDriver.ensureControlPlaneMirror();
+    }
+  });
+  app.all('/internal/git/repo.git/*', internalGitHandler);
+  app.all('/internal/git/repo.git', internalGitHandler);
 
   // LLM Proxy (authenticated via WORKSPACE_TOKEN, no user cookie)
   app.all(
@@ -291,7 +297,7 @@ export function createControlPlane(
     const user = c.get('user');
     const body = (await c.req.json()) as { title?: string };
     const title = (body.title || 'Website update').trim();
-    const warm = driver.reserveWarmWorkspace?.() ?? null;
+    const warm = (await driver.reserveWarmWorkspace?.()) ?? null;
     const id = warm ? warm.id : crypto.randomUUID();
     const short = id.slice(0, 6);
     const slug = slugify(title);
@@ -1256,14 +1262,21 @@ export function createControlPlane(
   app.get('/api/sessions/:id/debug-trace', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
+    const recentLogs = (await driver.getSessionLogs?.(s.id).catch(() => [])) ?? [];
     try {
       const ep = await driver.ensureRunning(s);
       const res = await fetch(`${ep.runnerUrl}/internal/debug/trace`);
-      const data = await res.json().catch(() => ({ error: 'Invalid debug trace response' }));
-      return c.json(data, res.ok ? 200 : 502);
+      const data = (await res.json().catch(() => ({ error: 'Invalid debug trace response' }))) as Record<
+        string,
+        unknown
+      >;
+      return c.json({ ...data, recentLogs }, res.ok ? 200 : 502);
     } catch (err) {
       return c.json(
-        { error: err instanceof Error ? err.message : 'Workspace is not running' },
+        {
+          error: err instanceof Error ? err.message : 'Workspace is not running',
+          recentLogs,
+        },
         503,
       );
     }
@@ -1561,6 +1574,7 @@ if (isMain) {
     stopReaper();
     void Promise.allSettled([
       Promise.resolve(cp.driver.stopWarmPool?.()),
+      Promise.resolve(cp.driver.close?.()),
       cp.screenshotService.close(),
     ]).finally(() => process.exit(0));
   };
@@ -1568,8 +1582,8 @@ if (isMain) {
   process.on('SIGTERM', shutdown);
 
   console.log(`[halley-control-plane] listening on http://0.0.0.0:${config.port} (repo=${config.repo})`);
-  if ('runDoctorChecks' in cp.driver && typeof cp.driver.runDoctorChecks === 'function') {
-    void (cp.driver as DockerWorkspaceDriver)
+  if (cp.driver.runDoctorChecks) {
+    void cp.driver
       .runDoctorChecks()
       .then((report) => {
         for (const w of report.warnings) console.warn(`[halley-doctor] WARN: ${w}`);

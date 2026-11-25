@@ -330,7 +330,11 @@ export function PublishModal({
                     ) : (
                       <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
                     )}
-                    <span>{activeStepDef?.shortLabel ?? 'Publishing…'}</span>
+                    <span>
+                      {state === 'verifying' && publishProgress?.queueMessage
+                        ? publishProgress.queueMessage
+                        : (activeStepDef?.shortLabel ?? 'Publishing…')}
+                    </span>
                   </div>
                   {!isPublished && (
                     <span className="font-mono text-xs text-stone-400">
@@ -361,17 +365,24 @@ export function PublishModal({
                   const done = isPublished || idx < activeStepIdx;
                   const active = !isPublished && idx === activeStepIdx;
                   return (
-                    <div key={step.key} className="flex items-center gap-3 text-sm">
-                      {done ? (
-                        <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                      ) : active ? (
-                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
-                      ) : (
-                        <div className="h-4 w-4 shrink-0 rounded-full border border-stone-300 bg-white" />
-                      )}
-                      <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
-                        {step.label}
-                      </span>
+                    <div key={step.key} className="flex items-start gap-3 text-sm">
+                      <div className="mt-0.5 shrink-0">
+                        {done ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        ) : active ? (
+                          <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                        ) : (
+                          <div className="h-4 w-4 rounded-full border border-stone-300 bg-white" />
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
+                          {step.label}
+                        </span>
+                        {active && step.key === 'verifying' && publishProgress?.queueMessage && (
+                          <p className="mt-0.5 text-xs text-amber-800">{publishProgress.queueMessage}</p>
+                        )}
+                      </div>
                     </div>
                   );
                 })}

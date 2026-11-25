@@ -126,6 +126,15 @@ export function formatDebugTraceAsMarkdown(trace: DebugTraceDto, sessionTitle: s
     lines.push('');
   }
 
+  if (trace.recentLogs && trace.recentLogs.length > 0) {
+    lines.push(`## Recent Workspace Logs (${trace.recentLogs.length} lines)`);
+    lines.push('');
+    lines.push('```text');
+    lines.push(trace.recentLogs.join('\n'));
+    lines.push('```');
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 

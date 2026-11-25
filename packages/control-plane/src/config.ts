@@ -31,10 +31,9 @@ export interface HalleyConfig {
   escalationThinkingLevel: 'off' | 'low' | 'medium' | 'high';
   escalationMaxUsd: number;
   dailyCostCapUsd: number;
-  workspaceDriver: 'docker' | 'local';
-  workspaceImage: string;
-  workspaceDockerNetwork: string;
-  workspaceMemoryMb: number;
+  workspaceHostUrl: string;
+  workspaceHostSecret: string;
+  maxActiveWorkspaces: number;
   controlPlaneInternalUrl: string;
   workspaceIdleTimeoutMs: number;
   browserIdleTimeoutMs: number;
@@ -55,13 +54,12 @@ function splitCsv(val: string | undefined): string[] {
 
 export function loadConfig(): HalleyConfig {
   const port = Number(process.env.PORT || 3000);
-  const workspaceDriver: 'docker' | 'local' =
-    process.env.WORKSPACE_DRIVER === 'local' ? 'local' : 'docker';
+  const workspaceHostUrl = (process.env.WORKSPACE_HOST_URL || '').trim().replace(/\/+$/, '');
   const warmPoolRaw = process.env.HALLEY_WARM_POOL_SIZE;
   const warmPoolSize =
     warmPoolRaw !== undefined && warmPoolRaw !== ''
       ? Math.max(0, Math.min(3, Number(warmPoolRaw) || 0))
-      : workspaceDriver === 'docker'
+      : workspaceHostUrl
         ? 1
         : 0;
   return {
@@ -98,10 +96,9 @@ export function loadConfig(): HalleyConfig {
       | 'high',
     escalationMaxUsd: Number(process.env.HALLEY_ESCALATION_MAX_USD || 2),
     dailyCostCapUsd: Number(process.env.HALLEY_DAILY_COST_CAP_USD || 10),
-    workspaceDriver,
-    workspaceImage: process.env.WORKSPACE_IMAGE || 'vrwarp/halley-workspace:latest',
-    workspaceDockerNetwork: process.env.WORKSPACE_DOCKER_NETWORK || '',
-    workspaceMemoryMb: Math.max(512, Number(process.env.WORKSPACE_MEMORY_MB || 3072) || 3072),
+    workspaceHostUrl,
+    workspaceHostSecret: (process.env.WORKSPACE_HOST_SECRET || '').trim(),
+    maxActiveWorkspaces: Math.max(1, Number(process.env.MAX_ACTIVE_WORKSPACES || 5) || 5),
     controlPlaneInternalUrl:
       process.env.CONTROL_PLANE_INTERNAL_URL || `http://127.0.0.1:${port}`,
     workspaceIdleTimeoutMs: Number(process.env.WORKSPACE_IDLE_TIMEOUT_MS || 20 * 60_000),

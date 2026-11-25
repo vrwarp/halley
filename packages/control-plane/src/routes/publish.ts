@@ -48,12 +48,12 @@ export class PublishService {
         body: JSON.stringify({ summary: 'Ready to publish' }),
       }).catch(() => {});
 
-      // 1. Hard-gate verification checks (pause Astro dev server to free memory during production build)
+      // 1. Hard-gate verification checks (keep Astro dev preview running under pooled 6 GB ceiling + max-1 build queue)
       this.setState(session.id, 'verifying');
       const verifyRes = await fetch(`${runnerUrl}/internal/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pausePreview: true }),
+        body: JSON.stringify({ pausePreview: false }),
       });
       const verifyData = (await verifyRes.json()) as {
         allPassed: boolean;
@@ -146,7 +146,7 @@ export class PublishService {
         const reVerify = await fetch(`${runnerUrl}/internal/verify`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pausePreview: true }),
+          body: JSON.stringify({ pausePreview: false }),
         });
         const reData = (await reVerify.json()) as {
           allPassed: boolean;
