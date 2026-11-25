@@ -535,68 +535,81 @@ function BeforeAfterWipe({
             setSplitPct(100);
           }
         }}
-        className="relative select-none overflow-hidden rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
+        className="relative select-none rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
       >
-        {/* Base layer: Draft screenshot + dual-color diff highlights */}
-        <img
-          src={draftUrl}
-          alt={`Draft ${route}`}
-          draggable={false}
-          className="block w-full pointer-events-none"
-        />
-        {highlights.map((h, idx) => (
-          <div
-            key={idx}
-            title={h.warning || h.file}
-            style={{
-              left: `${h.x}%`,
-              top: `${h.y}%`,
-              width: `${h.width}%`,
-              height: `${h.height}%`,
-            }}
-            className={`pointer-events-none absolute rounded border-2 ${
-              h.kind === 'merged_from_live'
-                ? 'border-teal-500 bg-teal-500/15'
-                : 'border-amber-500 bg-amber-500/15'
-            }`}
-          />
-        ))}
-
-        {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
-        >
+        {/* Inner clipped frame for images, highlights, and vertical divider line */}
+        <div className="relative overflow-hidden rounded-[7px]">
+          {/* Base layer: Draft screenshot + dual-color diff highlights */}
           <img
-            src={liveUrl}
-            alt={`Live ${route}`}
+            src={draftUrl}
+            alt={`Draft ${route}`}
             draggable={false}
-            className="block w-full"
+            className="block w-full pointer-events-none"
+          />
+          {highlights.map((h, idx) => (
+            <div
+              key={idx}
+              title={h.warning || h.file}
+              style={{
+                left: `${h.x}%`,
+                top: `${h.y}%`,
+                width: `${h.width}%`,
+                height: `${h.height}%`,
+              }}
+              className={`pointer-events-none absolute rounded border-2 ${
+                h.kind === 'merged_from_live'
+                  ? 'border-teal-500 bg-teal-500/15'
+                  : 'border-amber-500 bg-amber-500/15'
+              }`}
+            />
+          ))}
+
+          {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
+          <div
+            className="pointer-events-none absolute inset-0"
+            style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
+          >
+            <img
+              src={liveUrl}
+              alt={`Live ${route}`}
+              draggable={false}
+              className="block w-full"
+            />
+          </div>
+
+          {/* Vertical wipe divider line */}
+          <div
+            className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.35),0_2px_8px_rgba(0,0,0,0.4)]"
+            style={{ left: `${splitPct}%` }}
           />
         </div>
 
-        {/* Corner labels */}
-        <span
-          className={`pointer-events-none absolute left-2 top-2 rounded-full bg-stone-900/75 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm transition-opacity ${
-            splitPct < 14 ? 'opacity-0' : 'opacity-100'
-          }`}
-        >
-          Live
-        </span>
-        <span
-          className={`pointer-events-none absolute right-2 top-2 rounded-full bg-amber-600/90 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm transition-opacity ${
-            splitPct > 86 ? 'opacity-0' : 'opacity-100'
-          }`}
-        >
-          Draft
-        </span>
+        {/* Sticky Live / Draft chips (stay visible while scrolling long screenshots) */}
+        <div className="pointer-events-none absolute inset-0 z-10 py-2">
+          <div className="sticky top-2 flex items-center justify-between px-2">
+            <span
+              className={`rounded-full bg-stone-900/80 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
+                splitPct < 14 ? 'opacity-0' : 'opacity-100'
+              }`}
+            >
+              Live
+            </span>
+            <span
+              className={`rounded-full bg-amber-600/90 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
+                splitPct > 86 ? 'opacity-0' : 'opacity-100'
+              }`}
+            >
+              Draft
+            </span>
+          </div>
+        </div>
 
-        {/* Wipe divider line & handle */}
+        {/* Sticky wipe drag handle (stays vertically reachable while scrolling long screenshots) */}
         <div
-          className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.35),0_2px_8px_rgba(0,0,0,0.4)]"
+          className="pointer-events-none absolute inset-y-0 z-10 -translate-x-1/2 py-12"
           style={{ left: `${splitPct}%` }}
         >
-          <div className="absolute left-1/2 top-1/2 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-stone-300 bg-white text-stone-800 shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
+          <div className="sticky top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-full border border-stone-300 bg-white text-stone-800 shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
             <ChevronsLeftRight className="h-4 w-4" />
           </div>
         </div>
