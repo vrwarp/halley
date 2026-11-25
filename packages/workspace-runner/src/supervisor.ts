@@ -373,6 +373,14 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     };
     activeSessions.set(params.sessionId, managed);
 
+    let spawnError: Error | null = null;
+    child.on('error', (err) => {
+      spawnError = err;
+      if (activeSessions.get(params.sessionId)?.proc === child) {
+        activeSessions.delete(params.sessionId);
+      }
+      buildQueue.releaseBySession(params.sessionId);
+    });
     child.stdout?.on('data', (d: Buffer) => appendLog(params.sessionId, d, false));
     child.stderr?.on('data', (d: Buffer) => appendLog(params.sessionId, d, true));
     child.on('exit', () => {
@@ -385,6 +393,9 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     // Poll until astroReady
     const deadline = Date.now() + 90_000;
     while (Date.now() < deadline) {
+      if (spawnError !== null) {
+        throw new Error(`Failed to spawn workspace process: ${(spawnError as Error).message}`);
+      }
       if (child.exitCode !== null) {
         const tail = (logsBySession.get(params.sessionId) ?? []).slice(-15).join('\n');
         throw new Error(
@@ -1063,10 +1074,21 @@ if (isMain) {
     `[halley-supervisor] listening on http://${bindHost}:${port} (protocol=v${WORKSPACE_HOST_PROTOCOL_VERSION}, dir=${workspacesDir}, maxActive=${maxActiveWorkspaces}, warmPool=${warmPoolSize})`,
   );
 
-  // Start warm standby pool shortly after listening
-  setTimeout(() => {
+  // Wait until control-plane /api/health is reachable before starting the warm standby pool
+  void (async () => {
+    const cpHealthUrl = `${controlPlaneInternalUrl.replace(/\/+$/, '')}/api/health`;
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(cpHealthUrl, { signal: AbortSignal.timeout(2000) });
+        if (res.ok) break;
+      } catch {
+        // control-plane still starting
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
     supervisor.startWarmPool();
-  }, 500).unref?.();
+  })();
 
   const shutdown = () => {
     void supervisor.stopAll().finally(() => {
