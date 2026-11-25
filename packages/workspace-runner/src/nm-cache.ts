@@ -108,6 +108,33 @@ export async function detachHardlinkedNodeModules(
   return true;
 }
 
+async function isNodeModulesHealthy(nmPath: string, workspaceDir: string): Promise<boolean> {
+  if (!(await fileExists(nmPath))) return false;
+  try {
+    const pkg = JSON.parse(await fs.readFile(path.join(workspaceDir, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const deps = Object.keys(pkg.dependencies ?? {});
+    const devDeps = Object.keys(pkg.devDependencies ?? {});
+    const required = deps.includes('astro')
+      ? ['astro']
+      : deps.length > 0
+        ? [deps[0]!]
+        : devDeps.length > 0
+          ? [devDeps[0]!]
+          : [];
+    for (const dep of required) {
+      if (!(await fileExists(path.join(nmPath, dep, 'package.json')))) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return fileExists(nmPath);
+  }
+}
+
 export class NodeModulesCacheManager {
   private inflight = new Map<string, Promise<string>>();
 
@@ -118,9 +145,10 @@ export class NodeModulesCacheManager {
   ) {}
 
   /**
-   * Ensures a session workspace has an up-to-date `node_modules`.
+   * Ensures a session workspace has an up-to-date, healthy `node_modules`.
    * - If `devLocalRepo` has pre-installed `node_modules`, symlinks it (fast local/E2E path).
-   * - If `node_modules` is missing, populates via hardlinked copy (`cp -al`) from lockfile-hashed cache.
+   * - If `node_modules` is missing or incomplete/corrupt, populates atomically via hardlinked
+   *   copy (`cp -al` into a staging dir then rename) from the lockfile-hashed cache.
    * - If `node_modules` exists in `hardlinked` mode and the lockfile hash changed (copy-on-change),
    *   detaches and runs a fresh isolated install in the session workspace.
    */
@@ -136,9 +164,10 @@ export class NodeModulesCacheManager {
     if (!hash) return;
 
     const hasNm = await fileExists(nmPath);
+    const healthy = hasNm && (await isNodeModulesHealthy(nmPath, workspaceDir));
     const meta = await readNodeModulesMeta(stateDir);
 
-    if (hasNm) {
+    if (healthy) {
       if (!meta || meta.hash === hash) {
         return;
       }
@@ -148,6 +177,11 @@ export class NodeModulesCacheManager {
       await runPackageInstall(workspaceDir, this.pkgCacheDir);
       await writeNodeModulesMeta(stateDir, { mode: 'detached', hash });
       return;
+    }
+
+    if (hasNm && !healthy) {
+      // Self-heal partial/empty node_modules left behind by an interrupted install or copy
+      await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
     }
 
     // Fast path for local dev / E2E tests with a local fixture repo
@@ -162,11 +196,17 @@ export class NodeModulesCacheManager {
 
     onInstalling?.();
     const cachedNmPath = await this.ensureCachedInstall(hash, workspaceDir);
+    const stagingNmPath = path.join(workspaceDir, `.node_modules.tmp-${crypto.randomUUID().slice(0, 8)}`);
     try {
-      await execFileAsync('cp', ['-al', cachedNmPath, nmPath], { maxBuffer: 16 * 1024 * 1024 });
+      await execFileAsync('cp', ['-al', cachedNmPath, stagingNmPath], { maxBuffer: 16 * 1024 * 1024 });
+      await fs.rename(stagingNmPath, nmPath);
+      if (!(await isNodeModulesHealthy(nmPath, workspaceDir))) {
+        throw new Error('Hardlinked node_modules failed health check');
+      }
       await writeNodeModulesMeta(stateDir, { mode: 'hardlinked', hash });
     } catch {
-      // Fallback if cross-device or cp -al unsupported: real detached install
+      // Fallback if cross-device, cp -al unsupported, or health check failed: real detached install
+      await fs.rm(stagingNmPath, { recursive: true, force: true }).catch(() => {});
       await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
       await runPackageInstall(workspaceDir, this.pkgCacheDir);
       await writeNodeModulesMeta(stateDir, { mode: 'detached', hash });
@@ -178,10 +218,13 @@ export class NodeModulesCacheManager {
     const readyFile = path.join(targetDir, '.ready');
     const cachedNm = path.join(targetDir, 'node_modules');
 
-    if (await fileExists(readyFile)) {
+    if ((await fileExists(readyFile)) && (await isNodeModulesHealthy(cachedNm, sourceWorkspaceDir))) {
       const now = new Date();
       await fs.utimes(readyFile, now, now).catch(() => {});
       return cachedNm;
+    }
+    if (await fileExists(targetDir)) {
+      await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
     }
 
     const existing = this.inflight.get(hash);

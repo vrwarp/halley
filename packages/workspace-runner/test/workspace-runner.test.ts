@@ -543,6 +543,34 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('self-heals an incomplete/empty node_modules directory instead of skipping installation', async () => {
+    const { NodeModulesCacheManager } = await import('../src/nm-cache.js');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-nm-heal-'));
+    try {
+      const wsDir = path.join(tmp, 'workspace');
+      const stateDir = path.join(tmp, 'state');
+      const devRepo = path.join(tmp, 'dev-repo');
+      await fs.mkdir(path.join(wsDir, 'node_modules'), { recursive: true }); // empty broken dir!
+      await fs.mkdir(path.join(devRepo, 'node_modules/astro'), { recursive: true });
+      await fs.writeFile(path.join(devRepo, 'node_modules/astro/package.json'), '{"name":"astro"}');
+      await fs.writeFile(
+        path.join(wsDir, 'package.json'),
+        JSON.stringify({ name: 't', dependencies: { astro: '^5.0.0' } }),
+      );
+
+      const mgr = new NodeModulesCacheManager(path.join(tmp, 'nm-cache'), path.join(tmp, 'pkg-cache'), 2);
+      await mgr.ensureSessionNodeModules({ workspaceDir: wsDir, stateDir, devLocalRepo: devRepo });
+
+      const astroPkg = await fs
+        .access(path.join(wsDir, 'node_modules/astro/package.json'))
+        .then(() => true)
+        .catch(() => false);
+      expect(astroPkg).toBe(true);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 
