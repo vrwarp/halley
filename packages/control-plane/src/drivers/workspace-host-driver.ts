@@ -87,6 +87,8 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   private resolvedHostUrl: string | null = null;
   private startingSupervisor: Promise<string> | null = null;
   private lastSupervisorInstanceId: string | null = null;
+  private mirrorSyncInflight: Promise<string> | null = null;
+  private lastMirrorSyncAt = 0;
   private lastWarmPoolStatus: WarmPoolStatus = {
     enabled: false,
     target: 0,
@@ -332,20 +334,64 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     }
   }
 
-  async ensureControlPlaneMirror(baseBranch = this.config.baseBranch): Promise<string> {
+  async ensureControlPlaneMirror(
+    baseBranch = this.config.baseBranch,
+    opts?: { force?: boolean; allowStaleOnError?: boolean; ttlMs?: number; token?: string },
+  ): Promise<string> {
     const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
-    const token = this.config.devLocalRepo
-      ? undefined
-      : await this.github.getAccessToken().catch(() => undefined);
-    await ensureBareMirror(
-      mirrorDir,
-      this.config.repo,
-      token,
-      this.config.devLocalRepo || undefined,
-      baseBranch,
-    );
-    await configureBareMirrorForHttp(mirrorDir);
-    return mirrorDir;
+    const ttlMs = opts?.ttlMs ?? 15_000;
+    const mirrorExists = await fs
+      .access(path.join(mirrorDir, 'HEAD'))
+      .then(() => true)
+      .catch(() => false);
+
+    if (!opts?.force && mirrorExists && Date.now() - this.lastMirrorSyncAt < ttlMs) {
+      return mirrorDir;
+    }
+
+    if (this.mirrorSyncInflight) {
+      try {
+        return await this.mirrorSyncInflight;
+      } catch (err) {
+        if (opts?.allowStaleOnError && mirrorExists) {
+          return mirrorDir;
+        }
+        throw err;
+      }
+    }
+
+    const syncPromise = (async () => {
+      const token = this.config.devLocalRepo
+        ? undefined
+        : opts?.token || (await this.github.getAccessToken().catch(() => undefined));
+      await ensureBareMirror(
+        mirrorDir,
+        this.config.repo,
+        token,
+        this.config.devLocalRepo || undefined,
+        baseBranch,
+      );
+      await configureBareMirrorForHttp(mirrorDir);
+      this.lastMirrorSyncAt = Date.now();
+      return mirrorDir;
+    })().finally(() => {
+      if (this.mirrorSyncInflight === syncPromise) {
+        this.mirrorSyncInflight = null;
+      }
+    });
+
+    this.mirrorSyncInflight = syncPromise;
+    try {
+      return await syncPromise;
+    } catch (err) {
+      if (opts?.allowStaleOnError && mirrorExists) {
+        console.warn(
+          `[halley-host-driver] GitHub mirror sync failed (${err instanceof Error ? err.message : String(err)}); continuing with existing local mirror.`,
+        );
+        return mirrorDir;
+      }
+      throw err;
+    }
   }
 
   async reserveWarmWorkspace(): Promise<WarmReservation | null> {
@@ -411,7 +457,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
       // Refresh control-plane's bare mirror before asking workspaces to clone/sync
       this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
-      await this.ensureControlPlaneMirror(session.base_branch);
+      await this.ensureControlPlaneMirror(session.base_branch, { allowStaleOnError: true });
 
       const workspaceToken = this.ensureSessionToken(session.id);
       const persona = this.db.getUserById(session.owner_user_id)?.persona ?? 'non-technical';
@@ -624,15 +670,10 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
   async fetchIntoSession(session: SessionRecord, token: string): Promise<void> {
     // 1. Update control-plane's bare mirror from GitHub (using GitHub token strictly in control-plane)
-    const mirrorDir = path.join(this.config.dataDir, 'git-mirror', 'repo.git');
-    await ensureBareMirror(
-      mirrorDir,
-      session.repo,
-      token || undefined,
-      this.config.devLocalRepo || undefined,
-      session.base_branch,
-    );
-    await configureBareMirrorForHttp(mirrorDir);
+    await this.ensureControlPlaneMirror(session.base_branch, {
+      force: true,
+      token: token || undefined,
+    });
 
     // 2. Ask workspaces supervisor to fetch from control-plane's internal HTTP git server
     const hostUrl = await this.getHostUrl();
@@ -652,7 +693,10 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
   async pushSessionBranch(session: SessionRecord, token: string): Promise<void> {
     // 1. Ensure control-plane's bare mirror is ready to receive the halley/* branch
-    const mirrorDir = await this.ensureControlPlaneMirror(session.base_branch);
+    const mirrorDir = await this.ensureControlPlaneMirror(session.base_branch, {
+      allowStaleOnError: true,
+      token: token || undefined,
+    });
 
     // 2. Ask workspaces supervisor to push session.working_branch to control-plane's internal HTTP git server
     const hostUrl = await this.getHostUrl();
