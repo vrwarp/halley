@@ -184,11 +184,14 @@ async function main() {
       '-e',
       'HALLEY_BASE_BRANCH=main',
       '-e',
-      'HALLEY_WARM_POOL_SIZE=0',
+      'HALLEY_WARM_POOL_SIZE=1',
       '-e',
       'MAX_ACTIVE_WORKSPACES=5',
       'halley-workspace:ci-smoke',
     ]);
+
+    // Deliberately wait 2s before starting control-plane to exercise workspaces-first cold boot
+    await new Promise((r) => setTimeout(r, 2000));
 
     console.log('[docker-smoke] 3b. Starting halley-control-plane container (zero docker.sock)…');
     await run('docker', [
@@ -242,18 +245,36 @@ async function main() {
       await new Promise((r) => setTimeout(r, 300));
     }
 
-    console.log('[docker-smoke] 4. Checking /api/health/doctor (protocol handshake + disk usage)…');
-    const docRes = await fetch(`${cpUrl}/api/health/doctor`);
-    const docJson = (await docRes.json()) as {
-      ok: boolean;
-      errors: string[];
-      details: { supervisor?: { protocolVersion?: number; diskUsage?: { usedPercent?: number } } };
-    };
-    if (!docJson.ok) {
-      throw new Error(`Doctor check failed: ${JSON.stringify(docJson)}`);
+    console.log('[docker-smoke] 4. Checking /api/health/doctor & waiting for warm standby pool (HALLEY_WARM_POOL_SIZE=1)…');
+    let warmReady = false;
+    const warmDeadline = Date.now() + 120_000;
+    while (Date.now() < warmDeadline) {
+      const docRes = await fetch(`${cpUrl}/api/health/doctor`);
+      const docJson = (await docRes.json()) as {
+        ok: boolean;
+        errors: string[];
+        details: {
+          supervisor?: {
+            protocolVersion?: number;
+            warmPool?: { enabled?: boolean; ready?: number };
+          };
+        };
+      };
+      if (!docJson.ok) {
+        throw new Error(`Doctor check failed: ${JSON.stringify(docJson)}`);
+      }
+      if (!docJson.details.supervisor?.protocolVersion) {
+        throw new Error(`Expected supervisor protocolVersion in doctor report: ${JSON.stringify(docJson)}`);
+      }
+      if ((docJson.details.supervisor?.warmPool?.ready ?? 0) >= 1) {
+        warmReady = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
     }
-    if (!docJson.details.supervisor?.protocolVersion) {
-      throw new Error(`Expected supervisor protocolVersion in doctor report: ${JSON.stringify(docJson)}`);
+    if (!warmReady) {
+      const wsLogs = await run('docker', ['logs', wsName]).catch(() => '');
+      throw new Error(`Timed out waiting for warm standby pool to become ready.\nWS logs:\n${wsLogs}`);
     }
 
     console.log('[docker-smoke] 5. Verifying workspaces PID 1 dropped privileges to `node`…');
@@ -371,6 +392,15 @@ async function main() {
     if (afterRestart.session.status !== 'sleeping') {
       throw new Error(`Expected session to reconcile to 'sleeping' after workspaces restart, got '${afterRestart.session.status}'`);
     }
+
+    // Simulate an interrupted/partial node_modules directory (empty dir, missing astro) before waking
+    await run('docker', [
+      'exec',
+      wsName,
+      'sh',
+      '-c',
+      `rm -rf /workspaces/sessions/${sessionId}/workspace/node_modules && mkdir -p /workspaces/sessions/${sessionId}/workspace/node_modules`,
+    ]);
 
     const wakeRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/wake`, {
       method: 'POST',

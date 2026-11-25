@@ -571,6 +571,52 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('survives a session child-process spawn error without crashing the supervisor', async () => {
+    const { createWorkspaceSupervisor } = await import('../src/supervisor.js');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-sup-spawn-err-'));
+    try {
+      const sessionId = 'spawn-err-session';
+      const wsDir = path.join(tmp, 'sessions', sessionId, 'workspace');
+      await fs.mkdir(path.join(wsDir, '.git'), { recursive: true });
+      await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 't' }));
+
+      const sup = createWorkspaceSupervisor({
+        workspacesDir: tmp,
+        controlPlaneInternalUrl: 'http://127.0.0.1:1',
+        repo: 'test/site',
+        baseBranch: 'main',
+        modelId: 'haiku-latest',
+        thinkingLevel: 'off',
+        gitBotName: 'Bot',
+        gitBotEmail: 'bot@example.com',
+        warmPoolSize: 0,
+        maxActiveWorkspaces: 5,
+        runnerEntry: path.join(tmp, 'nonexistent-runner.js'),
+        bindHost: '127.0.0.1',
+      });
+
+      // Remove workspaceDir right before spawn or pass bad runnerEntry: process exits non-zero,
+      // and supervisor must return 500 cleanly and keep serving /health
+      const startRes = await sup.app.request(`/api/sessions/${sessionId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baseBranch: 'main',
+          workingBranch: 'halley/test',
+          baseSha: 'abc1234',
+          workspaceToken: 'tok',
+        }),
+      });
+      expect(startRes.status).toBe(500);
+
+      const healthRes = await sup.app.request('/health');
+      expect(healthRes.status).toBe(200);
+      await sup.stopAll();
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 
