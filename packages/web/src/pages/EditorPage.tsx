@@ -1650,15 +1650,17 @@ export function EditorPage({
               ));
             })()}
 
-            {live.activeTools.map((t) => (
-              <div
-                key={t.callId}
-                className="flex items-center gap-2 rounded-lg border border-amber-200/70 bg-amber-50/50 px-3 py-2 text-xs text-amber-900"
-              >
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
-                <span>{friendlyToolLabel(t.name)}…</span>
-              </div>
-            ))}
+            {live.activeTools
+              .filter((t) => t.status !== 'done' && t.status !== 'error')
+              .map((t) => (
+                <div
+                  key={t.callId}
+                  className="flex items-center gap-2 rounded-lg border border-amber-200/70 bg-amber-50/50 px-3 py-2 text-xs text-amber-900"
+                >
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-600" />
+                  <span>{friendlyToolLabel(t.name)}…</span>
+                </div>
+              ))}
 
             {live.streamingText && (
               <div>

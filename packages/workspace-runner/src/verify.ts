@@ -44,7 +44,7 @@ export function formatCompactCheckSummary(results: VerificationCheckResult[]): s
     .join('\n');
 }
 
-async function runShell(
+export async function runShell(
   cwd: string,
   command: string,
   timeoutMs = 180_000,
@@ -57,6 +57,9 @@ async function runShell(
   return new Promise((resolve) => {
     const child = spawn('nice', ['-n', '10', 'bash', '-lc', command], {
       cwd,
+      // Own process group so timeout kills npm/astro/esbuild/pagefind grandchildren too;
+      // otherwise orphaned grandchildren keep stdout/stderr pipes open and 'close' never fires.
+      detached: true,
       env: {
         ...process.env,
         WORKSPACE_TOKEN: '',
@@ -70,6 +73,11 @@ async function runShell(
 
     const chunks: string[] = [];
     let totalBytes = 0;
+    let settled = false;
+    let timedOut = false;
+    let killEscalationTimer: NodeJS.Timeout | null = null;
+    let forceResolveTimer: NodeJS.Timeout | null = null;
+
     const append = (buf: Buffer) => {
       if (totalBytes > 64_000) return;
       const str = buf.toString('utf8');
@@ -77,21 +85,62 @@ async function runShell(
       chunks.push(str);
     };
 
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // Process group may already have exited
+        }
+      }
+      try {
+        child.kill(signal);
+      } catch {
+        // ignore
+      }
+    };
+
+    const finish = (passed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killEscalationTimer) clearTimeout(killEscalationTimer);
+      if (forceResolveTimer) clearTimeout(forceResolveTimer);
+      resolve({
+        passed: passed && !timedOut,
+        durationMs: Date.now() - start,
+        output: stripAnsi(chunks.join('')).trim(),
+      });
+    };
+
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
 
     const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      chunks.push('\n[Timed out]');
+      timedOut = true;
+      chunks.push(`\n[Timed out after ${Math.round(timeoutMs / 1000)}s]`);
+      killProcessGroup('SIGTERM');
+      killEscalationTimer = setTimeout(() => {
+        killProcessGroup('SIGKILL');
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }, 1_500);
+      killEscalationTimer.unref?.();
+      forceResolveTimer = setTimeout(() => {
+        finish(false);
+      }, 3_000);
+      forceResolveTimer.unref?.();
     }, timeoutMs);
+    timer.unref?.();
+
+    child.on('error', (err) => {
+      chunks.push(`\n[Spawn error: ${err.message}]`);
+      finish(false);
+    });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({
-        passed: code === 0,
-        durationMs: Date.now() - start,
-        output: stripAnsi(chunks.join('')).trim(),
-      });
+      finish(code === 0);
     });
   });
 }
