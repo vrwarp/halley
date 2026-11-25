@@ -132,6 +132,15 @@ export function MobileChatCard({
     }
   }, [pendingSend, live.busy, live.runFailure, entries]);
 
+  // Auto-grow composer textarea as the user types multiple lines
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+    el.style.overflowY = el.scrollHeight > 120 ? 'auto' : 'hidden';
+  }, [input, open, rendered, textareaRef]);
+
   useEffect(() => {
     const update = () => {
       const vv = window.visualViewport;
@@ -235,18 +244,9 @@ export function MobileChatCard({
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-stone-100 bg-[#FAF9F7] px-3 py-2">
         <div className="flex items-center gap-1.5 min-w-0">
           <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-900 text-amber-400">
-            {isWorking ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Sparkles className="h-3 w-3" />
-            )}
+            <Sparkles className="h-3 w-3" />
           </div>
           <span className="text-xs font-semibold text-stone-900">Halley</span>
-          {isWorking && (
-            <span className="truncate text-[11px] text-amber-800">
-              · {stepCount > 0 ? `Step ${stepCount}` : 'Working…'}
-            </span>
-          )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <button
@@ -326,8 +326,10 @@ export function MobileChatCard({
           <>
             {displayedUserText && (
               <div className="flex justify-end">
-                <div className="max-w-[88%] rounded-2xl rounded-tr-sm bg-stone-900 px-3 py-1.5 text-xs text-white line-clamp-2 whitespace-pre-wrap">
-                  {displayedUserText}
+                <div className="max-w-[88%] rounded-2xl rounded-tr-sm bg-stone-900 px-3 py-1.5 text-xs leading-relaxed text-white">
+                  <p className="line-clamp-3 whitespace-pre-wrap break-words">
+                    {displayedUserText}
+                  </p>
                 </div>
               </div>
             )}
@@ -518,7 +520,7 @@ export function MobileChatCard({
                     ? 'What should Halley change?'
                     : `Ask Halley about ${currentRoute}…`
               }
-              className="max-h-20 flex-1 resize-none bg-transparent py-1 text-sm text-stone-900 placeholder:text-stone-400 outline-none"
+              className="max-h-[120px] flex-1 resize-none overflow-y-auto bg-transparent py-1 text-sm leading-5 text-stone-900 placeholder:text-stone-400 outline-none"
             />
 
             {isWorking ? (

@@ -72,6 +72,8 @@ export interface PiRuntimeOptions {
   pageService?: PageCreationService;
   onLockChange: (locked: boolean, file?: string) => void;
   onRunFinishedWithEdits: (summary: string) => Promise<void>;
+  pauseAstroForBuild?: () => Promise<void>;
+  resumeAstroAfterBuild?: () => Promise<void>;
   onTranscriptUpdate: (snapshot: {
     entries: TranscriptEntryDto[];
     live: LiveRunStateDto;
@@ -368,9 +370,10 @@ export class HalleyPiRuntime {
   private buildHalleyExtension(agentsMdText: string) {
     const opts = this.opts;
 
-    // Track in-flight file mutations so parallel screenshot_page / run_checks calls
-    // emitted in the same assistant turn always wait for writes + Vite watcher settle.
+    // Track in-flight file mutations and build checks so parallel screenshot_page / run_checks calls
+    // emitted in the same assistant turn always wait for writes + Astro dev server recovery.
     const inFlightMutations = new Set<Promise<unknown>>();
+    const inFlightChecks = new Set<Promise<unknown>>();
     let lastMutationFinishedAt = 0;
 
     const trackMutation = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -468,6 +471,9 @@ export class HalleyPiRuntime {
       execute: async (args) => {
         // Ensure any parallel edit/write/bash in the same turn finishes and Vite invalidates CSS first
         await waitForPendingMutations(200);
+        while (inFlightChecks.size > 0) {
+          await Promise.allSettled([...inFlightChecks]);
+        }
 
         const cleanRoute = args.route.startsWith('/') ? args.route : `/${args.route}`;
         const endpoint = `${opts.controlPlaneInternalUrl.replace(/\/$/, '')}/internal/screenshot`;
@@ -535,32 +541,45 @@ export class HalleyPiRuntime {
       execute: async () => {
         await waitForPendingMutations(0);
         const queueNotes: string[] = [];
-        try {
-          const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot, {
-            supervisorUrl: opts.supervisorUrl,
-            hostSecret: opts.hostSecret,
-            sessionId: opts.sessionId,
-            onQueued: (_pos, msg) => {
-              queueNotes.push(msg);
-              console.log(`[halley-pi] ${msg}`);
-            },
-          });
-          const summary = formatCompactCheckSummary(results);
-          const prefix = queueNotes.length > 0 ? `${queueNotes[0]}\n` : '';
-          return {
-            output: [{ type: 'text', text: `${prefix}${summary}` }],
-            isError: !allPassed,
-          };
-        } catch (err) {
-          return {
-            output: [
-              {
-                type: 'text',
-                text: err instanceof Error ? err.message : 'Verification checks failed',
+        const runTask = (async () => {
+          await opts.pauseAstroForBuild?.();
+          try {
+            const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot, {
+              supervisorUrl: opts.supervisorUrl,
+              hostSecret: opts.hostSecret,
+              sessionId: opts.sessionId,
+              onQueued: (_pos, msg) => {
+                queueNotes.push(msg);
+                console.log(`[halley-pi] ${msg}`);
               },
-            ],
-            isError: true,
-          };
+            });
+            const summary = formatCompactCheckSummary(results);
+            const prefix = queueNotes.length > 0 ? `${queueNotes[0]}\n` : '';
+            return {
+              output: [{ type: 'text' as const, text: `${prefix}${summary}` }],
+              isError: !allPassed,
+            };
+          } catch (err) {
+            return {
+              output: [
+                {
+                  type: 'text' as const,
+                  text: err instanceof Error ? err.message : 'Verification checks failed',
+                },
+              ],
+              isError: true,
+            };
+          } finally {
+            await opts.resumeAstroAfterBuild?.().catch((err) => {
+              console.warn('[halley-pi] Failed to resume Astro after run_checks:', err);
+            });
+          }
+        })();
+        inFlightChecks.add(runTask);
+        try {
+          return await runTask;
+        } finally {
+          inFlightChecks.delete(runTask);
         }
       },
     });
