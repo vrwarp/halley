@@ -1373,10 +1373,15 @@ export function createControlPlane(
       p.startsWith('/node_modules/')
     ) {
       const ref = c.req.header('referer') || '';
-      const m = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
-      if (m?.[1]) {
-        return previewProxy.handleHttpForSession(c, m[1]);
+      const refMatch = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
+      const cookieHeader = c.req.header('cookie') || '';
+      const cookieMatch = cookieHeader.match(/(?:^|;\s*)halley_preview_session=([0-9a-f-]{20,})\b/i);
+      const targetSessionId = refMatch?.[1] || cookieMatch?.[1];
+      if (targetSessionId) {
+        return previewProxy.handleHttpForSession(c, targetSessionId);
       }
+      // Never fall through to SPA index.html (text/html) for Vite/Astro dev module paths
+      return c.notFound();
     }
     return next();
   });

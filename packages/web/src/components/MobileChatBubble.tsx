@@ -58,6 +58,7 @@ export function MobileChatBubble({
     origY: number;
     moved: boolean;
   } | null>(null);
+  const suppressClickRef = useRef(false);
 
   useEffect(() => {
     const onResize = () => {
@@ -87,7 +88,10 @@ export function MobileChatBubble({
       {completionToast && visible && (
         <button
           type="button"
-          onClick={onTapToast}
+          onClick={(e) => {
+            e.stopPropagation();
+            onTapToast();
+          }}
           style={
             isOnRightHalf
               ? { right: `${BUBBLE_SIZE + 10}px`, top: '50%', transform: 'translateY(-50%)' }
@@ -105,6 +109,8 @@ export function MobileChatBubble({
         tabIndex={visible ? 0 : -1}
         aria-label="Open Halley chat"
         onPointerDown={(e) => {
+          e.stopPropagation();
+          suppressClickRef.current = false;
           e.currentTarget.setPointerCapture(e.pointerId);
           dragRef.current = {
             pointerId: e.pointerId,
@@ -128,18 +134,29 @@ export function MobileChatBubble({
           }
         }}
         onPointerUp={(e) => {
+          e.stopPropagation();
           const d = dragRef.current;
           dragRef.current = null;
           if (!d || d.pointerId !== e.pointerId) return;
           if (e.currentTarget.hasPointerCapture(e.pointerId)) {
             e.currentTarget.releasePointerCapture(e.pointerId);
           }
-          if (!d.moved) {
-            onTap();
+          if (d.moved) {
+            suppressClickRef.current = true;
           }
         }}
         onPointerCancel={() => {
           dragRef.current = null;
+          suppressClickRef.current = false;
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          onTap();
         }}
         className={`relative flex h-[54px] w-[54px] items-center justify-center rounded-full border-2 border-white/90 bg-stone-900 text-amber-400 shadow-[0_8px_24px_rgba(0,0,0,0.45),0_0_0_1px_rgba(28,25,23,0.2)] active:scale-95 transition-transform ${
           entryPulse ? 'halley-bubble-pulse' : ''
