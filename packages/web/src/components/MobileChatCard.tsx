@@ -103,6 +103,10 @@ export function MobileChatCard({
   textareaRef,
 }: Props) {
   const [rendered, setRendered] = useState(open);
+  const [pendingSend, setPendingSend] = useState<{
+    text: string;
+    baselineEntryCount: number;
+  } | null>(null);
   const [vvMetrics, setVvMetrics] = useState(() => ({
     height: typeof window !== 'undefined' ? window.visualViewport?.height ?? window.innerHeight : 800,
     offsetBottom: 0,
@@ -116,6 +120,17 @@ export function MobileChatCard({
     const timer = setTimeout(() => setRendered(false), 170);
     return () => clearTimeout(timer);
   }, [open]);
+
+  // Clear optimistic pending state once the server starts the turn, fails, or already replied
+  useEffect(() => {
+    if (!pendingSend) return;
+    const hasNewAssistant = entries
+      .slice(pendingSend.baselineEntryCount)
+      .some((e) => e.role === 'assistant' && !e.isIntermediate && e.text.trim().length > 0);
+    if (live.busy || live.runFailure || hasNewAssistant) {
+      setPendingSend(null);
+    }
+  }, [pendingSend, live.busy, live.runFailure, entries]);
 
   useEffect(() => {
     const update = () => {
@@ -140,21 +155,56 @@ export function MobileChatCard({
 
   if (!rendered) return null;
 
-  // Latest exchange: last user message + last final assistant reply after (or overall)
-  let lastUser: TranscriptEntryDto | null = null;
-  let lastAssistant: TranscriptEntryDto | null = null;
+  const submitPrompt = (whenBusy?: 'followUp', overrideText?: string) => {
+    const raw = (overrideText ?? input).trim();
+    if (!raw && attachments.length === 0 && chips.length === 0) return;
+    const displayText =
+      raw ||
+      (attachments.length > 0 && chips.length === 0
+        ? 'Use attached photo'
+        : chips.length === 1
+          ? 'Update selected section'
+          : 'Update selected sections');
+    if (!live.busy) {
+      setPendingSend({ text: displayText, baselineEntryCount: entries.length });
+    }
+    onSend(whenBusy, overrideText);
+  };
+
+  // Scope the compact view strictly to the latest turn so older replies never flicker back while working
+  let lastUserIdx = -1;
   for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i]!;
-    if (!lastAssistant && e.role === 'assistant' && !e.isIntermediate && e.text.trim()) {
+    if (entries[i]!.role === 'user') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  const lastUser = lastUserIdx >= 0 ? entries[lastUserIdx]! : null;
+  const turnEntries = lastUserIdx >= 0 ? entries.slice(lastUserIdx + 1) : entries;
+  let lastAssistant: TranscriptEntryDto | null = null;
+  let completedToolsInTurn = 0;
+  for (let i = 0; i < turnEntries.length; i++) {
+    const e = turnEntries[i]!;
+    if (e.role === 'tool') completedToolsInTurn += 1;
+    if (e.role === 'assistant' && !e.isIntermediate && e.text.trim()) {
       lastAssistant = e;
     }
-    if (!lastUser && e.role === 'user') {
-      lastUser = e;
-    }
-    if (lastUser && lastAssistant) break;
   }
 
-  const isEmpty = !lastUser && !lastAssistant && !live.busy && !live.streamingText;
+  const isWorking = live.busy || Boolean(pendingSend);
+  const activeTool = live.activeTools[0];
+  const stepCount = pendingSend
+    ? 0
+    : completedToolsInTurn + (live.activeTools.length > 0 ? 1 : 0);
+  const displayedUserText = pendingSend
+    ? pendingSend.text
+    : lastUser
+      ? lastUser.pageRequest
+        ? `New page: ${lastUser.pageRequest.title} (${lastUser.pageRequest.route})`
+        : parseUserMessageDisplay(lastUser.text).body
+      : null;
+
+  const isEmpty = !displayedUserText && !lastAssistant && !isWorking;
   const keyboardOpen = vvMetrics.offsetBottom > 80;
   const winW = typeof window !== 'undefined' ? window.innerWidth : 390;
   const winH = typeof window !== 'undefined' ? window.innerHeight : 844;
@@ -185,16 +235,16 @@ export function MobileChatCard({
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-stone-100 bg-[#FAF9F7] px-3 py-2">
         <div className="flex items-center gap-1.5 min-w-0">
           <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-900 text-amber-400">
-            {live.busy ? (
+            {isWorking ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <Sparkles className="h-3 w-3" />
             )}
           </div>
           <span className="text-xs font-semibold text-stone-900">Halley</span>
-          {live.busy && (
+          {isWorking && (
             <span className="truncate text-[11px] text-amber-800">
-              · {live.activeTools[0] ? friendlyToolLabel(live.activeTools[0].name) : 'Working…'}
+              · {stepCount > 0 ? `Step ${stepCount}` : 'Working…'}
             </span>
           )}
         </div>
@@ -241,7 +291,7 @@ export function MobileChatCard({
         </div>
       )}
 
-      {/* Compact Body: Starter pills when empty OR latest exchange */}
+      {/* Compact Body: Starter pills when empty OR latest exchange / calm working state */}
       <div className="flex-1 overflow-y-auto px-3 py-2.5 space-y-2">
         {isEmpty ? (
           canEdit ? (
@@ -256,14 +306,14 @@ export function MobileChatCard({
               </button>
               <button
                 type="button"
-                onClick={() => onSend(undefined, `What's on this page (${currentRoute})?`)}
+                onClick={() => submitPrompt(undefined, `What's on this page (${currentRoute})?`)}
                 className="rounded-full border border-stone-200 bg-[#FAF9F7] px-2.5 py-1 text-[11px] font-medium text-stone-700"
               >
                 What&apos;s on this page?
               </button>
               <button
                 type="button"
-                onClick={() => onSend(undefined, 'Add a new upcoming event')}
+                onClick={() => submitPrompt(undefined, 'Add a new upcoming event')}
                 className="rounded-full border border-stone-200 bg-[#FAF9F7] px-2.5 py-1 text-[11px] font-medium text-stone-700"
               >
                 Add upcoming event
@@ -274,30 +324,31 @@ export function MobileChatCard({
           )
         ) : (
           <>
-            {lastUser && (
+            {displayedUserText && (
               <div className="flex justify-end">
                 <div className="max-w-[88%] rounded-2xl rounded-tr-sm bg-stone-900 px-3 py-1.5 text-xs text-white line-clamp-2 whitespace-pre-wrap">
-                  {lastUser.pageRequest
-                    ? `New page: ${lastUser.pageRequest.title} (${lastUser.pageRequest.route})`
-                    : parseUserMessageDisplay(lastUser.text).body}
+                  {displayedUserText}
                 </div>
               </div>
             )}
 
-            {live.streamingText ? (
-              <div className="text-xs leading-relaxed text-stone-800">
-                <ChatMessageContent
-                  text={live.streamingText}
-                  onNavigateRoute={onNavigateRouteAndClose}
-                  knownRoutes={knownRoutes}
-                  astroBase={astroBase}
-                />
-                <span className="ml-0.5 inline-block h-3 w-1.5 animate-pulse bg-amber-600 align-middle" />
-              </div>
-            ) : live.busy && live.activeTools.length > 0 ? (
-              <div className="flex items-center gap-2 rounded-lg border border-amber-200/70 bg-amber-50/50 px-2.5 py-1.5 text-xs text-amber-900">
-                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600" />
-                <span className="truncate">{friendlyToolLabel(live.activeTools[0]!.name)}…</span>
+            {isWorking ? (
+              <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-amber-50/60 px-3 py-2 text-xs text-amber-950">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600" />
+                  <span className="truncate font-medium">
+                    {activeTool
+                      ? `${friendlyToolLabel(activeTool.name)}…`
+                      : pendingSend
+                        ? 'Sending…'
+                        : 'Thinking…'}
+                  </span>
+                </div>
+                {stepCount > 0 && (
+                  <span className="shrink-0 rounded-full bg-white/90 px-2 py-0.5 font-mono text-[10px] font-semibold text-amber-900 border border-amber-200/80">
+                    {stepCount} {stepCount === 1 ? 'step' : 'steps'}
+                  </span>
+                )}
               </div>
             ) : lastAssistant ? (
               <div className="text-xs leading-relaxed text-stone-800">
@@ -370,7 +421,7 @@ export function MobileChatCard({
                   </button>
                 )}
               </div>
-              {!input.trim() && !live.busy && !spend.capped && (
+              {!input.trim() && !isWorking && !spend.capped && (
                 <div className="flex items-center gap-1 overflow-x-auto">
                   {[
                     {
@@ -391,7 +442,7 @@ export function MobileChatCard({
                     <button
                       key={q.label}
                       type="button"
-                      onClick={() => onSend(undefined, q.prompt)}
+                      onClick={() => submitPrompt(undefined, q.prompt)}
                       className="shrink-0 rounded-full border border-stone-200 bg-stone-50 px-2 py-0.5 text-[11px] font-medium text-stone-600"
                     >
                       {q.label}
@@ -457,11 +508,11 @@ export function MobileChatCard({
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
-                  onSend(live.busy ? 'followUp' : undefined);
+                  submitPrompt(isWorking ? 'followUp' : undefined);
                 }
               }}
               placeholder={
-                live.busy
+                isWorking
                   ? 'Queue next message…'
                   : chips.length > 0
                     ? 'What should Halley change?'
@@ -470,11 +521,14 @@ export function MobileChatCard({
               className="max-h-20 flex-1 resize-none bg-transparent py-1 text-sm text-stone-900 placeholder:text-stone-400 outline-none"
             />
 
-            {live.busy ? (
+            {isWorking ? (
               <div className="flex shrink-0 items-center gap-1">
                 <button
                   type="button"
-                  onClick={onAbort}
+                  onClick={() => {
+                    setPendingSend(null);
+                    onAbort();
+                  }}
                   aria-label="Stop"
                   className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-300 bg-white px-2 text-xs font-medium text-stone-700"
                 >
@@ -483,7 +537,7 @@ export function MobileChatCard({
                 <button
                   type="button"
                   disabled={spend.capped}
-                  onClick={() => onSend('followUp')}
+                  onClick={() => submitPrompt('followUp')}
                   aria-label="Send queued message"
                   className="inline-flex h-8 items-center gap-1 rounded-lg bg-stone-900 px-2.5 text-xs font-semibold text-white disabled:opacity-40"
                 >
@@ -494,7 +548,7 @@ export function MobileChatCard({
               <button
                 type="button"
                 disabled={spend.capped}
-                onClick={() => onSend()}
+                onClick={() => submitPrompt()}
                 aria-label="Send message"
                 className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg bg-stone-900 px-2.5 text-xs font-semibold text-white disabled:opacity-40"
               >

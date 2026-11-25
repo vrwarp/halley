@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
+  ChevronsLeftRight,
   Code2,
   Eye,
   Loader2,
@@ -11,7 +12,7 @@ import {
   Smartphone,
   ZoomIn,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ImageLightbox } from './ImageLightbox.js';
 
 interface Props {
@@ -146,34 +147,31 @@ export function VisualReview({
                       {hasLive ? `Live as of ${p.liveTimestamp}` : 'Draft preview'}
                     </span>
                   </div>
-                  <div className={`grid gap-3 ${hasLive ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
-                    {hasLive && liveUrl && (
-                      <div>
-                        <div className="mb-1 flex items-center justify-between">
-                          <p className="text-[11px] font-medium text-stone-500">Live</p>
-                          <span className="inline-flex items-center gap-0.5 text-[10px] text-stone-400">
-                            <ZoomIn className="h-3 w-3" /> Tap to zoom
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setLightbox({
-                              src: liveUrl,
-                              alt: `Live ${p.route}`,
-                              title: `Live · ${p.route} (${screenshotViewport})`,
-                            })
-                          }
-                          className="block w-full overflow-hidden rounded-lg border border-stone-200 bg-white text-left focus:outline-none focus:ring-2 focus:ring-amber-500"
-                        >
-                          <img
-                            src={liveUrl}
-                            alt={`Live ${p.route}`}
-                            className="block w-full"
-                          />
-                        </button>
-                      </div>
-                    )}
+                  {hasLive && liveUrl && draftUrl ? (
+                    <BeforeAfterWipe
+                      liveUrl={liveUrl}
+                      draftUrl={draftUrl}
+                      route={p.route}
+                      viewport={screenshotViewport}
+                      highlights={highlights}
+                      onZoom={(side) =>
+                        setLightbox(
+                          side === 'live'
+                            ? {
+                                src: liveUrl,
+                                alt: `Live ${p.route}`,
+                                title: `Live · ${p.route} (${screenshotViewport})`,
+                              }
+                            : {
+                                src: draftUrl,
+                                alt: `Draft ${p.route}`,
+                                title: `Draft · ${p.route} (${screenshotViewport})`,
+                                highlights,
+                              },
+                        )
+                      }
+                    />
+                  ) : (
                     <div>
                       <div className="mb-1 flex items-center justify-between">
                         <p className="text-[11px] font-medium text-stone-500">Draft</p>
@@ -225,7 +223,7 @@ export function VisualReview({
                         </div>
                       )}
                     </div>
-                  </div>
+                  )}
                 </div>
               );
             })}
@@ -411,6 +409,198 @@ export function VisualReview({
           onClose={() => setLightbox(null)}
         />
       )}
+    </div>
+  );
+}
+
+interface BeforeAfterWipeProps {
+  liveUrl: string;
+  draftUrl: string;
+  route: string;
+  viewport: 'mobile' | 'desktop';
+  highlights: VisualDiffHighlightDto[];
+  onZoom: (side: 'live' | 'draft') => void;
+}
+
+function BeforeAfterWipe({
+  liveUrl,
+  draftUrl,
+  route,
+  highlights,
+  onZoom,
+}: BeforeAfterWipeProps) {
+  const [splitPct, setSplitPct] = useState(50);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const draggingRef = useRef(false);
+
+  const updateFromClientX = (clientX: number) => {
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    const pct = ((clientX - rect.left) / rect.width) * 100;
+    setSplitPct(Math.max(0, Math.min(100, pct)));
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <div className="inline-flex items-center gap-1 text-[11px]">
+          <button
+            type="button"
+            onClick={() => setSplitPct(100)}
+            className={`rounded px-1.5 py-0.5 font-medium transition ${
+              splitPct >= 85
+                ? 'bg-stone-900 text-white'
+                : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
+            }`}
+          >
+            Live
+          </button>
+          <button
+            type="button"
+            onClick={() => setSplitPct(50)}
+            className={`rounded px-1.5 py-0.5 font-medium transition ${
+              splitPct > 15 && splitPct < 85
+                ? 'bg-stone-200 text-stone-800'
+                : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
+            }`}
+          >
+            50/50
+          </button>
+          <button
+            type="button"
+            onClick={() => setSplitPct(0)}
+            className={`rounded px-1.5 py-0.5 font-medium transition ${
+              splitPct <= 15
+                ? 'bg-amber-600 text-white'
+                : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
+            }`}
+          >
+            Draft
+          </button>
+          <span className="hidden sm:inline text-[10px] text-stone-400 ml-1">
+            Drag to wipe
+          </span>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => onZoom(splitPct > 50 ? 'live' : 'draft')}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-stone-500 hover:bg-stone-200/70 hover:text-stone-900"
+        >
+          <ZoomIn className="h-3 w-3" />
+          Zoom {splitPct > 50 ? 'Live' : 'Draft'}
+        </button>
+      </div>
+
+      <div
+        ref={stageRef}
+        role="slider"
+        tabIndex={0}
+        aria-label={`Compare Live and Draft screenshots for ${route}`}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(splitPct)}
+        aria-valuetext={`${Math.round(splitPct)}% Live, ${Math.round(100 - splitPct)}% Draft`}
+        onPointerDown={(e) => {
+          draggingRef.current = true;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          updateFromClientX(e.clientX);
+        }}
+        onPointerMove={(e) => {
+          if (!draggingRef.current) return;
+          updateFromClientX(e.clientX);
+        }}
+        onPointerUp={(e) => {
+          draggingRef.current = false;
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        }}
+        onPointerCancel={() => {
+          draggingRef.current = false;
+        }}
+        onKeyDown={(e) => {
+          const step = e.shiftKey ? 1 : 5;
+          if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            setSplitPct((v) => Math.max(0, v - step));
+          } else if (e.key === 'ArrowRight') {
+            e.preventDefault();
+            setSplitPct((v) => Math.min(100, v + step));
+          } else if (e.key === 'Home') {
+            e.preventDefault();
+            setSplitPct(0);
+          } else if (e.key === 'End') {
+            e.preventDefault();
+            setSplitPct(100);
+          }
+        }}
+        className="relative select-none overflow-hidden rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
+      >
+        {/* Base layer: Draft screenshot + dual-color diff highlights */}
+        <img
+          src={draftUrl}
+          alt={`Draft ${route}`}
+          draggable={false}
+          className="block w-full pointer-events-none"
+        />
+        {highlights.map((h, idx) => (
+          <div
+            key={idx}
+            title={h.warning || h.file}
+            style={{
+              left: `${h.x}%`,
+              top: `${h.y}%`,
+              width: `${h.width}%`,
+              height: `${h.height}%`,
+            }}
+            className={`pointer-events-none absolute rounded border-2 ${
+              h.kind === 'merged_from_live'
+                ? 'border-teal-500 bg-teal-500/15'
+                : 'border-amber-500 bg-amber-500/15'
+            }`}
+          />
+        ))}
+
+        {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
+        <div
+          className="pointer-events-none absolute inset-0"
+          style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
+        >
+          <img
+            src={liveUrl}
+            alt={`Live ${route}`}
+            draggable={false}
+            className="block w-full"
+          />
+        </div>
+
+        {/* Corner labels */}
+        <span
+          className={`pointer-events-none absolute left-2 top-2 rounded-full bg-stone-900/75 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm transition-opacity ${
+            splitPct < 14 ? 'opacity-0' : 'opacity-100'
+          }`}
+        >
+          Live
+        </span>
+        <span
+          className={`pointer-events-none absolute right-2 top-2 rounded-full bg-amber-600/90 px-2 py-0.5 text-[10px] font-semibold text-white backdrop-blur-sm transition-opacity ${
+            splitPct > 86 ? 'opacity-0' : 'opacity-100'
+          }`}
+        >
+          Draft
+        </span>
+
+        {/* Wipe divider line & handle */}
+        <div
+          className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.35),0_2px_8px_rgba(0,0,0,0.4)]"
+          style={{ left: `${splitPct}%` }}
+        >
+          <div className="absolute left-1/2 top-1/2 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-stone-300 bg-white text-stone-800 shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
+            <ChevronsLeftRight className="h-4 w-4" />
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
