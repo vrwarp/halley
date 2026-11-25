@@ -858,6 +858,16 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       await page.waitForTimeout(800);
       await bubbleBtn.waitFor({ state: 'visible', timeout: 5_000 });
 
+      // Ensure compact mobile top bar (now showing "Publish · 1") never overflows viewport width
+      const overflowCheck = await page.evaluate(() => {
+        const header = document.querySelector('header');
+        return {
+          docOverflow: document.documentElement.scrollWidth > window.innerWidth,
+          headerOverflow: header ? header.scrollWidth > header.clientWidth : false,
+        };
+      });
+      expect(overflowCheck).toEqual({ docOverflow: false, headerOverflow: false });
+
       // 4. Select heading -> tap "Ask Halley…" -> compact floating chat card opens with attached chip
       await frameLocator.locator('h1').first().click();
       await frameLocator.locator('button[data-act="ask"]').click();

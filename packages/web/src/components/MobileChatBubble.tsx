@@ -7,6 +7,7 @@ export interface BubblePos {
 }
 
 interface Props {
+  visible?: boolean;
   pos: BubblePos;
   onChangePos: (pos: BubblePos) => void;
   onTap: () => void;
@@ -38,6 +39,7 @@ export function defaultBubblePos(): BubblePos {
 }
 
 export function MobileChatBubble({
+  visible = true,
   pos,
   onChangePos,
   onTap,
@@ -70,14 +72,19 @@ export function MobileChatBubble({
 
   return (
     <div
-      className="fixed z-40 select-none"
+      aria-hidden={!visible}
+      className={`fixed z-40 select-none transition-[transform,opacity,visibility] duration-200 ease-out ${
+        visible
+          ? 'visible scale-100 opacity-100'
+          : 'invisible pointer-events-none scale-75 opacity-0'
+      }`}
       style={{
         left: `${pos.x}px`,
         top: `${pos.y}px`,
         touchAction: 'none',
       }}
     >
-      {completionToast && (
+      {completionToast && visible && (
         <button
           type="button"
           onClick={onTapToast}
@@ -95,6 +102,7 @@ export function MobileChatBubble({
 
       <button
         type="button"
+        tabIndex={visible ? 0 : -1}
         aria-label="Open Halley chat"
         onPointerDown={(e) => {
           e.currentTarget.setPointerCapture(e.pointerId);
@@ -133,7 +141,7 @@ export function MobileChatBubble({
         onPointerCancel={() => {
           dragRef.current = null;
         }}
-        className={`relative flex h-[54px] w-[54px] items-center justify-center rounded-full bg-stone-900 text-amber-400 shadow-lg ring-1 ring-black/10 active:scale-95 transition-transform ${
+        className={`relative flex h-[54px] w-[54px] items-center justify-center rounded-full border-2 border-white/90 bg-stone-900 text-amber-400 shadow-[0_8px_24px_rgba(0,0,0,0.45),0_0_0_1px_rgba(28,25,23,0.2)] active:scale-95 transition-transform ${
           entryPulse ? 'halley-bubble-pulse' : ''
         }`}
       >

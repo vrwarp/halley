@@ -137,12 +137,13 @@ export function PageToolbarControls({
         {/* 1. Change hidden / unlisted status */}
         <button
           type="button"
+          disabled={busy}
           onClick={() => {
             setError(null);
             setOpenPopover((v) => (v === 'visibility' ? null : 'visibility'));
           }}
           title={isUnlisted ? 'Page is unlisted — click to change visibility' : 'Page is public — click to hide/unlist'}
-          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-50 ${
             isUnlisted
               ? 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
               : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300 hover:text-stone-900'
@@ -157,10 +158,11 @@ export function PageToolbarControls({
         {/* 2. Change page URL / path */}
         <button
           type="button"
+          disabled={busy}
           onClick={() => void openRenamePopover()}
           title="Change page URL"
           aria-label="Change page URL"
-          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+          className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition disabled:opacity-50 ${
             openPopover === 'rename'
               ? 'border-amber-400 bg-amber-50 text-amber-900'
               : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300 hover:text-stone-900'
