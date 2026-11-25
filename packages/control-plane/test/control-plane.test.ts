@@ -5,13 +5,12 @@ import path from 'node:path';
 import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
-import { DockerWorkspaceDriver, hasEmptyWorkspaceToken } from '../src/drivers/docker-driver.js';
-import { LocalWorkspaceDriver } from '../src/drivers/local-driver.js';
 import {
   CrashLoopTracker,
   WorkspaceCrashLoopError,
   type WorkspaceDriver,
 } from '../src/drivers/workspace-driver.js';
+import { WorkspaceHostDriver } from '../src/drivers/workspace-host-driver.js';
 import { createControlPlane } from '../src/index.js';
 import { hashWorkspaceToken } from '../src/proxy/llm-proxy.js';
 import { ScreenshotService } from '../src/screenshot-service.js';
@@ -545,18 +544,42 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
     }
   });
 
-  it('detects empty WORKSPACE_TOKEN env and mints/persists a fresh token after control-plane restart', async () => {
-    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN='])).toBe(true);
-    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN=   '])).toBe(true);
-    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1'])).toBe(true);
-    expect(hasEmptyWorkspaceToken(['HALLEY_SESSION_ID=1', 'WORKSPACE_TOKEN=abc123'])).toBe(false);
-    expect(hasEmptyWorkspaceToken(undefined)).toBe(false);
+  it('rotates/persists session token, detects protocol version mismatch, and reconciles sessions after workspaces restart', async () => {
+    const http = await import('node:http');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-host-test-'));
+    let fakeProtocolVersion = 1;
+    let fakeInstanceId = 'inst-1';
+    let fakeActiveIds: string[] = [];
+    const fakeServer = http.createServer((req, res) => {
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            protocolVersion: fakeProtocolVersion,
+            instanceId: fakeInstanceId,
+            activeSessionIds: fakeActiveIds,
+            activeCount: fakeActiveIds.length,
+            maxActiveWorkspaces: 5,
+            warmPool: { enabled: false, target: 0, ready: 0, warming: 0 },
+            buildQueue: { activeSessionId: null, queueLength: 0, queuedSessionIds: [] },
+            diskUsage: { totalBytes: 1000, freeBytes: 500, usedBytes: 500, usedPercent: 50 },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => fakeServer.listen(0, '127.0.0.1', () => resolve()));
+    const addr = fakeServer.address() as { port: number };
+    const fakeHostUrl = `http://127.0.0.1:${addr.port}`;
 
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-token-test-'));
     try {
       const cfg = {
         ...loadConfig(),
         dataDir: tmp,
+        workspaceHostUrl: fakeHostUrl,
         adminEmails: ['admin@thecrossing.website'],
         devLoginEnabled: true,
       };
@@ -565,7 +588,6 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         email: 'admin@thecrossing.website',
         name: 'Admin',
         picture: null,
-        isAdmin: true,
       });
       const initialToken = 'initial-token-before-restart';
       const session = cp.db.createSession({
@@ -573,29 +595,42 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         title: 'Test6',
         slug: 'test6',
         ownerUserId: user.id,
-        repo: cfg.targetRepo || 'vrwarp/thecrossing.website',
+        repo: cfg.repo || 'vrwarp/thecrossing.website',
         baseBranch: 'main',
         workingBranch: 'halley/test6-8c7582',
         volumeName: 'halley-ws-8c758298-cf3e-4fee-a4fc-a7f2731e6dae',
         workspaceTokenHash: hashWorkspaceToken(initialToken),
       });
 
-      // Fresh DockerWorkspaceDriver simulating a control-plane restart (empty in-memory sessionTokens)
-      const dockerDriver = new DockerWorkspaceDriver(cfg, cp.db, {} as never);
-      const rotated = dockerDriver.ensureSessionToken(session.id);
+      const hostDriver = new WorkspaceHostDriver(cfg, cp.db, {} as never);
+      const rotated = hostDriver.ensureSessionToken(session.id);
       expect(rotated.length).toBeGreaterThanOrEqual(32);
       expect(rotated).not.toBe(initialToken);
       expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(rotated))?.id).toBe(session.id);
       expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(initialToken))).toBeNull();
-      // Subsequent call returns the cached token without rotating again
-      expect(dockerDriver.ensureSessionToken(session.id)).toBe(rotated);
+      expect(hostDriver.ensureSessionToken(session.id)).toBe(rotated);
 
-      // Fresh LocalWorkspaceDriver also rotates & persists cleanly
-      const localDriver = new LocalWorkspaceDriver(cfg, cp.db, {} as never);
-      const localRotated = localDriver.ensureSessionToken(session.id);
-      expect(localRotated.length).toBeGreaterThanOrEqual(32);
-      expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(localRotated))?.id).toBe(session.id);
+      // Reconcile after workspaces container restart: session marked 'running' in DB but absent from supervisor flips to 'sleeping'
+      cp.db.updateSession(session.id, {
+        status: 'running',
+        runner_url: 'http://workspaces:4101',
+        astro_url: 'http://workspaces:4322',
+      });
+      fakeInstanceId = 'inst-2';
+      fakeActiveIds = [];
+      await hostDriver.reconcileSessions();
+      const afterReconcile = cp.db.getSession(session.id)!;
+      expect(afterReconcile.status).toBe('sleeping');
+      expect(afterReconcile.runner_url).toBeNull();
+      expect(afterReconcile.astro_url).toBeNull();
+
+      // Doctor reports clear error on protocol version mismatch
+      fakeProtocolVersion = 99;
+      const doc = await hostDriver.runDoctorChecks();
+      expect(doc.ok).toBe(false);
+      expect(doc.errors.some((e) => e.includes('update both halley-control-plane and halley-workspace'))).toBe(true);
     } finally {
+      fakeServer.close();
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });

@@ -461,6 +461,88 @@ describe('workspace-runner git, protection & hygiene', () => {
       await harness.close(BACKGROUND_CONTEXT);
     }
   });
+
+  it('enforces shared-container bash guardrails without blocking normal repo commands', async () => {
+    const { checkSharedContainerBashCommand, isDependencyMutationCommand } = await import(
+      '../src/bash-guard.js'
+    );
+    const root = '/workspaces/sessions/abc/workspace';
+
+    expect(checkSharedContainerBashCommand('pkill -f astro', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('kill -9 1234', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('fuser -k 4321/tcp', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('npx astro dev', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('npm run build', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('astro check', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('ls ../state', root).allowed).toBe(false);
+    expect(checkSharedContainerBashCommand('cat /workspaces/sessions/other/workspace/package.json', root).allowed).toBe(false);
+
+    // Normal repo commands & git ranges must be allowed
+    expect(checkSharedContainerBashCommand('rg "Sunday" src/', root).allowed).toBe(true);
+    expect(checkSharedContainerBashCommand('git diff main..HEAD', root).allowed).toBe(true);
+    expect(checkSharedContainerBashCommand('node -e "console.log(1)"', root).allowed).toBe(true);
+
+    expect(isDependencyMutationCommand('npm install lodash')).toBe(true);
+    expect(isDependencyMutationCommand('pnpm add date-fns')).toBe(true);
+    expect(isDependencyMutationCommand('rg install src/')).toBe(false);
+  });
+
+  it('serializes builds in FIFO order, reports queue positions, and releases locks on session exit or timeout', async () => {
+    const { BuildQueueTimeoutError, FifoBuildQueue } = await import('../src/build-queue.js');
+    const q = new FifoBuildQueue(5_000);
+
+    const l1 = await q.acquire('s1');
+    expect(q.getStatus().activeSessionId).toBe('s1');
+
+    const positionsS2: number[] = [];
+    const positionsS3: number[] = [];
+    const p2 = q.acquire('s2', { onQueued: (p) => positionsS2.push(p) });
+    const p3 = q.acquire('s3', { onQueued: (p) => positionsS3.push(p) });
+
+    expect(positionsS2).toEqual([1]);
+    expect(positionsS3).toEqual([2]);
+    expect(q.getStatus().queueLength).toBe(2);
+
+    // Releasing s1 advances s2 and updates s3's position to 1
+    l1.release();
+    const l2 = await p2;
+    expect(q.getStatus().activeSessionId).toBe('s2');
+    expect(positionsS3).toEqual([2, 1]);
+
+    // Simulating crash of s2 releases s2's lock and advances s3
+    q.releaseBySession('s2');
+    const l3 = await p3;
+    expect(q.getStatus().activeSessionId).toBe('s3');
+
+    // Timeout while s3 holds lock
+    await expect(q.acquire('s4', { timeoutMs: 40 })).rejects.toBeInstanceOf(BuildQueueTimeoutError);
+    l3.release();
+    expect(q.getStatus().activeSessionId).toBeNull();
+    void l2;
+  });
+
+  it('detaches hardlinked node_modules on copy-on-change before package manager mutations', async () => {
+    const { detachHardlinkedNodeModules, readNodeModulesMeta, writeNodeModulesMeta } = await import(
+      '../src/nm-cache.js'
+    );
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-nm-detach-'));
+    try {
+      const wsDir = path.join(tmp, 'workspace');
+      const stateDir = path.join(tmp, 'state');
+      await fs.mkdir(path.join(wsDir, 'node_modules/pkg'), { recursive: true });
+      await fs.writeFile(path.join(wsDir, 'package.json'), '{"name":"t"}');
+      await fs.writeFile(path.join(wsDir, 'node_modules/pkg/index.js'), 'export default 1;');
+      await writeNodeModulesMeta(stateDir, { mode: 'hardlinked', hash: 'abc123' });
+
+      const detached = await detachHardlinkedNodeModules(wsDir, stateDir);
+      expect(detached).toBe(true);
+      const exists = await fs.access(path.join(wsDir, 'node_modules')).then(() => true).catch(() => false);
+      expect(exists).toBe(false);
+      expect((await readNodeModulesMeta(stateDir))?.mode).toBe('detached');
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 

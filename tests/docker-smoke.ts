@@ -65,7 +65,7 @@ function startFakeAnthropicOnAllInterfaces(port: number): Promise<http.Server> {
     emit('content_block_delta', {
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'text_delta', text: 'Docker smoke Pi turn succeeded!' },
+      delta: { type: 'text_delta', text: '2-container Docker smoke Pi turn succeeded!' },
     });
     emit('content_block_stop', { type: 'content_block_stop', index: 0 });
     emit('message_delta', {
@@ -82,7 +82,7 @@ function startFakeAnthropicOnAllInterfaces(port: number): Promise<http.Server> {
   });
 }
 
-async function createMinimalAstroSiteWithLockfile(dir: string): Promise<void> {
+async function createMinimalAstroSite(dir: string): Promise<void> {
   await fs.mkdir(path.join(dir, 'src/pages'), { recursive: true });
   await fs.writeFile(
     path.join(dir, 'package.json'),
@@ -114,7 +114,7 @@ export default defineConfig({ base: '/docker-site' });
   <body>
     <main>
       <h1>Docker Workspace Alive — Em Dash Check</h1>
-      <p>Static copy inside ephemeral workspace container.</p>
+      <p>Static copy inside shared workspaces container.</p>
     </main>
   </body>
 </html>
@@ -132,26 +132,27 @@ export default defineConfig({ base: '/docker-site' });
 async function main() {
   const netName = `halley-smoke-net-${process.pid}`;
   const cpName = `halley-cp-smoke-${process.pid}`;
+  const wsName = `halley-ws-smoke-${process.pid}`;
   const dataVol = `halley-data-smoke-${process.pid}`;
+  const wsVol = `halley-ws-vol-smoke-${process.pid}`;
+  const hostSecret = `smoke-secret-${process.pid}`;
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-docker-smoke-'));
   const repoDir = path.join(tmp, 'site-repo');
-  let sessionId = '';
-  let dupSessionId = '';
   let anthropicServer: http.Server | null = null;
 
   try {
     console.log('[docker-smoke] 1. Creating fixture Astro git repo…');
-    await createMinimalAstroSiteWithLockfile(repoDir);
+    await createMinimalAstroSite(repoDir);
 
     const fakeLlmPort = await getFreePort();
     const hostPort = await getFreePort();
     anthropicServer = await startFakeAnthropicOnAllInterfaces(fakeLlmPort);
 
-    console.log(`[docker-smoke] 2. Creating network ${netName} & data volume ${dataVol}…`);
+    console.log(`[docker-smoke] 2. Creating network ${netName} & volumes (${dataVol}, ${wsVol})…`);
     await run('docker', ['network', 'create', netName]);
     await run('docker', ['volume', 'create', dataVol]);
+    await run('docker', ['volume', 'create', wsVol]);
 
-    // Inspect gateway IP of the custom bridge network so control-plane container can reach fake Anthropic on host
     const gatewayIp = await run('docker', [
       'network',
       'inspect',
@@ -160,8 +161,36 @@ async function main() {
       '{{(index .IPAM.Config 0).Gateway}}',
     ]);
 
-    // Ensure workspace entry script supports npm install when no lockfile is present
-    console.log('[docker-smoke] 3. Starting halley-control-plane container (auto-network + docker.sock)…');
+    console.log('[docker-smoke] 3a. Starting halley-workspace container (unprivileged, zero secrets, zero docker.sock)…');
+    await run('docker', [
+      'run',
+      '-d',
+      '--name',
+      wsName,
+      '--network',
+      netName,
+      '-v',
+      `${wsVol}:/workspaces`,
+      '-e',
+      'WORKSPACES_DIR=/workspaces',
+      '-e',
+      'SUPERVISOR_PORT=4000',
+      '-e',
+      `CONTROL_PLANE_INTERNAL_URL=http://${cpName}:3000`,
+      '-e',
+      `WORKSPACE_HOST_SECRET=${hostSecret}`,
+      '-e',
+      'HALLEY_REPO=smoke/site',
+      '-e',
+      'HALLEY_BASE_BRANCH=main',
+      '-e',
+      'HALLEY_WARM_POOL_SIZE=0',
+      '-e',
+      'MAX_ACTIVE_WORKSPACES=5',
+      'halley-workspace:ci-smoke',
+    ]);
+
+    console.log('[docker-smoke] 3b. Starting halley-control-plane container (zero docker.sock)…');
     await run('docker', [
       'run',
       '-d',
@@ -173,13 +202,10 @@ async function main() {
       `127.0.0.1:${hostPort}:3000`,
       '-v',
       `${dataVol}:/data`,
-      '-v',
-      '/var/run/docker.sock:/var/run/docker.sock',
       '-e',
-      'WORKSPACE_DRIVER=docker',
+      `WORKSPACE_HOST_URL=http://${wsName}:4000`,
       '-e',
-      'WORKSPACE_IMAGE=halley-workspace:ci-smoke',
-      // Deliberately OMIT WORKSPACE_DOCKER_NETWORK to verify auto-detection of netName!
+      `WORKSPACE_HOST_SECRET=${hostSecret}`,
       '-e',
       `CONTROL_PLANE_INTERNAL_URL=http://${cpName}:3000`,
       '-e',
@@ -201,11 +227,11 @@ async function main() {
       'halley-control-plane:ci-smoke',
     ]);
 
-    // Copy fixture git repo into control-plane container at /tmp/fixture-repo
+    // Copy fixture git repo into control-plane ONLY (workspaces must clone via internal HTTP mirror!)
     await run('docker', ['cp', repoDir, `${cpName}:/tmp/fixture-repo`]);
 
     const cpUrl = `http://127.0.0.1:${hostPort}`;
-    const deadline = Date.now() + 20_000;
+    const deadline = Date.now() + 25_000;
     while (Date.now() < deadline) {
       try {
         const res = await fetch(`${cpUrl}/api/health`);
@@ -216,17 +242,27 @@ async function main() {
       await new Promise((r) => setTimeout(r, 300));
     }
 
-    console.log('[docker-smoke] 4. Checking /api/health/doctor preflight…');
+    console.log('[docker-smoke] 4. Checking /api/health/doctor (protocol handshake + disk usage)…');
     const docRes = await fetch(`${cpUrl}/api/health/doctor`);
-    const docJson = (await docRes.json()) as { ok: boolean; errors: string[]; details: { dataDirMounted?: boolean } };
+    const docJson = (await docRes.json()) as {
+      ok: boolean;
+      errors: string[];
+      details: { supervisor?: { protocolVersion?: number; diskUsage?: { usedPercent?: number } } };
+    };
     if (!docJson.ok) {
       throw new Error(`Doctor check failed: ${JSON.stringify(docJson)}`);
     }
-    if (!docJson.details.dataDirMounted) {
-      throw new Error(`Expected dataDirMounted=true in doctor report: ${JSON.stringify(docJson)}`);
+    if (!docJson.details.supervisor?.protocolVersion) {
+      throw new Error(`Expected supervisor protocolVersion in doctor report: ${JSON.stringify(docJson)}`);
     }
 
-    console.log('[docker-smoke] 5. Logging in and creating Docker-backed session…');
+    console.log('[docker-smoke] 5. Verifying workspaces PID 1 dropped privileges to `node`…');
+    const pid1Owner = await run('docker', ['exec', wsName, 'stat', '-c', '%U', '/proc/1']);
+    if (pid1Owner !== 'node') {
+      throw new Error(`Expected PID 1 inside workspaces container to run as 'node', got '${pid1Owner}'`);
+    }
+
+    console.log('[docker-smoke] 6. Logging in and creating session (cloning via internal Git HTTP mirror)…');
     const loginRes = await fetch(`${cpUrl}/api/auth/dev-login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -238,13 +274,13 @@ async function main() {
     const createRes = await fetch(`${cpUrl}/api/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: cookie },
-      body: JSON.stringify({ title: 'Docker Smoke Session' }),
+      body: JSON.stringify({ title: '2-Container Smoke Session' }),
     });
     if (!createRes.ok) throw new Error(`Create session failed: ${createRes.status}`);
     const { session } = (await createRes.json()) as { session: { id: string } };
-    sessionId = session.id;
+    const sessionId = session.id;
 
-    console.log(`[docker-smoke] 6. Waiting for halley-ws-${sessionId.slice(0, 12)} container & Astro dev preview…`);
+    console.log(`[docker-smoke] 7. Waiting for session ${sessionId.slice(0, 8)} Astro preview…`);
     let previewHtml = '';
     const bootDeadline = Date.now() + 120_000;
     while (Date.now() < bootDeadline) {
@@ -263,7 +299,7 @@ async function main() {
           break;
         }
         if (prevRes.status === 403 || text.includes('Blocked request')) {
-          throw new Error(`Vite allowedHosts blocked Docker preview request: ${text}`);
+          throw new Error(`Vite allowedHosts blocked preview request: ${text}`);
         }
       }
       await new Promise((r) => setTimeout(r, 1500));
@@ -271,26 +307,19 @@ async function main() {
 
     if (!previewHtml.includes('Docker Workspace Alive')) {
       const cpLogs = await run('docker', ['logs', cpName]).catch(() => '');
-      const wsLogs = await run('docker', ['logs', `halley-ws-${sessionId.slice(0, 12)}`]).catch(() => '');
-      throw new Error(`Timed out waiting for Docker preview.\nCP logs:\n${cpLogs}\nWS logs:\n${wsLogs}`);
+      const wsLogs = await run('docker', ['logs', wsName]).catch(() => '');
+      throw new Error(`Timed out waiting for preview.\nCP logs:\n${cpLogs}\nWS logs:\n${wsLogs}`);
     }
-    console.log('[docker-smoke] 7. Verified live preview HTML via preview-proxy (no Vite host block)!');
+    console.log('[docker-smoke] 8. Verified live preview HTML + /@vite/client + AST /__editor/inspect!');
 
-    console.log('[docker-smoke] 7b. Verifying root /@vite/client module proxy returns JavaScript (not text/html)…');
     const viteClientRes = await fetch(`${cpUrl}/@vite/client`, {
-      headers: {
-        Cookie: cookie,
-        Referer: `${cpUrl}/p/${sessionId}/docker-site/`,
-      },
+      headers: { Cookie: cookie, Referer: `${cpUrl}/p/${sessionId}/docker-site/` },
     });
     const viteClientCt = viteClientRes.headers.get('content-type') || '';
     if (!viteClientRes.ok || !viteClientCt.includes('javascript')) {
-      throw new Error(
-        `Expected /@vite/client with preview Referer to return JS, got status=${viteClientRes.status} content-type=${viteClientCt}`,
-      );
+      throw new Error(`Expected /@vite/client JS, got status=${viteClientRes.status} ct=${viteClientCt}`);
     }
 
-    console.log('[docker-smoke] 8. Verifying AST /__editor/inspect inside Docker workspace…');
     const inspectRes = await fetch(`${cpUrl}/p/${sessionId}/docker-site/__editor/inspect`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: cookie },
@@ -301,48 +330,7 @@ async function main() {
       throw new Error(`Expected p at 7:7 to be editable-static, got: ${JSON.stringify(inspectJson)}`);
     }
 
-    console.log('[docker-smoke] 9. Verifying shared Chromium POST /internal/screenshot in control-plane against workspace container…');
-    const wsEnvLines = (
-      await run('docker', [
-        'inspect',
-        `halley-ws-${sessionId.slice(0, 12)}`,
-        '--format',
-        '{{range .Config.Env}}{{println .}}{{end}}',
-      ])
-    ).split(/\r?\n/);
-    const wsTokenLine = wsEnvLines.find((l) => l.startsWith('WORKSPACE_TOKEN='));
-    const wsToken = wsTokenLine ? wsTokenLine.slice('WORKSPACE_TOKEN='.length) : '';
-    if (!wsToken) {
-      throw new Error('Failed to extract WORKSPACE_TOKEN from workspace container env');
-    }
-
-    const shotRes = await fetch(`${cpUrl}/internal/screenshot`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${wsToken}`,
-      },
-      body: JSON.stringify({ route: '/', viewport: 'desktop' }),
-    });
-    if (!shotRes.ok) {
-      throw new Error(`POST /internal/screenshot failed (${shotRes.status}): ${await shotRes.text()}`);
-    }
-    if (shotRes.headers.get('content-type') !== 'image/jpeg') {
-      throw new Error(`Expected image/jpeg from /internal/screenshot, got ${shotRes.headers.get('content-type')}`);
-    }
-    const shotBytes = Buffer.from(await shotRes.arrayBuffer());
-    if (shotBytes.length < 100 || shotBytes[0] !== 0xff || shotBytes[1] !== 0xd8 || shotBytes[2] !== 0xff) {
-      throw new Error(`Expected valid JPEG bytes from /internal/screenshot, got ${shotBytes.length} bytes`);
-    }
-
-    console.log('[docker-smoke] 10. Verifying privilege drop to `node`, duplicateWorkspace, and legacy UID 1001 volume self-healing…');
-    const wsContainer = `halley-ws-${sessionId.slice(0, 12)}`;
-    const pid1Owner = await run('docker', ['exec', wsContainer, 'stat', '-c', '%U', '/proc/1']);
-    if (pid1Owner !== 'node') {
-      throw new Error(`Expected PID 1 inside workspace container to run as unprivileged 'node', got '${pid1Owner}'`);
-    }
-
-    // 10a. Duplicate workspace and verify duplicated volume boots cleanly without ERR_SQLITE_ERROR
+    console.log('[docker-smoke] 9. Verifying session duplication inside shared workspaces container…');
     const dupRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/duplicate`, {
       method: 'POST',
       headers: { Cookie: cookie },
@@ -351,11 +339,10 @@ async function main() {
       throw new Error(`Duplicate session failed (${dupRes.status}): ${await dupRes.text()}`);
     }
     const { session: dupSession } = (await dupRes.json()) as { session: { id: string } };
-    dupSessionId = dupSession.id;
     const dupDeadline = Date.now() + 90_000;
     let dupReady = false;
     while (Date.now() < dupDeadline) {
-      const dsRes = await fetch(`${cpUrl}/api/sessions/${dupSessionId}`, { headers: { Cookie: cookie } });
+      const dsRes = await fetch(`${cpUrl}/api/sessions/${dupSession.id}`, { headers: { Cookie: cookie } });
       const dsData = (await dsRes.json()) as { session: { status: string; bootProgress?: { detail?: string } } };
       if (dsData.session.status === 'error') {
         throw new Error(`Duplicated session entered error state: ${JSON.stringify(dsData.session.bootProgress)}`);
@@ -367,61 +354,52 @@ async function main() {
       await new Promise((r) => setTimeout(r, 1000));
     }
     if (!dupReady) {
-      throw new Error('Timed out waiting for duplicated session workspace to become ready');
+      throw new Error('Timed out waiting for duplicated session to boot');
     }
 
-    // 10b. Simulate legacy UID 1001 (pwuser) + read-only mode bits on /halley-volume/state & pi.sqlite, then wake
-    await run('docker', ['rm', '-f', wsContainer]);
-    await run('docker', [
-      'run',
-      '--rm',
-      '--entrypoint',
-      'sh',
-      '-v',
-      `halley-ws-${sessionId}:/halley-volume`,
-      'halley-workspace:ci-smoke',
-      '-c',
-      'chown -R 1001:1001 /halley-volume && chmod 0755 /halley-volume/state && chmod 0444 /halley-volume/state/pi.sqlite',
-    ]);
+    console.log('[docker-smoke] 10. Restarting workspaces container and verifying state reconciliation + lazy wake…');
+    await run('docker', ['restart', wsName]);
+    // Wait for doctor to report healthy again (which reconciles DB sessions to sleeping)
+    const reconDeadline = Date.now() + 20_000;
+    while (Date.now() < reconDeadline) {
+      const r = await fetch(`${cpUrl}/api/health/doctor`);
+      if (r.ok) break;
+      await new Promise((r2) => setTimeout(r2, 400));
+    }
+    const afterRestartRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
+    const afterRestart = (await afterRestartRes.json()) as { session: { status: string } };
+    if (afterRestart.session.status !== 'sleeping') {
+      throw new Error(`Expected session to reconcile to 'sleeping' after workspaces restart, got '${afterRestart.session.status}'`);
+    }
 
     const wakeRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/wake`, {
       method: 'POST',
       headers: { Cookie: cookie },
     });
-    if (!wakeRes.ok) {
-      throw new Error(`Wake after UID 1001 simulation failed (${wakeRes.status}): ${await wakeRes.text()}`);
-    }
+    if (!wakeRes.ok) throw new Error(`Wake failed: ${wakeRes.status}`);
     const wakeDeadline = Date.now() + 90_000;
-    let wokeCleanly = false;
+    let woke = false;
     while (Date.now() < wakeDeadline) {
-      const wsRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
-      const wsData = (await wsRes.json()) as { session: { status: string; bootProgress?: { detail?: string } } };
-      if (wsData.session.status === 'error') {
-        throw new Error(`Woken legacy-UID session failed (ERR_SQLITE_ERROR regression): ${JSON.stringify(wsData.session.bootProgress)}`);
+      const wRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
+      const wData = (await wRes.json()) as { session: { status: string; publishError?: string } };
+      if (wData.session.status === 'error') {
+        throw new Error(`Woken session failed: ${wData.session.publishError}`);
       }
-      if (wsData.session.status === 'running') {
-        wokeCleanly = true;
+      if (wData.session.status === 'running') {
+        woke = true;
         break;
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    if (!wokeCleanly) {
-      throw new Error('Timed out waiting for legacy-UID session to self-heal and wake');
-    }
+    if (!woke) throw new Error('Timed out waiting for session to wake after workspaces restart');
 
-    console.log('[docker-smoke] SUCCESS — Docker-in-Docker orchestration verified end-to-end!');
+    console.log('[docker-smoke] SUCCESS — 2-container stack (zero docker.sock) verified end-to-end!');
   } finally {
     anthropicServer?.close();
-    if (dupSessionId) {
-      await run('docker', ['rm', '-f', `halley-ws-${dupSessionId.slice(0, 12)}`]).catch(() => {});
-      await run('docker', ['volume', 'rm', '-f', `halley-ws-${dupSessionId}`]).catch(() => {});
-    }
-    if (sessionId) {
-      await run('docker', ['rm', '-f', `halley-ws-${sessionId.slice(0, 12)}`]).catch(() => {});
-      await run('docker', ['volume', 'rm', '-f', `halley-ws-${sessionId}`]).catch(() => {});
-    }
     await run('docker', ['rm', '-f', cpName]).catch(() => {});
+    await run('docker', ['rm', '-f', wsName]).catch(() => {});
     await run('docker', ['volume', 'rm', '-f', dataVol]).catch(() => {});
+    await run('docker', ['volume', 'rm', '-f', wsVol]).catch(() => {});
     await run('docker', ['network', 'rm', netName]).catch(() => {});
     await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
   }

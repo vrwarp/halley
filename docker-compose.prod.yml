@@ -1,26 +1,51 @@
 # Ready-to-run production / Synology NAS Compose file using prebuilt Docker Hub images.
+# Two static containers on an isolated bridge network — zero /var/run/docker.sock required.
 # Usage:
 #   1. Copy .env.example to .env and fill in secrets
 #   2. docker compose -f docker-compose.prod.yml up -d
-#      (halley-control-plane automatically pulls vrwarp/halley-workspace:latest on first session)
 services:
   control-plane:
-    image: vrwarp/halley-control-plane:latest
+    image: vrwarp/halley-control-plane:${HALLEY_TAG:-latest}
     ports:
       - "${HOST_PORT:-3000}:3000"
     env_file:
       - .env
     environment:
       - CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000
+      - WORKSPACE_HOST_URL=http://workspaces:4000
     volumes:
       - halley-data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - halley-net
+    depends_on:
+      - workspaces
+    restart: unless-stopped
+
+  workspaces:
+    image: vrwarp/halley-workspace:${HALLEY_TAG:-latest}
+    mem_limit: ${WORKSPACES_MEMORY_LIMIT:-6g}
+    environment:
+      - WORKSPACES_DIR=/workspaces
+      - SUPERVISOR_PORT=4000
+      - CONTROL_PLANE_INTERNAL_URL=http://control-plane:3000
+      - WORKSPACE_HOST_SECRET=${WORKSPACE_HOST_SECRET:-}
+      - HALLEY_REPO=${HALLEY_REPO:-vrwarp/thecrossing.website}
+      - HALLEY_BASE_BRANCH=${HALLEY_BASE_BRANCH:-main}
+      - HALLEY_MODEL_ID=${HALLEY_MODEL_ID:-haiku-latest}
+      - HALLEY_THINKING_LEVEL=${HALLEY_THINKING_LEVEL:-high}
+      - HALLEY_GIT_BOT_NAME=${HALLEY_GIT_BOT_NAME:-Halley Bot}
+      - HALLEY_GIT_BOT_EMAIL=${HALLEY_GIT_BOT_EMAIL:-halley-bot@users.noreply.github.com}
+      - HALLEY_WARM_POOL_SIZE=${HALLEY_WARM_POOL_SIZE:-1}
+      - MAX_ACTIVE_WORKSPACES=${MAX_ACTIVE_WORKSPACES:-5}
+    volumes:
+      - halley-workspaces:/workspaces
     networks:
       - halley-net
     restart: unless-stopped
 
 volumes:
   halley-data:
+  halley-workspaces:
 
 networks:
   halley-net:

@@ -43,7 +43,7 @@ jobs:
         run: pnpm test:e2e
 
   docker-smoke:
-    name: Docker-in-Docker Orchestration Smoke Test
+    name: 2-Container Docker Smoke Test
     runs-on: ubuntu-24.04
     timeout-minutes: 25
 
@@ -86,5 +86,5 @@ jobs:
           cache-from: type=gha,scope=halley-workspace
           cache-to: type=gha,mode=max,scope=halley-workspace
 
-      - name: Run Docker-out-of-Docker smoke test
+      - name: Run 2-container Docker smoke test
         run: pnpm test:docker-smoke

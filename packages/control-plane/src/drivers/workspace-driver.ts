@@ -166,6 +166,13 @@ export class CrashLoopTracker {
   }
 }
 
+export interface DoctorCheckResult {
+  ok: boolean;
+  warnings: string[];
+  errors: string[];
+  details: Record<string, unknown>;
+}
+
 export interface WorkspaceDriver {
   setRawWorkspaceToken?(sessionId: string, token: string): void;
   ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint>;
@@ -183,10 +190,14 @@ export interface WorkspaceDriver {
   setBootProgressListener?(listener: BootProgressListener): void;
   getBootProgress?(sessionId: string): BootProgressDto | null;
   getCrashInfo?(sessionId: string): WorkspaceCrashInfo | null;
+  getSessionLogs?(sessionId: string): Promise<string[]>;
+  runDoctorChecks?(): Promise<DoctorCheckResult>;
+  reconcileSessions?(): Promise<void>;
   startWarmPool?(): void;
   stopWarmPool?(): Promise<void>;
-  reserveWarmWorkspace?(): WarmReservation | null;
+  reserveWarmWorkspace?(): Promise<WarmReservation | null> | WarmReservation | null;
   getWarmPoolStatus?(): WarmPoolStatus;
+  close?(): Promise<void>;
 }
 
 /**
@@ -238,6 +249,7 @@ export async function ensureBareMirror(
   repoSlug: string,
   token?: string,
   localSourcePath?: string,
+  baseBranch = 'main',
 ): Promise<string> {
   const remoteUrl = localSourcePath
     ? localSourcePath
@@ -256,10 +268,17 @@ export async function ensureBareMirror(
   };
 
   if (!exists) {
-    await fs.mkdir(path.dirname(mirrorDir), { recursive: true });
-    await runWithAuth(['clone', '--mirror', remoteUrl, mirrorDir], path.dirname(mirrorDir));
+    await fs.mkdir(mirrorDir, { recursive: true });
+    await runGit(mirrorDir, ['init', '--bare']);
+    await runGit(mirrorDir, ['remote', 'add', 'origin', remoteUrl]);
   } else {
-    await runWithAuth(['remote', 'update', '--prune'], mirrorDir);
+    await runGit(mirrorDir, ['remote', 'set-url', 'origin', remoteUrl]).catch(() => {});
   }
+
+  await runWithAuth(
+    ['fetch', 'origin', `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`],
+    mirrorDir,
+  );
+  await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});
   return mirrorDir;
 }
