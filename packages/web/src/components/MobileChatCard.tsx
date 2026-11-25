@@ -225,7 +225,7 @@ export function MobileChatCard({
     <div
       role="dialog"
       aria-label="Halley chat"
-      aria-hidden={!open}
+      inert={!open || undefined}
       onPointerDown={(e) => e.stopPropagation()}
       style={{
         width: 'min(92vw, 360px)',
@@ -259,7 +259,10 @@ export function MobileChatCard({
           </button>
           <button
             type="button"
-            onClick={onClose}
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onClose();
+            }}
             aria-label="Close chat card"
             className="flex h-7 w-7 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-200/60 hover:text-stone-900"
           >
