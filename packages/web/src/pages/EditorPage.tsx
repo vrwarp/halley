@@ -313,6 +313,13 @@ export function EditorPage({
     setBootProgress(null);
     setPreviewPaused({ paused: false });
     void loadSessionMeta();
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!session) return;
+    if (session.status !== 'running' && session.status !== 'published' && session.status !== 'merged') {
+      return;
+    }
     api
       .getTranscript(sessionId)
       .then((t) => {
@@ -320,7 +327,7 @@ export function EditorPage({
         if (t.volumeExpired) setVolumeExpired(true);
       })
       .catch(() => {});
-  }, [sessionId]);
+  }, [sessionId, session?.status]);
 
   useEffect(() => {
     if (!session) return;

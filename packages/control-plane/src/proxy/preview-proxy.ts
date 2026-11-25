@@ -203,6 +203,16 @@ export function createPreviewProxy(
           resHeaders.set(k, v);
         }
       }
+      if (c.req.path.startsWith('/p/')) {
+        const cookieHeader = c.req.header('cookie') || '';
+        const existingCookie = cookieHeader.match(/(?:^|;\s*)halley_preview_session=([^;]+)/)?.[1];
+        if (existingCookie !== sessionId) {
+          resHeaders.append(
+            'set-cookie',
+            `halley_preview_session=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax`,
+          );
+        }
+      }
       return new Response(Readable.toWeb(upstream) as ReadableStream, {
         status: upstream.statusCode ?? 200,
         headers: resHeaders,
