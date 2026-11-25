@@ -1040,13 +1040,15 @@ export class HalleyPiRuntime {
         .map((b) => b.text)
         .join('') ?? undefined;
 
-    const activeTools = (liveDoc?.tools ?? []).map((t) => ({
-      callId: t.callId,
-      name: t.name,
-      summary: t.name,
-      output: t.output?.slice(0, 600),
-      status: t.status as LiveRunStateDto['activeTools'][number]['status'],
-    }));
+    const activeTools = (liveDoc?.tools ?? [])
+      .filter((t) => t.status !== 'done' && t.status !== 'error')
+      .map((t) => ({
+        callId: t.callId,
+        name: t.name,
+        summary: t.name,
+        output: t.output?.slice(0, 600),
+        status: t.status as LiveRunStateDto['activeTools'][number]['status'],
+      }));
 
     const usageDoc = value.docs['pi.usage'];
     let usageUsd = 0;

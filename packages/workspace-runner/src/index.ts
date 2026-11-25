@@ -355,8 +355,14 @@ async function main() {
     return c.json({ ok: true, persona });
   });
 
+  let routesInflight: Promise<Awaited<ReturnType<typeof discoverSiteRoutes>>> | null = null;
   app.get('/internal/routes', async (c) => {
-    const routes = await discoverSiteRoutes(REPO_ROOT);
+    if (!routesInflight) {
+      routesInflight = discoverSiteRoutes(REPO_ROOT).finally(() => {
+        routesInflight = null;
+      });
+    }
+    const routes = await routesInflight;
     return c.json({ routes });
   });
 

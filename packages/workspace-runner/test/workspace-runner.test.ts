@@ -617,6 +617,23 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('runShell kills entire process group on timeout and resolves promptly even when grandchildren hold stdout open', async () => {
+    const { runShell } = await import('../src/verify.js');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-runshell-'));
+    try {
+      const t0 = Date.now();
+      // Spawn a background grandchild that inherits stdout and sleeps 30s, then wait
+      const res = await runShell(tmp, 'sleep 30 & wait', 400);
+      const elapsed = Date.now() - t0;
+      expect(res.passed).toBe(false);
+      expect(res.output).toContain('[Timed out');
+      // Must resolve within a few seconds rather than hanging 30s waiting on the grandchild
+      expect(elapsed).toBeLessThan(5_000);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 
