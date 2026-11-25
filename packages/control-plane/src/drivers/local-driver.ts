@@ -360,6 +360,15 @@ export class LocalWorkspaceDriver implements WorkspaceDriver {
     const srcWs = path.join(srcBase, 'workspace');
     const dstWs = path.join(dstBase, 'workspace');
 
+    const hasSrcRepo = await fs
+      .access(path.join(srcWs, '.git'))
+      .then(() => true)
+      .catch(() => false);
+    if (!hasSrcRepo) {
+      // Source workspace hasn't finished cloning yet; leave absent so ensureRunning clones cleanly
+      return;
+    }
+
     // Copy full workspace directory including dirty uncommitted files (excluding node_modules)
     await fs.cp(srcWs, dstWs, {
       recursive: true,

@@ -900,4 +900,78 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       await browser.close();
     }
   });
+
+  it('shows confirmation dialog explaining Branch off and navigates to the new instance from Editor and Dashboard', async () => {
+    const baseUrl = `http://127.0.0.1:${cpPort}`;
+    const browser = await chromium.launch({ headless: true });
+
+    let page: import('playwright').Page | null = null;
+    try {
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      page = await context.newPage();
+
+      await page.goto(baseUrl, { waitUntil: 'networkidle' });
+      await page.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
+      await page.click('button:has-text("Dev Sign In")');
+      await page.waitForSelector('input[placeholder*="Easter service times"]');
+
+      // Create source draft
+      await page.fill('input[placeholder*="Easter service times"]', 'Branch Source Draft');
+      await page.click('button:has-text("New edit")');
+
+      await page.waitForSelector('iframe', { timeout: 60_000 });
+      const frameLocator = page.frameLocator('iframe');
+      await frameLocator.locator('h1').first().waitFor({ timeout: 60_000 });
+
+      // 1. Click Branch off in Editor -> confirmation popup appears explaining what it'll do
+      await page.click('button[title="Branch off a copy of this draft"]');
+      const dialog = page.locator('[role="dialog"]');
+      await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+      await dialog.locator('text=Branch off “Branch Source Draft”?').waitFor({ timeout: 5_000 });
+      await dialog.locator('text=Copies your current progress').waitFor({ timeout: 5_000 });
+      await dialog.locator('text=Leaves this draft untouched').waitFor({ timeout: 5_000 });
+
+      // Cancel keeps us in the original instance without creating a copy
+      await dialog.locator('button:has-text("Cancel")').click();
+      await dialog.waitFor({ state: 'hidden', timeout: 5_000 });
+      await page.locator('header span:text-is("Branch Source Draft")').waitFor({ timeout: 5_000 });
+
+      // Confirm Branch off -> brings us to the new instance ("Branch Source Draft (Copy)")
+      const firstIframeSrc = await page.locator('iframe').getAttribute('src');
+      await page.click('button[title="Branch off a copy of this draft"]');
+      await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+      await dialog.locator('button:has-text("Branch off")').click();
+
+      await page.locator('header span:text-is("Branch Source Draft (Copy)")').waitFor({ timeout: 30_000 });
+      await page.waitForSelector('iframe', { timeout: 60_000 });
+      const secondIframeSrc = await page.locator('iframe').getAttribute('src');
+      expect(secondIframeSrc).not.toBe(firstIframeSrc);
+
+      // 2. Return to Dashboard -> both drafts exist; clicking Branch off on Dashboard also confirms & opens new instance
+      await page.click('button[title="Back to edits"]');
+      await page.locator('h3:text-is("Branch Source Draft")').waitFor({ timeout: 10_000 });
+      await page.locator('h3:text-is("Branch Source Draft (Copy)")').waitFor({ timeout: 10_000 });
+
+      const sourceCard = page
+        .locator('div.group')
+        .filter({ has: page.locator('h3:text-is("Branch Source Draft")') })
+        .first();
+      await sourceCard.locator('button:has-text("Branch off")').click();
+
+      await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+      await dialog.locator('text=Branch off “Branch Source Draft”?').waitFor({ timeout: 5_000 });
+      await dialog.locator('button:has-text("Branch off")').click();
+
+      await page.locator('header span:text-is("Branch Source Draft (Copy)")').waitFor({ timeout: 30_000 });
+      await page.waitForSelector('iframe', { timeout: 60_000 });
+      const thirdIframeSrc = await page.locator('iframe').getAttribute('src');
+      expect(thirdIframeSrc).not.toBe(firstIframeSrc);
+      expect(thirdIframeSrc).not.toBe(secondIframeSrc);
+    } catch (err) {
+      console.error('=== BRANCH OFF E2E CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      throw err;
+    } finally {
+      await browser.close();
+    }
+  });
 });
