@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { BranchOffModal } from '../components/BranchOffModal.js';
 
 interface Props {
   user: UserDto;
@@ -115,6 +116,9 @@ export function DashboardPage({
   const [undoError, setUndoError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<EditorSessionDto | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [branchTarget, setBranchTarget] = useState<EditorSessionDto | null>(null);
+  const [branchingOff, setBranchingOff] = useState(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
 
   const isFinished = (s: EditorSessionDto) => s.status === 'published' || s.status === 'merged';
   const myDrafts = sessions.filter((s) => s.isOwner && !isFinished(s));
@@ -152,6 +156,26 @@ export function DashboardPage({
   const handleDuplicate = async (id: string) => {
     const { session } = await api.duplicateSession(id);
     onOpenSession(session.id);
+  };
+
+  const handleBranchOff = (s: EditorSessionDto) => {
+    setBranchError(null);
+    setBranchTarget(s);
+  };
+
+  const handleConfirmBranchOff = async () => {
+    if (!branchTarget || branchingOff) return;
+    setBranchingOff(true);
+    setBranchError(null);
+    try {
+      const { session } = await api.duplicateSession(branchTarget.id);
+      setBranchTarget(null);
+      onOpenSession(session.id);
+    } catch (err) {
+      setBranchError(err instanceof Error ? err.message : 'Could not branch off draft');
+    } finally {
+      setBranchingOff(false);
+    }
   };
 
   const handleDelete = (s: EditorSessionDto) => {
@@ -355,7 +379,7 @@ export function DashboardPage({
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={() => void handleDuplicate(s.id)}
+                            onClick={() => handleBranchOff(s)}
                             title="Branch off a copy of this draft"
                             className="inline-flex items-center gap-1 rounded-lg border border-stone-200 px-2 py-1 text-[11px] font-medium text-stone-600 hover:bg-stone-50"
                           >
@@ -607,6 +631,21 @@ export function DashboardPage({
             </div>
           </div>
         </div>
+      )}
+
+      {branchTarget && (
+        <BranchOffModal
+          draftTitle={branchTarget.title}
+          busy={branchingOff}
+          error={branchError}
+          onCancel={() => {
+            if (!branchingOff) {
+              setBranchTarget(null);
+              setBranchError(null);
+            }
+          }}
+          onConfirm={() => void handleConfirmBranchOff()}
+        />
       )}
     </div>
   );

@@ -47,6 +47,7 @@ import { elementKey, friendlyElementKind } from '@halley/shared';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { api, type PriorThreadDto } from '../api.js';
 import { flyToChip } from '../components/attachFlight.js';
+import { BranchOffModal } from '../components/BranchOffModal.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
 import { ConflictCards } from '../components/ConflictCards.js';
 import { DebugTraceDrawer } from '../components/DebugTraceDrawer.js';
@@ -202,6 +203,9 @@ export function EditorPage({
   const [showUndoPubModal, setShowUndoPubModal] = useState(false);
   const [undoPubReason, setUndoPubReason] = useState('');
   const [undoPubBusy, setUndoPubBusy] = useState(false);
+  const [showBranchOffModal, setShowBranchOffModal] = useState(false);
+  const [branchOffBusy, setBranchOffBusy] = useState(false);
+  const [branchOffError, setBranchOffError] = useState<string | null>(null);
 
   const [input, setInput] = useState('');
   const [chips, setChips] = useState<ElementContext[]>([]);
@@ -1005,6 +1009,21 @@ export function EditorPage({
     }
   };
 
+  const handleConfirmBranchOff = async () => {
+    if (branchOffBusy) return;
+    setBranchOffBusy(true);
+    setBranchOffError(null);
+    try {
+      const { session: dup } = await api.duplicateSession(session.id);
+      setShowBranchOffModal(false);
+      onOpenSession(dup.id);
+    } catch (err) {
+      setBranchOffError(err instanceof Error ? err.message : 'Could not branch off draft');
+    } finally {
+      setBranchOffBusy(false);
+    }
+  };
+
   return (
     <div className="flex h-dvh flex-col bg-[#FAF9F7]">
       {isMobile ? (
@@ -1225,15 +1244,16 @@ export function EditorPage({
 
               <button
                 type="button"
-                onClick={async () => {
-                  const { session: dup } = await api.duplicateSession(session.id);
-                  onOpenSession(dup.id);
+                onClick={() => {
+                  setBranchOffError(null);
+                  setShowBranchOffModal(true);
                 }}
                 title="Branch off a copy of this draft"
-                className="hidden lg:inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50"
+                aria-label="Branch off a copy of this draft"
+                className="inline-flex items-center gap-1 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-600 hover:bg-stone-50"
               >
                 <GitBranch className="h-3.5 w-3.5" />
-                Branch off
+                <span className="hidden lg:inline">Branch off</span>
               </button>
 
               <div className="relative flex items-center">
@@ -2121,7 +2141,7 @@ export function EditorPage({
       )}
 
       {/* Mobile Floating Chat Bubble + Compact Card (< 640px) */}
-      {isMobile && !isWorkspaceBooting && !mobileChatOpen && !previewSelectionActive && !mobileSheet && !showPublish && !showNewPageModal && !showDebug && (
+      {isMobile && !isWorkspaceBooting && !mobileChatOpen && !previewSelectionActive && !mobileSheet && !showPublish && !showNewPageModal && !showDebug && !showBranchOffModal && !showUndoPubModal && (
         <MobileChatBubble
           pos={mobileBubblePos}
           onChangePos={setMobileBubblePos}
@@ -2539,10 +2559,10 @@ export function EditorPage({
                   </button>
                   <button
                     type="button"
-                    onClick={async () => {
+                    onClick={() => {
                       setMobileSheet(null);
-                      const { session: dup } = await api.duplicateSession(session.id);
-                      onOpenSession(dup.id);
+                      setBranchOffError(null);
+                      setShowBranchOffModal(true);
                     }}
                     className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
                   >
@@ -2780,6 +2800,21 @@ export function EditorPage({
           onChangedFilesUpdated={async () => {
             await loadSessionMeta();
           }}
+        />
+      )}
+
+      {showBranchOffModal && (
+        <BranchOffModal
+          draftTitle={session.title}
+          busy={branchOffBusy}
+          error={branchOffError}
+          onCancel={() => {
+            if (!branchOffBusy) {
+              setShowBranchOffModal(false);
+              setBranchOffError(null);
+            }
+          }}
+          onConfirm={() => void handleConfirmBranchOff()}
         />
       )}
 

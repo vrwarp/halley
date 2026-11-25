@@ -22,6 +22,13 @@ export function App() {
   const openSession = (id: string, opts?: { openPublish?: boolean }) => {
     setOpenPublishOnLoad(Boolean(opts?.openPublish));
     setActiveSessionId(id);
+    void api
+      .listSessions()
+      .then((list) => {
+        setSessions(list.sessions);
+        setSpend(list.spend);
+      })
+      .catch(() => {});
   };
 
   const params = new URLSearchParams(window.location.search);

@@ -1187,9 +1187,8 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
       '-c',
       [
         'mkdir -p /dst/state',
-        'cp -a /src/workspace /dst/workspace',
+        `if [ -d /src/workspace/.git ]; then cp -a /src/workspace /dst/workspace && cd /dst/workspace && git config --global --add safe.directory '*' && git checkout -B ${target.working_branch}; fi`,
         'if [ -d /src/state/uploads ]; then cp -a /src/state/uploads /dst/state/uploads; fi',
-        `cd /dst/workspace && git config --global --add safe.directory '*' && git checkout -B ${target.working_branch}`,
         'chown -R node:node /dst && chmod -R u+rwX /dst',
       ].join(' && '),
     ]);
