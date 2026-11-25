@@ -121,6 +121,63 @@ function crashLoopHtml(sessionId: string, err: WorkspaceCrashLoopError): string 
 </html>`;
 }
 
+const VITE_CLIENT_SHIM_JS = `
+const sheetsMap = new Map();
+let lastInsertedStyle;
+const cspNonce = document.querySelector('meta[property=csp-nonce]')?.nonce;
+function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    if (cspNonce) style.setAttribute('nonce', cspNonce);
+    if (!lastInsertedStyle) {
+      document.head.appendChild(style);
+      setTimeout(() => { lastInsertedStyle = undefined; }, 0);
+    } else {
+      lastInsertedStyle.insertAdjacentElement('afterend', style);
+    }
+    lastInsertedStyle = style;
+  } else {
+    style.textContent = content;
+  }
+  sheetsMap.set(id, style);
+}
+function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+function injectQuery(url, queryToInject) {
+  if (url[0] !== '.' && url[0] !== '/') return url;
+  const pathname = url.replace(/[?#].*$/, '');
+  const { search, hash } = new URL(url, 'http://vite.dev');
+  return pathname + '?' + queryToInject + (search ? '&' + search.slice(1) : '') + (hash || '');
+}
+function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+class ErrorOverlay {}
+export { ErrorOverlay, createHotContext, injectQuery, removeStyle, updateStyle };
+`.trimStart();
+
+const ASTRO_TOOLBAR_STUB_JS = 'export default {};\nexport const loadDevToolbarApps = async () => [];\n';
+
 export function createPreviewProxy(
   auth: AuthService,
   db: ControlPlaneDb,
@@ -129,6 +186,30 @@ export function createPreviewProxy(
   const handleHttpForSession = async (c: Context, sessionId: string) => {
     const user = auth.getUserFromContext(c);
     if (!user) return c.text('Unauthorized', 401);
+
+    const reqPath = new URL(c.req.url).pathname;
+    if (c.req.method === 'GET' && (reqPath === '/@vite/client' || reqPath.endsWith('/@vite/client'))) {
+      return new Response(VITE_CLIENT_SHIM_JS, {
+        status: 200,
+        headers: {
+          'content-type': 'application/javascript; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    if (
+      c.req.method === 'GET' &&
+      (reqPath.endsWith('/dev-toolbar/entrypoint.js') ||
+        reqPath.includes('__x00__astro:toolbar:internal'))
+    ) {
+      return new Response(ASTRO_TOOLBAR_STUB_JS, {
+        status: 200,
+        headers: {
+          'content-type': 'application/javascript; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
 
     const session = db.getSession(sessionId);
     if (!session) return c.text('Session not found', 404);

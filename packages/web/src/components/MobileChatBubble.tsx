@@ -73,7 +73,7 @@ export function MobileChatBubble({
 
   return (
     <div
-      aria-hidden={!visible}
+      inert={!visible || undefined}
       className={`fixed z-40 select-none transition-[transform,opacity,visibility] duration-200 ease-out ${
         visible
           ? 'visible scale-100 opacity-100'
@@ -90,6 +90,7 @@ export function MobileChatBubble({
           type="button"
           onClick={(e) => {
             e.stopPropagation();
+            e.currentTarget.blur();
             onTapToast();
           }}
           style={
@@ -156,6 +157,7 @@ export function MobileChatBubble({
             suppressClickRef.current = false;
             return;
           }
+          e.currentTarget.blur();
           onTap();
         }}
         className={`relative flex h-[54px] w-[54px] items-center justify-center rounded-full border-2 border-white/90 bg-stone-900 text-amber-400 shadow-[0_8px_24px_rgba(0,0,0,0.45),0_0_0_1px_rgba(28,25,23,0.2)] active:scale-95 transition-transform ${
