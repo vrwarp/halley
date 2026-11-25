@@ -2143,29 +2143,39 @@ export function EditorPage({
       )}
 
       {/* Mobile Floating Chat Bubble + Compact Card (< 640px) */}
-      {isMobile && !isWorkspaceBooting && !mobileChatOpen && !previewSelectionActive && !mobileSheet && !showPublish && !showNewPageModal && !showDebug && !showBranchOffModal && !showUndoPubModal && (
-        <MobileChatBubble
-          pos={mobileBubblePos}
-          onChangePos={setMobileBubblePos}
-          onTap={() => {
-            setMobileCompletionToast(null);
-            setMobileChatOpen(true);
-          }}
-          busy={live.busy}
-          chipCount={chips.length}
-          needsAttention={needsMobileAttention}
-          entryPulse={entries.length === 0 && !live.busy}
-          completionToast={mobileCompletionToast}
-          onTapToast={() => {
-            setMobileCompletionToast(null);
-            setMobileChatOpen(true);
-          }}
-        />
-      )}
+      {isMobile && !isWorkspaceBooting && (
+        <>
+          <MobileChatBubble
+            visible={
+              !mobileChatOpen &&
+              !previewSelectionActive &&
+              !mobileSheet &&
+              !showPublish &&
+              !showNewPageModal &&
+              !showDebug &&
+              !showBranchOffModal &&
+              !showUndoPubModal
+            }
+            pos={mobileBubblePos}
+            onChangePos={setMobileBubblePos}
+            onTap={() => {
+              setMobileCompletionToast(null);
+              setMobileChatOpen(true);
+            }}
+            busy={live.busy}
+            chipCount={chips.length}
+            needsAttention={needsMobileAttention}
+            entryPulse={entries.length === 0 && !live.busy}
+            completionToast={mobileCompletionToast}
+            onTapToast={() => {
+              setMobileCompletionToast(null);
+              setMobileChatOpen(true);
+            }}
+          />
 
-      {isMobile && !isWorkspaceBooting && mobileChatOpen && (
-        <MobileChatCard
-          bubblePos={mobileBubblePos}
+          <MobileChatCard
+            open={mobileChatOpen}
+            bubblePos={mobileBubblePos}
           canEdit={session.canEdit}
           currentRoute={currentRoute}
           astroBase={session.astroBase}
@@ -2213,6 +2223,7 @@ export function EditorPage({
           composerRef={mobileComposerRef}
           textareaRef={mobileTextareaRef}
         />
+        </>
       )}
 
       {/* Mobile Full-Screen Sheets */}

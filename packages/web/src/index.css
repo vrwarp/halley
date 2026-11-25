@@ -30,3 +30,44 @@ body {
 .halley-bubble-pulse {
   animation: halley-bubble-entry 1.5s ease-out 1;
 }
+
+@keyframes halley-card-enter {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.84) translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(-50%) scale(1) translateY(0);
+  }
+}
+
+@keyframes halley-card-exit {
+  0% {
+    opacity: 1;
+    transform: translateX(-50%) scale(1) translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.86) translateY(8px);
+  }
+}
+
+.halley-card-enter {
+  animation: halley-card-enter 200ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.halley-card-exit {
+  animation: halley-card-exit 160ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .halley-bubble-pulse {
+    animation: none;
+  }
+  .halley-card-enter,
+  .halley-card-exit {
+    animation: none;
+    transform: translateX(-50%);
+  }
+}

@@ -29,6 +29,7 @@ export interface MobileNotice {
 }
 
 interface Props {
+  open: boolean;
   bubblePos: BubblePos;
   canEdit: boolean;
   currentRoute: string;
@@ -69,6 +70,7 @@ const chipLabelOf = (c: ElementContext, persona: 'non-technical' | 'developer') 
 };
 
 export function MobileChatCard({
+  open,
   bubblePos,
   canEdit,
   currentRoute,
@@ -100,10 +102,20 @@ export function MobileChatCard({
   composerRef,
   textareaRef,
 }: Props) {
+  const [rendered, setRendered] = useState(open);
   const [vvMetrics, setVvMetrics] = useState(() => ({
     height: typeof window !== 'undefined' ? window.visualViewport?.height ?? window.innerHeight : 800,
     offsetBottom: 0,
   }));
+
+  useEffect(() => {
+    if (open) {
+      setRendered(true);
+      return;
+    }
+    const timer = setTimeout(() => setRendered(false), 170);
+    return () => clearTimeout(timer);
+  }, [open]);
 
   useEffect(() => {
     const update = () => {
@@ -126,6 +138,8 @@ export function MobileChatCard({
     };
   }, []);
 
+  if (!rendered) return null;
+
   // Latest exchange: last user message + last final assistant reply after (or overall)
   let lastUser: TranscriptEntryDto | null = null;
   let lastAssistant: TranscriptEntryDto | null = null;
@@ -142,25 +156,30 @@ export function MobileChatCard({
 
   const isEmpty = !lastUser && !lastAssistant && !live.busy && !live.streamingText;
   const keyboardOpen = vvMetrics.offsetBottom > 80;
+  const winW = typeof window !== 'undefined' ? window.innerWidth : 390;
   const winH = typeof window !== 'undefined' ? window.innerHeight : 844;
   const anchorTop = !keyboardOpen && bubblePos.y < winH * 0.35;
   const targetMaxH = Math.max(210, Math.min(Math.round(winH * 0.43), vvMetrics.height - 72));
+  const originXPct = Math.max(8, Math.min(92, Math.round(((bubblePos.x + 27) / Math.max(1, winW)) * 100)));
 
   return (
     <div
       role="dialog"
       aria-label="Halley chat"
+      aria-hidden={!open}
       onPointerDown={(e) => e.stopPropagation()}
       style={{
         width: 'min(92vw, 360px)',
         maxHeight: `${targetMaxH}px`,
         left: '50%',
-        transform: 'translateX(-50%)',
+        transformOrigin: `${originXPct}% ${anchorTop ? '0%' : '100%'}`,
         ...(anchorTop
           ? { top: '56px' }
           : { bottom: `${vvMetrics.offsetBottom + 12}px` }),
       }}
-      className="fixed z-40 flex flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xl ring-1 ring-black/5"
+      className={`fixed z-40 flex flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xl ring-1 ring-black/5 ${
+        open ? 'halley-card-enter' : 'halley-card-exit pointer-events-none'
+      }`}
     >
       {/* Slim Header */}
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-stone-100 bg-[#FAF9F7] px-3 py-2">
