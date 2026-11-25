@@ -5,6 +5,29 @@ VOLUME_DIR="/halley-volume"
 WORKSPACE_DIR="${VOLUME_DIR}/workspace"
 STATE_DIR="${VOLUME_DIR}/state"
 
+if [ "$(id -u)" -eq 0 ]; then
+  mkdir -p "${VOLUME_DIR}" "${STATE_DIR}" /halley-pkg-cache
+  chown node:node "${VOLUME_DIR}" /halley-pkg-cache
+  chmod u+rwx "${VOLUME_DIR}" /halley-pkg-cache
+  # Always guarantee STATE_DIR (pi.sqlite, WAL/SHM/journal, uploads, meta) is writable by node
+  chown -R node:node "${STATE_DIR}"
+  chmod -R u+rwX "${STATE_DIR}"
+
+  # Self-heal workspace/repo files migrated from older image UIDs (e.g. pwuser 1001 -> node 1000) or root
+  if [ -n "$(find "${VOLUME_DIR}" -maxdepth 3 \( -not -user node -o -not -perm -u+w \) -print -quit 2>/dev/null)" ]; then
+    chown -R node:node "${VOLUME_DIR}"
+    chmod -R u+rwX "${VOLUME_DIR}"
+  fi
+  if [ -n "$(find /halley-pkg-cache -maxdepth 2 \( -not -user node -o -not -perm -u+w \) -print -quit 2>/dev/null)" ]; then
+    chown -R node:node /halley-pkg-cache
+    chmod -R u+rwX /halley-pkg-cache
+  fi
+  if [ -d /halley-mirror ]; then
+    chmod -R a+rX /halley-mirror 2>/dev/null || true
+  fi
+  exec gosu node "$0" "$@"
+fi
+
 mkdir -p "${STATE_DIR}"
 git config --global --add safe.directory '*'
 

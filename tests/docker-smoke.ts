@@ -136,6 +136,7 @@ async function main() {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-docker-smoke-'));
   const repoDir = path.join(tmp, 'site-repo');
   let sessionId = '';
+  let dupSessionId = '';
   let anthropicServer: http.Server | null = null;
 
   try {
@@ -334,9 +335,87 @@ async function main() {
       throw new Error(`Expected valid JPEG bytes from /internal/screenshot, got ${shotBytes.length} bytes`);
     }
 
+    console.log('[docker-smoke] 10. Verifying privilege drop to `node`, duplicateWorkspace, and legacy UID 1001 volume self-healing…');
+    const wsContainer = `halley-ws-${sessionId.slice(0, 12)}`;
+    const pid1Owner = await run('docker', ['exec', wsContainer, 'stat', '-c', '%U', '/proc/1']);
+    if (pid1Owner !== 'node') {
+      throw new Error(`Expected PID 1 inside workspace container to run as unprivileged 'node', got '${pid1Owner}'`);
+    }
+
+    // 10a. Duplicate workspace and verify duplicated volume boots cleanly without ERR_SQLITE_ERROR
+    const dupRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/duplicate`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    if (!dupRes.ok) {
+      throw new Error(`Duplicate session failed (${dupRes.status}): ${await dupRes.text()}`);
+    }
+    const { session: dupSession } = (await dupRes.json()) as { session: { id: string } };
+    dupSessionId = dupSession.id;
+    const dupDeadline = Date.now() + 90_000;
+    let dupReady = false;
+    while (Date.now() < dupDeadline) {
+      const dsRes = await fetch(`${cpUrl}/api/sessions/${dupSessionId}`, { headers: { Cookie: cookie } });
+      const dsData = (await dsRes.json()) as { session: { status: string; bootProgress?: { detail?: string } } };
+      if (dsData.session.status === 'error') {
+        throw new Error(`Duplicated session entered error state: ${JSON.stringify(dsData.session.bootProgress)}`);
+      }
+      if (dsData.session.status === 'running') {
+        dupReady = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!dupReady) {
+      throw new Error('Timed out waiting for duplicated session workspace to become ready');
+    }
+
+    // 10b. Simulate legacy UID 1001 (pwuser) + read-only mode bits on /halley-volume/state & pi.sqlite, then wake
+    await run('docker', ['rm', '-f', wsContainer]);
+    await run('docker', [
+      'run',
+      '--rm',
+      '--entrypoint',
+      'sh',
+      '-v',
+      `halley-ws-${sessionId}:/halley-volume`,
+      'halley-workspace:ci-smoke',
+      '-c',
+      'chown -R 1001:1001 /halley-volume && chmod 0755 /halley-volume/state && chmod 0444 /halley-volume/state/pi.sqlite',
+    ]);
+
+    const wakeRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/wake`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    if (!wakeRes.ok) {
+      throw new Error(`Wake after UID 1001 simulation failed (${wakeRes.status}): ${await wakeRes.text()}`);
+    }
+    const wakeDeadline = Date.now() + 90_000;
+    let wokeCleanly = false;
+    while (Date.now() < wakeDeadline) {
+      const wsRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
+      const wsData = (await wsRes.json()) as { session: { status: string; bootProgress?: { detail?: string } } };
+      if (wsData.session.status === 'error') {
+        throw new Error(`Woken legacy-UID session failed (ERR_SQLITE_ERROR regression): ${JSON.stringify(wsData.session.bootProgress)}`);
+      }
+      if (wsData.session.status === 'running') {
+        wokeCleanly = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!wokeCleanly) {
+      throw new Error('Timed out waiting for legacy-UID session to self-heal and wake');
+    }
+
     console.log('[docker-smoke] SUCCESS — Docker-in-Docker orchestration verified end-to-end!');
   } finally {
     anthropicServer?.close();
+    if (dupSessionId) {
+      await run('docker', ['rm', '-f', `halley-ws-${dupSessionId.slice(0, 12)}`]).catch(() => {});
+      await run('docker', ['volume', 'rm', '-f', `halley-ws-${dupSessionId}`]).catch(() => {});
+    }
     if (sessionId) {
       await run('docker', ['rm', '-f', `halley-ws-${sessionId.slice(0, 12)}`]).catch(() => {});
       await run('docker', ['volume', 'rm', '-f', `halley-ws-${sessionId}`]).catch(() => {});
