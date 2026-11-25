@@ -276,7 +276,15 @@ export async function ensureBareMirror(
   }
 
   await runWithAuth(
-    ['fetch', 'origin', `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`],
+    [
+      '-c',
+      'http.lowSpeedLimit=1',
+      '-c',
+      'http.lowSpeedTime=30',
+      'fetch',
+      'origin',
+      `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`,
+    ],
     mirrorDir,
   );
   await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});

@@ -744,4 +744,53 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('deduplicates concurrent mirror syncs via TTL/single-flight and falls back to stale mirror on transient error', async () => {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-mirror-test-'));
+    try {
+      const upstream = path.join(tmp, 'upstream');
+      await fs.mkdir(upstream, { recursive: true });
+      await execFileAsync('git', ['init', '-b', 'main'], { cwd: upstream });
+      await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: upstream });
+      await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: upstream });
+      await fs.writeFile(path.join(upstream, 'README.md'), 'hello\n');
+      await execFileAsync('git', ['add', '-A'], { cwd: upstream });
+      await execFileAsync('git', ['commit', '-m', 'init'], { cwd: upstream });
+
+      const cfg = {
+        ...loadConfig(),
+        dataDir: path.join(tmp, 'data'),
+        devLocalRepo: upstream,
+        baseBranch: 'main',
+      };
+      const cp = createControlPlane(cfg, createMockDriver());
+      const hostDriver = new WorkspaceHostDriver(cfg, cp.db, {} as never);
+
+      // Concurrent calls share one in-flight fetch and populate the local bare mirror
+      const [m1, m2] = await Promise.all([
+        hostDriver.ensureControlPlaneMirror('main'),
+        hostDriver.ensureControlPlaneMirror('main'),
+      ]);
+      expect(m1).toBe(m2);
+
+      // Remove upstream repo to simulate a transient GitHub SSL/network outage;
+      // force=true + allowStaleOnError=true must fall back cleanly to the existing local mirror
+      await fs.rm(upstream, { recursive: true, force: true });
+      const stale = await hostDriver.ensureControlPlaneMirror('main', {
+        force: true,
+        allowStaleOnError: true,
+      });
+      expect(stale).toBe(m1);
+
+      // Without allowStaleOnError, force=true surfaces the error
+      await expect(
+        hostDriver.ensureControlPlaneMirror('main', { force: true, allowStaleOnError: false }),
+      ).rejects.toThrow();
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });

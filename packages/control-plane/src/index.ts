@@ -108,7 +108,7 @@ export function createControlPlane(
   // Internal Git Smart-HTTP mirror (keeps GitHub credentials strictly inside control-plane)
   const internalGitHandler = createInternalGitHttpHandler(config, db, async () => {
     if (hostDriver) {
-      await hostDriver.ensureControlPlaneMirror();
+      await hostDriver.ensureControlPlaneMirror(config.baseBranch, { allowStaleOnError: true });
     }
   });
   app.all('/internal/git/repo.git/*', internalGitHandler);
