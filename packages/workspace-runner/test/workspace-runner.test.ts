@@ -345,5 +345,122 @@ describe('workspace-runner git, protection & hygiene', () => {
 
     await mgr.stop();
   });
+
+  it('configures claude-haiku-5-5 compaction below its 100K 5x tariff cliff and compacts in Pi Durable before crossing 100K', async () => {
+    const { BACKGROUND_CONTEXT } = await import('@earendil-works/chord/context');
+    const { createModels } = await import('@earendil-works/pi-ai/models');
+    const { anthropicProvider } = await import('@earendil-works/pi-ai/providers/anthropic');
+    const { fauxAssistantMessage, fauxProvider } = await import('@earendil-works/pi-ai/providers/faux');
+    const { CompactionEntry, createRegistry, Harness, MemoryStorage } = await import('@earendil-works/pi-durable');
+    const { buildCompactionSettings } = await import('../src/pi-runtime.js');
+
+    // 1. Validate thresholds against the real pi-ai Anthropic catalog
+    const realCatalog = anthropicProvider().getModels();
+    const settings = buildCompactionSettings(realCatalog);
+
+    expect(settings.enabled).toBe(true);
+    expect(settings.reserveTokens).toBe(20_000);
+    expect(settings.keepRecentTokens).toBe(20_000);
+    expect(settings.backgroundTokens).toBe(32_768);
+
+    // claude-haiku-5-5 (1M window, 5x cliff > 100K): block at 80K, background at 64K, keep 16K
+    const haiku55 = realCatalog.find((m) => m.id === 'claude-haiku-5-5')!;
+    expect(haiku55.contextWindow).toBe(1_000_000);
+    const haikuOverride = settings.modelOverrides['anthropic/claude-haiku-5-5']!;
+    expect(haikuOverride).toEqual({
+      reserveTokens: 920_000,
+      keepRecentTokens: 16_000,
+      backgroundTokens: 16_000,
+    });
+    const haikuBlocking = haiku55.contextWindow - haikuOverride.reserveTokens!;
+    const haikuBackground = haikuBlocking - haikuOverride.backgroundTokens!;
+    expect(haikuBlocking).toBe(80_000);
+    expect(haikuBackground).toBe(64_000);
+
+    // 1M flat-priced models (sonnet-5-5, opus-5-5): block at 800K, background at 700K, keep 60K
+    expect(settings.modelOverrides['anthropic/claude-sonnet-5-5']).toEqual({
+      reserveTokens: 200_000,
+      keepRecentTokens: 60_000,
+      backgroundTokens: 100_000,
+    });
+    expect(settings.modelOverrides['anthropic/claude-opus-5-5']).toEqual({
+      reserveTokens: 200_000,
+      keepRecentTokens: 60_000,
+      backgroundTokens: 100_000,
+    });
+
+    // 200K models inherit base policy
+    expect(settings.modelOverrides['anthropic/claude-haiku-4-5']).toBeUndefined();
+
+    // 2. End-to-end Pi Durable Harness check: a 1M claude-haiku-5-5 session compacts above 80K (well below 100K & 1M)
+    const faux = fauxProvider({
+      provider: 'anthropic',
+      models: [{ id: 'claude-haiku-5-5', contextWindow: 1_000_000, maxTokens: 128_000 }],
+    });
+    const models = createModels();
+    models.setProvider(faux.provider);
+
+    let maxObservedPromptTokens = 0;
+    faux.setResponses([
+      () => fauxAssistantMessage('Turn 1 complete.'),
+      () => fauxAssistantMessage('Turn 2 complete.'),
+      // Summarization call triggered before Turn 3 runs (~85K > 80K blocking threshold)
+      () =>
+        fauxAssistantMessage(
+          '## Goal\nEdit site\n\n## Constraints & Preferences\n- (none)\n\n## Progress\n### Done\n- [x] Turns 1-2\n\n### In Progress\n- [ ] Turn 3\n\n### Blocked\n- (none)\n\n## Key Decisions\n- None\n\n## Next Steps\n1. Finish Turn 3\n\n## Critical Context\n- (none)',
+        ),
+      (ctx) => {
+        const approxPromptChars = ctx.messages
+          .map((m) => JSON.stringify(m.content).length)
+          .reduce((a, b) => a + b, 0);
+        maxObservedPromptTokens = Math.max(maxObservedPromptTokens, Math.ceil(approxPromptChars / 4));
+        return fauxAssistantMessage('Turn 3 complete after compaction.');
+      },
+    ]);
+
+    const harness = await Harness.open(
+      new MemoryStorage(),
+      {
+        models,
+        registry: createRegistry(),
+        settings: {
+          compaction: buildCompactionSettings(faux.models),
+        },
+      },
+      BACKGROUND_CONTEXT,
+    );
+
+    try {
+      const root = await harness.root(BACKGROUND_CONTEXT, {
+        agent: {
+          model: { provider: 'anthropic', modelId: 'claude-haiku-5-5' },
+        },
+      });
+      harness.resume();
+
+      // ~30K tokens each (105,000 chars / 3.5 estimate ~= 30K; / 4 faux ~= 26.25K)
+      const chunk = 'a'.repeat(112_000);
+      const sub1 = await root.submit({ type: 'input', requestId: 't1', content: chunk }, BACKGROUND_CONTEXT);
+      expect((await sub1.wait(BACKGROUND_CONTEXT)).status).toBe('done');
+
+      const sub2 = await root.submit({ type: 'input', requestId: 't2', content: chunk }, BACKGROUND_CONTEXT);
+      expect((await sub2.wait(BACKGROUND_CONTEXT)).status).toBe('done');
+
+      const sub3 = await root.submit({ type: 'input', requestId: 't3', content: chunk }, BACKGROUND_CONTEXT);
+      expect((await sub3.wait(BACKGROUND_CONTEXT)).status).toBe('done');
+
+      const watch = await root.watch(BACKGROUND_CONTEXT);
+      const compactions = watch.value.entries.filter((e) => CompactionEntry.is(e));
+      await watch.stop();
+
+      expect(compactions.length).toBeGreaterThanOrEqual(1);
+      // Turn 3 prompt after compaction must stay well under the 100,000-token tariff cliff
+      expect(maxObservedPromptTokens).toBeGreaterThan(0);
+      expect(maxObservedPromptTokens).toBeLessThan(100_000);
+    } finally {
+      await harness.close(BACKGROUND_CONTEXT);
+    }
+  });
 });
+
 

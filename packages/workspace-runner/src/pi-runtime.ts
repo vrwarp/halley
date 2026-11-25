@@ -5,6 +5,7 @@ import { createModels } from '@earendil-works/pi-ai/models';
 import { anthropicProvider } from '@earendil-works/pi-ai/providers/anthropic';
 import {
   AssistantEntry,
+  CompactionEntry,
   createRegistry,
   defineExtension,
   defineTool,
@@ -16,6 +17,8 @@ import {
   ToolTask,
   UserEntry,
   wrapTool,
+  type CompactionPolicy,
+  type CompactionSettings,
   type Conversation,
 } from '@earendil-works/pi-durable';
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
@@ -118,6 +121,71 @@ function resolveAnthropicModelId(
   return candidates[0]?.id ?? requestedId;
 }
 
+export interface CompactionCatalogModel {
+  id: string;
+  provider?: string;
+  contextWindow: number;
+  cost?: {
+    tiers?: ReadonlyArray<{ inputTokensAbove: number }>;
+  };
+}
+
+/**
+ * Builds model-aware Pi Durable compaction settings:
+ * - Models with a prompt-length pricing cliff (notably `claude-haiku-5-5`, whose 1M window
+ *   jumps 5x across input/output/cacheRead/cacheWrite once prompt tokens exceed 100,000):
+ *   blocks at 80% of the cliff (80,000 tokens -> `reserveTokens: 920_000`) to leave a 20K
+ *   buffer for in-flight tool/screenshot payloads, starts non-blocking background compaction
+ *   at 64,000 tokens (`backgroundTokens: 16_000`), and retains a 16,000-token verbatim tail.
+ * - Flat-priced >500K-window models (`claude-sonnet-5-5`, `claude-opus-5-5`, etc.):
+ *   reserves 20% (blocks at 800K on 1M, leaving full room for 128K adaptive thinking/output),
+ *   starts background compaction at 70% (700K), and retains a 60K verbatim tail.
+ * - Standard <=500K-window models (e.g. 200K `claude-haiku-4-5` / `claude-sonnet-4-5`):
+ *   uses 20K reserve, 20K verbatim tail, and 32,768 background lead.
+ */
+export function buildCompactionSettings(
+  models: ReadonlyArray<CompactionCatalogModel>,
+): CompactionPolicy & Required<Pick<CompactionSettings, 'modelOverrides'>> {
+  const modelOverrides: Record<string, Partial<CompactionPolicy>> = {};
+
+  for (const m of models) {
+    const provider = m.provider || 'anthropic';
+    const key = `${provider}/${m.id}`;
+    const tierCliffs = (m.cost?.tiers ?? [])
+      .map((t) => t.inputTokensAbove)
+      .filter((n) => Number.isFinite(n) && n > 0 && n < m.contextWindow);
+    const minCliff =
+      tierCliffs.length > 0
+        ? Math.min(...tierCliffs)
+        : m.id === 'claude-haiku-5-5' && m.contextWindow > 100_000
+          ? 100_000
+          : undefined;
+
+    if (minCliff !== undefined) {
+      const blockingBudget = Math.floor(minCliff * 0.8);
+      modelOverrides[key] = {
+        reserveTokens: Math.max(16_384, m.contextWindow - blockingBudget),
+        keepRecentTokens: Math.max(8_000, Math.floor(blockingBudget * 0.2)),
+        backgroundTokens: Math.max(8_000, Math.floor(blockingBudget * 0.2)),
+      };
+    } else if (m.contextWindow > 500_000) {
+      modelOverrides[key] = {
+        reserveTokens: Math.max(16_384, Math.floor(m.contextWindow * 0.2)),
+        keepRecentTokens: Math.max(20_000, Math.floor(m.contextWindow * 0.06)),
+        backgroundTokens: Math.max(32_768, Math.floor(m.contextWindow * 0.1)),
+      };
+    }
+  }
+
+  return {
+    enabled: true,
+    reserveTokens: 20_000,
+    keepRecentTokens: 20_000,
+    backgroundTokens: 32_768,
+    modelOverrides,
+  };
+}
+
 export class HalleyPiRuntime {
   private harness!: Harness;
   private root!: Conversation;
@@ -184,8 +252,19 @@ export class HalleyPiRuntime {
     }));
     this.availableModelIds = proxiedModels;
     this.resolvedModelId = resolveAnthropicModelId(this.opts.modelId, proxiedModels);
+    const compactionSettings = buildCompactionSettings(proxiedModels);
+    const resolvedCatalogModel = proxiedModels.find((m) => m.id === this.resolvedModelId);
+    const activeCompaction = {
+      ...compactionSettings,
+      ...compactionSettings.modelOverrides[`anthropic/${this.resolvedModelId}`],
+    };
+    const blockingAt = resolvedCatalogModel
+      ? resolvedCatalogModel.contextWindow - activeCompaction.reserveTokens
+      : undefined;
+    const backgroundAt =
+      blockingAt !== undefined ? blockingAt - activeCompaction.backgroundTokens : undefined;
     console.log(
-      `[halley-pi] model=${this.opts.modelId} -> ${this.resolvedModelId} (thinking=${this.opts.thinkingLevel})`,
+      `[halley-pi] model=${this.opts.modelId} -> ${this.resolvedModelId} (thinking=${this.opts.thinkingLevel}, compactBg=${backgroundAt ?? 'default'}, compactBlock=${blockingAt ?? 'default'}, keepRecent=${activeCompaction.keepRecentTokens})`,
     );
     const proxiedAnthropic = {
       ...baseAnthropic,
@@ -233,6 +312,7 @@ export class HalleyPiRuntime {
             cwd: this.opts.repoRoot,
           }),
         settings: {
+          compaction: compactionSettings,
           progress: {
             partialIntervalMs: 120,
             outputIntervalMs: 150,
@@ -786,6 +866,23 @@ export class HalleyPiRuntime {
               isError: Boolean(msg.isError),
             });
           }
+        } else if (CompactionEntry.is(entry)) {
+          const content = entry.model?.[0]?.content;
+          const text =
+            typeof content === 'string'
+              ? content
+              : Array.isArray(content)
+                ? content
+                    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+                    .map((b) => b.text)
+                    .join('\n')
+                : '';
+          debugEntries.push({
+            id: String(entry.id),
+            kind: entry.kind,
+            role: 'other',
+            ...(text ? { text } : {}),
+          });
         }
       }
     }
