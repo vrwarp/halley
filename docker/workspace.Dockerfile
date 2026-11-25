@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ripgrep \
     python3 \
     jq \
+    gosu \
   && rm -rf /var/lib/apt/lists/*
 
 # Ensure Node 22 + pnpm are available and prepare directories for unprivileged node user
@@ -38,4 +39,7 @@ RUN pnpm --filter @halley/shared build \
 
 EXPOSE 4100 4321
 
+# Start entrypoint as root solely to self-heal volume ownership (e.g. volumes migrated from older UIDs),
+# then immediately drop privileges to unprivileged `node` via gosu.
+USER root
 ENTRYPOINT ["/usr/local/bin/halley-workspace-entrypoint.sh"]

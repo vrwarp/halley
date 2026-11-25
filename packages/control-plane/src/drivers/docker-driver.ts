@@ -1153,10 +1153,11 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     await execFileAsync('docker', [
       'run',
       '--rm',
+      '--entrypoint',
+      'sh',
       '-v',
       `${session.volume_name}:/halley-volume`,
       this.config.workspaceImage,
-      'sh',
       '-c',
       'rm -rf /halley-volume/workspace/node_modules',
     ]);
@@ -1176,18 +1177,20 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     await execFileAsync('docker', [
       'run',
       '--rm',
+      '--entrypoint',
+      'sh',
       '-v',
       `${source.volume_name}:/src:ro`,
       '-v',
       `${target.volume_name}:/dst`,
       this.config.workspaceImage,
-      'sh',
       '-c',
       [
         'mkdir -p /dst/state',
         'cp -a /src/workspace /dst/workspace',
         'if [ -d /src/state/uploads ]; then cp -a /src/state/uploads /dst/state/uploads; fi',
-        `cd /dst/workspace && git checkout -b ${target.working_branch}`,
+        `cd /dst/workspace && git config --global --add safe.directory '*' && git checkout -B ${target.working_branch}`,
+        'chown -R node:node /dst && chmod -R u+rwX /dst',
       ].join(' && '),
     ]);
   }
@@ -1197,6 +1200,8 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     await withGitAskPass(token, async () => {
       await execFileAsync('docker', [
         'exec',
+        '-u',
+        'node',
         '-e',
         `HALLEY_GIT_TOKEN=${token}`,
         name,
@@ -1211,6 +1216,8 @@ export class DockerWorkspaceDriver implements WorkspaceDriver {
     const name = this.containerName(session.id);
     await execFileAsync('docker', [
       'exec',
+      '-u',
+      'node',
       '-e',
       `HALLEY_GIT_TOKEN=${token}`,
       name,
