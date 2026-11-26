@@ -57,7 +57,12 @@ export function inferRouteFromFilePath(relPath: string): string {
       .replace(/^index$/, '');
     return sub ? `/${sub}` : '/';
   }
+  if (norm.startsWith('src/content/sermons/') && norm.endsWith('.json')) {
+    const slug = path.basename(norm, '.json');
+    return slug ? `/sermons/${slug}` : '/sermons';
+  }
   if (norm.startsWith('src/content/sermons/')) return '/sermons';
+  if (norm.startsWith('src/components/')) return 'Shared component';
   if (norm.startsWith('src/layouts/') || norm === 'src/data/site.ts' || norm.startsWith('src/styles/')) {
     return 'All pages';
   }

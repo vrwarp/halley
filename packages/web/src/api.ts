@@ -154,14 +154,45 @@ export const api = {
     }),
   getChanges: (id: string) =>
     apiFetch<{ changes: GitFileChange[]; checkpoints: CheckpointInfo[] }>(`/api/sessions/${id}/changes`),
-  getReview: (id: string, screenshots = false, viewport: 'desktop' | 'mobile' = 'desktop') =>
-    apiFetch<{
+  getReview: (
+    id: string,
+    screenshots = false,
+    viewport: 'desktop' | 'mobile' = 'desktop',
+    activeRoute?: string,
+  ) => {
+    const qs = new URLSearchParams({
+      screenshots: screenshots ? '1' : '0',
+      viewport,
+    });
+    if (activeRoute) qs.set('activeRoute', activeRoute);
+    return apiFetch<{
       cards: ChangeCardDto[];
       pages: VisualDiffPageDto[];
+      targetRoutes?: string[];
       mergeReview: MergeReviewStateDto | null;
       baseSha: string;
       prevBaseSha: string | null;
-    }>(`/api/sessions/${id}/review?screenshots=${screenshots ? '1' : '0'}&viewport=${viewport}`),
+    }>(`/api/sessions/${id}/review?${qs.toString()}`);
+  },
+  getReviewScreenshot: (
+    id: string,
+    opts: {
+      route: string;
+      viewport: 'desktop' | 'mobile';
+      mode?: 'cropped' | 'full';
+      signal?: AbortSignal;
+    },
+  ) => {
+    const qs = new URLSearchParams({
+      route: opts.route,
+      viewport: opts.viewport,
+      mode: opts.mode === 'full' ? 'full' : 'cropped',
+    });
+    return apiFetch<{ page: VisualDiffPageDto }>(
+      `/api/sessions/${id}/review/screenshot?${qs.toString()}`,
+      opts.signal ? { signal: opts.signal } : undefined,
+    );
+  },
   getUpstreamStatus: (id: string) =>
     apiFetch<{
       behind: boolean;

@@ -67,7 +67,7 @@ function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delt
 }
 
 describe('ScreenshotService', () => {
-  it('reuses a single warm browser across calls with fresh BrowserContexts and serializes concurrent captures', async () => {
+  it('reuses a single warm browser across calls with fresh BrowserContexts and respects maxConcurrency', async () => {
     let launchCount = 0;
     let active = 0;
     let maxActive = 0;
@@ -76,10 +76,11 @@ describe('ScreenshotService', () => {
     const svc = new ScreenshotService({
       idleTimeoutMs: 60_000,
       settleWaitMs: 0,
+      maxConcurrency: 2,
       launchBrowser: async () => {
         launchCount += 1;
         fakeRef = createFakeBrowser({
-          gotoDelayMs: 25,
+          gotoDelayMs: 30,
           onActiveChange: (d) => {
             active += d;
             if (active > maxActive) maxActive = active;
@@ -90,9 +91,10 @@ describe('ScreenshotService', () => {
     });
 
     try {
-      const [r1, r2] = await Promise.all([
+      const [r1, r2, r3] = await Promise.all([
         svc.capture({ url: 'http://ws-1:4321/p/s1/', viewport: 'desktop' }),
         svc.capture({ url: 'http://ws-2:4321/p/s2/about', viewport: 'mobile' }),
+        svc.capture({ url: 'http://ws-3:4321/p/s3/contact', viewport: 'desktop' }),
       ]);
 
       expect(r1.width).toBe(1280);
@@ -100,20 +102,47 @@ describe('ScreenshotService', () => {
       expect(r1.mimeType).toBe('image/jpeg');
       expect(r2.width).toBe(390);
       expect(r2.height).toBe(844);
+      expect(r3.width).toBe(1280);
       expect(r1.data.toString()).toBe('fake-jpeg');
-      expect(fakeRef!.stats().screenshotCalls).toEqual([
-        { type: 'jpeg', quality: 80, fullPage: false },
-        { type: 'jpeg', quality: 80, fullPage: false },
-      ]);
       expect(fakeRef!.stats().contextOptions[0]).toEqual({
         viewport: { width: 1280, height: 800 },
         deviceScaleFactor: 1,
+        reducedMotion: 'reduce',
       });
       expect(launchCount).toBe(1);
-      expect(maxActive).toBe(1);
+      expect(maxActive).toBe(2);
       expect(svc.isBrowserRunning()).toBe(true);
-      expect(fakeRef!.stats().contextsCreated).toBe(2);
-      expect(fakeRef!.stats().contextsClosed).toBe(2);
+      expect(fakeRef!.stats().contextsCreated).toBe(3);
+      expect(fakeRef!.stats().contextsClosed).toBe(3);
+    } finally {
+      await svc.close();
+    }
+  });
+
+  it('prewarms Chromium non-blockingly and auto-closes after idleTimeoutMs', async () => {
+    let launchCount = 0;
+    const fakes: Array<ReturnType<typeof createFakeBrowser>> = [];
+
+    const svc = new ScreenshotService({
+      idleTimeoutMs: 50,
+      settleWaitMs: 0,
+      launchBrowser: async () => {
+        launchCount += 1;
+        const fake = createFakeBrowser();
+        fakes.push(fake);
+        return fake.browser;
+      },
+    });
+
+    try {
+      svc.prewarm();
+      await new Promise((r) => setTimeout(r, 15));
+      expect(launchCount).toBe(1);
+      expect(svc.isBrowserRunning()).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 90));
+      expect(svc.isBrowserRunning()).toBe(false);
+      expect(fakes[0]!.stats().closeCalls).toBe(1);
     } finally {
       await svc.close();
     }
@@ -225,7 +254,7 @@ describe('ScreenshotService', () => {
     }
   });
 
-  it('captures mobile and desktop Live vs Draft review screenshots clipped to 2400px with per-viewport shots', async () => {
+  it('captures mobile and desktop Live vs Draft review screenshots up to 10000px and caches Live captures per baseSha', async () => {
     const visitedUrls: string[] = [];
     const contextViewports: Array<{ width: number; height: number }> = [];
     const screenshotCalls: Array<Record<string, unknown>> = [];
@@ -247,7 +276,7 @@ describe('ScreenshotService', () => {
                 waitForTimeout: async () => {},
                 title: async () => 'Events',
                 evaluate: async (fnOrExpr: unknown) => {
-                  if (typeof fnOrExpr === 'string') return 3200; // exceeds 2400px clip cap
+                  if (typeof fnOrExpr === 'string') return 12_500; // exceeds 10_000px clip cap
                   return [
                     {
                       x: 10,
@@ -261,7 +290,7 @@ describe('ScreenshotService', () => {
                 },
                 screenshot: async (opts: Record<string, unknown>) => {
                   screenshotCalls.push(opts);
-                  return Buffer.from('review-jpg');
+                  return Buffer.from('review-mock-bytes');
                 },
               }),
               close: async () => {},
@@ -278,25 +307,38 @@ describe('ScreenshotService', () => {
         mergedFromLiveFiles: [],
         draftBaseUrl: 'http://ws-1:4321/p/s1',
         liveBaseUrl: 'https://example.org',
+        baseSha: 'abc1234',
         liveTimestamp: '11:30 AM',
         viewport: 'mobile',
       });
 
       expect(mobilePages).toHaveLength(1);
       expect(contextViewports[0]).toEqual({ width: 390, height: 844 });
-      expect(visitedUrls).toEqual(['http://ws-1:4321/p/s1/events', 'https://example.org/events']);
+      expect(visitedUrls).toContain('http://ws-1:4321/p/s1/events');
+      expect(visitedUrls).toContain('https://example.org/events');
       expect(screenshotCalls[0]).toEqual({
-        type: 'jpeg',
-        quality: 80,
+        type: 'png',
         fullPage: true,
-        clip: { x: 0, y: 0, width: 390, height: 2400 },
+        clip: { x: 0, y: 0, width: 390, height: 10_000 },
       });
       expect(mobilePages[0]!.viewport).toBe('mobile');
       expect(mobilePages[0]!.shots?.mobile?.width).toBe(390);
-      expect(mobilePages[0]!.shots?.mobile?.height).toBe(2400);
-      expect(mobilePages[0]!.shots?.mobile?.draftScreenshotDataUrl).toContain('data:image/jpeg;base64,');
-      expect(mobilePages[0]!.shots?.mobile?.liveScreenshotDataUrl).toContain('data:image/jpeg;base64,');
+      expect(mobilePages[0]!.shots?.mobile?.height).toBe(10_000);
       expect(mobilePages[0]!.shots?.mobile?.highlights).toHaveLength(1);
+
+      // Second review with same baseSha should hit the Live LRU cache (no second visit to example.org)
+      visitedUrls.length = 0;
+      await svc.captureRouteReview({
+        route: '/events',
+        draftFiles: ['src/pages/events.astro'],
+        mergedFromLiveFiles: [],
+        draftBaseUrl: 'http://ws-1:4321/p/s1',
+        liveBaseUrl: 'https://example.org',
+        baseSha: 'abc1234',
+        liveTimestamp: '11:31 AM',
+        viewport: 'mobile',
+      });
+      expect(visitedUrls).toEqual(['http://ws-1:4321/p/s1/events']);
 
       const desktopPages = await svc.captureLiveVsDraftPages({
         routes: ['/events'],
@@ -309,8 +351,6 @@ describe('ScreenshotService', () => {
       });
 
       expect(desktopPages).toHaveLength(1);
-      expect(contextViewports[1]).toEqual({ width: 1280, height: 800 });
-      expect(desktopPages[0]!.shots?.desktop?.draftScreenshotDataUrl).toContain('data:image/jpeg;base64,');
       expect(desktopPages[0]!.shots?.desktop?.liveScreenshotDataUrl).toBeUndefined();
     } finally {
       await svc.close();

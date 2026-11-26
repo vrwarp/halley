@@ -42,7 +42,7 @@ import { detachHardlinkedNodeModules } from './nm-cache.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import { runAllVerificationChecks } from './verify.js';
-import { buildChangeCards } from './visual-diff.js';
+import { buildChangeCards, resolveVisualReviewRoutes } from './visual-diff.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -1152,6 +1152,7 @@ async function main() {
 
   app.get('/internal/review', async (c) => {
     const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
+    const activeRoute = c.req.query('activeRoute') || null;
     const changes = await getGitChanges(REPO_ROOT, baseRef);
     const cards = await buildChangeCards(REPO_ROOT, changes, {
       baseRef,
@@ -1159,6 +1160,7 @@ async function main() {
       editorName: gitIdentity.editorName,
       conflictRecords: activeMergeState?.records,
     });
+    const targetRoutes = resolveVisualReviewRoutes(cards, activeRoute);
     const mergedFromLiveFiles =
       prevBaseSha && baseSha && prevBaseSha !== baseSha
         ? await execFileAsync('git', ['diff', '--name-only', `${prevBaseSha}..${baseSha}`], {
@@ -1173,6 +1175,7 @@ async function main() {
     return c.json({
       cards,
       pages: [],
+      targetRoutes,
       draftFiles: changes.map((ch) => ch.path),
       mergedFromLiveFiles,
       astroReady: astroManager.getStatus().ready,

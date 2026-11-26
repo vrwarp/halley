@@ -483,48 +483,59 @@ export class HalleyPiRuntime {
           { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
         > = [];
 
-        for (const vp of viewports) {
-          const fallbackSize = vp === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 };
-          const res = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${opts.workspaceToken}`,
-            },
-            body: JSON.stringify({
-              route: cleanRoute,
-              viewport: vp,
-              ...(args.fullPage ? { fullPage: true } : {}),
-            }),
-          });
+        const results = await Promise.all(
+          viewports.map(async (vp) => {
+            const fallbackSize =
+              vp === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 };
+            const res = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${opts.workspaceToken}`,
+              },
+              body: JSON.stringify({
+                route: cleanRoute,
+                viewport: vp,
+                ...(args.fullPage ? { fullPage: true } : {}),
+              }),
+            });
 
-          if (!res.ok) {
-            const errText = await res.text().catch(() => res.statusText);
+            if (!res.ok) {
+              const errText = await res.text().catch(() => res.statusText);
+              return { error: `Screenshot failed (${res.status}): ${errText}` as string };
+            }
+
+            const rawContentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]!.trim();
+            const mimeType = rawContentType.startsWith('image/') ? rawContentType : 'image/jpeg';
+            const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
+            const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
+            const imgBytes = Buffer.from(await res.arrayBuffer());
             return {
-              output: [
-                {
-                  type: 'text',
-                  text: `Screenshot failed (${res.status}): ${errText}`,
-                },
-              ],
+              vp,
+              width,
+              height,
+              mimeType,
+              base64: imgBytes.toString('base64'),
+            };
+          }),
+        );
+
+        for (const r of results) {
+          if ('error' in r) {
+            return {
+              output: [{ type: 'text', text: r.error! }],
               isError: true,
             };
           }
-
-          const rawContentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]!.trim();
-          const mimeType = rawContentType.startsWith('image/') ? rawContentType : 'image/jpeg';
-          const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
-          const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
-          const imgBytes = Buffer.from(await res.arrayBuffer());
           output.push(
             {
               type: 'text',
-              text: `Captured ${vp} (${width}x${height}${args.fullPage ? ', fullPage' : ''}) screenshot of ${cleanRoute}`,
+              text: `Captured ${r.vp} (${r.width}x${r.height}${args.fullPage ? ', fullPage' : ''}) screenshot of ${cleanRoute}`,
             },
             {
               type: 'image',
-              data: imgBytes.toString('base64'),
-              mimeType,
+              data: r.base64,
+              mimeType: r.mimeType,
             },
           );
         }

@@ -16,7 +16,7 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
 import { ConflictCards } from './ConflictCards.js';
 import { VisualReview } from './VisualReview.js';
@@ -24,6 +24,7 @@ import { VisualReview } from './VisualReview.js';
 interface Props {
   session: EditorSessionDto;
   persona?: 'non-technical' | 'developer';
+  currentRoute?: string;
   publishProgress: PublishProgressPayload | null;
   onClose: () => void;
   onAskHalleyToFix: (summary: string, logs?: string) => Promise<void>;
@@ -62,6 +63,7 @@ const STEPS: Array<{ key: string; label: string; detail: string }> = [
 export function PublishModal({
   session,
   persona = 'non-technical',
+  currentRoute,
   publishProgress,
   onClose,
   onAskHalleyToFix,
@@ -72,27 +74,43 @@ export function PublishModal({
   const [title, setTitle] = useState(session.title);
   const [titleDirty, setTitleDirty] = useState(false);
   const [cards, setCards] = useState<ChangeCardDto[]>([]);
+  const [targetRoutes, setTargetRoutes] = useState<string[]>([]);
   const [activeViewport, setActiveViewport] = useState<'mobile' | 'desktop'>(
     isPhone ? 'mobile' : 'desktop',
   );
   const [pagesByViewport, setPagesByViewport] = useState<
-    Partial<Record<'mobile' | 'desktop', VisualDiffPageDto[]>>
-  >({});
-  const [screenshotsEnabled, setScreenshotsEnabled] = useState(isPhone);
+    Record<'mobile' | 'desktop', Record<string, VisualDiffPageDto>>
+  >({ mobile: {}, desktop: {} });
+  const [fullPagesByViewport, setFullPagesByViewport] = useState<
+    Record<'mobile' | 'desktop', Record<string, VisualDiffPageDto>>
+  >({ mobile: {}, desktop: {} });
+  const [loadingRoutesByViewport, setLoadingRoutesByViewport] = useState<
+    Record<'mobile' | 'desktop', Record<string, boolean>>
+  >({ mobile: {}, desktop: {} });
+  const [loadingFullByViewport, setLoadingFullByViewport] = useState<
+    Record<'mobile' | 'desktop', Record<string, boolean>>
+  >({ mobile: {}, desktop: {} });
   const [mergeReview, setMergeReview] = useState<MergeReviewStateDto | null>(null);
   const [excludedPaths, setExcludedPaths] = useState<Record<string, boolean>>({});
   const [loadingChanges, setLoadingChanges] = useState(true);
-  const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [retryingDeploy, setRetryingDeploy] = useState(false);
   const [publishElapsedSec, setPublishElapsedSec] = useState(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const generationRef = useRef(0);
 
   useEffect(() => {
     if (!titleDirty) {
       setTitle(session.title);
     }
   }, [session.title, titleDirty]);
+
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
   const state = publishProgress?.state ?? session.publishState;
   const prUrl = publishProgress?.prUrl ?? session.prUrl;
@@ -101,30 +119,107 @@ export function PublishModal({
   const checks: VerificationCheckResult[] = publishProgress?.checks ?? [];
   const isUndoMode = session.kind === 'revert';
 
-  const fetchScreenshotsFor = async (vp: 'mobile' | 'desktop') => {
-    setLoadingScreenshots(true);
-    setScreenshotsEnabled(true);
-    try {
-      const rev = await api.getReview(session.id, true, vp);
-      setCards(rev.cards);
-      if (rev.mergeReview) setMergeReview(rev.mergeReview);
-      setPagesByViewport((prev) => ({ ...prev, [vp]: rev.pages }));
-    } catch {
-      // ignore
-    } finally {
-      setLoadingScreenshots(false);
+  const resetScreenshotCache = () => {
+    generationRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setPagesByViewport({ mobile: {}, desktop: {} });
+    setFullPagesByViewport({ mobile: {}, desktop: {} });
+    setLoadingRoutesByViewport({ mobile: {}, desktop: {} });
+    setLoadingFullByViewport({ mobile: {}, desktop: {} });
+  };
+
+  const fetchRoutesForViewport = (vp: 'mobile' | 'desktop', routes: string[]) => {
+    if (routes.length === 0) return;
+    const gen = generationRef.current;
+    if (!abortRef.current || abortRef.current.signal.aborted) {
+      abortRef.current = new AbortController();
     }
+    const signal = abortRef.current.signal;
+
+    setLoadingRoutesByViewport((prev) => {
+      const nextVp = { ...prev[vp] };
+      for (const r of routes) nextVp[r] = true;
+      return { ...prev, [vp]: nextVp };
+    });
+
+    for (const route of routes) {
+      void api
+        .getReviewScreenshot(session.id, { route, viewport: vp, mode: 'cropped', signal })
+        .then(({ page }) => {
+          if (generationRef.current !== gen || signal.aborted) return;
+          setPagesByViewport((prev) => ({
+            ...prev,
+            [vp]: { ...prev[vp], [route]: page },
+          }));
+        })
+        .catch(() => {
+          // Ignore aborts or transient per-route errors
+        })
+        .finally(() => {
+          if (generationRef.current !== gen) return;
+          setLoadingRoutesByViewport((prev) => ({
+            ...prev,
+            [vp]: { ...prev[vp], [route]: false },
+          }));
+        });
+    }
+  };
+
+  const handleRequestFullPage = (route: string) => {
+    const vp = activeViewport;
+    if (fullPagesByViewport[vp][route] || loadingFullByViewport[vp][route]) return;
+    const gen = generationRef.current;
+    if (!abortRef.current || abortRef.current.signal.aborted) {
+      abortRef.current = new AbortController();
+    }
+    const signal = abortRef.current.signal;
+
+    setLoadingFullByViewport((prev) => ({
+      ...prev,
+      [vp]: { ...prev[vp], [route]: true },
+    }));
+
+    void api
+      .getReviewScreenshot(session.id, { route, viewport: vp, mode: 'full', signal })
+      .then(({ page }) => {
+        if (generationRef.current !== gen || signal.aborted) return;
+        setFullPagesByViewport((prev) => ({
+          ...prev,
+          [vp]: { ...prev[vp], [route]: page },
+        }));
+      })
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        if (generationRef.current !== gen) return;
+        setLoadingFullByViewport((prev) => ({
+          ...prev,
+          [vp]: { ...prev[vp], [route]: false },
+        }));
+      });
   };
 
   const loadReview = async (opts?: { invalidateScreenshots?: boolean }) => {
     try {
-      const rev = await api.getReview(session.id, false, activeViewport);
+      const rev = await api.getReview(session.id, false, activeViewport, currentRoute);
       setCards(rev.cards);
       if (rev.mergeReview) setMergeReview(rev.mergeReview);
+      const resolvedRoutes =
+        rev.targetRoutes && rev.targetRoutes.length > 0
+          ? rev.targetRoutes
+          : [
+              ...new Set([
+                ...rev.cards.map((c) => c.route || '/'),
+                ...(rev.cards.length === 0 ? [currentRoute || '/'] : []),
+              ]),
+            ].slice(0, 4);
+      setTargetRoutes(resolvedRoutes);
       if (opts?.invalidateScreenshots) {
-        setPagesByViewport({});
+        resetScreenshotCache();
       }
-      return rev;
+      return { rev, routes: resolvedRoutes };
     } catch {
       return null;
     } finally {
@@ -148,10 +243,10 @@ export function PublishModal({
         }
       }
       if (!active) return;
-      await loadReview();
-      // Auto-load mobile screenshots non-blockingly on phones; desktop stays opt-in
-      if (active && isPhone) {
-        void fetchScreenshotsFor('mobile');
+      const loaded = await loadReview();
+      // Auto-load cropped screenshots progressively on both mobile and desktop
+      if (active && loaded && loaded.routes.length > 0) {
+        fetchRoutesForViewport(isPhone ? 'mobile' : 'desktop', loaded.routes);
       }
     })();
     return () => {
@@ -161,9 +256,9 @@ export function PublishModal({
 
   useEffect(() => {
     if (state === 'failed_conflict') {
-      void loadReview({ invalidateScreenshots: true }).then(() => {
-        if (screenshotsEnabled || isPhone) {
-          void fetchScreenshotsFor(activeViewport);
+      void loadReview({ invalidateScreenshots: true }).then((loaded) => {
+        if (loaded && loaded.routes.length > 0) {
+          fetchRoutesForViewport(activeViewport, loaded.routes);
         }
       });
     }
@@ -185,6 +280,7 @@ export function PublishModal({
   const hasPendingChoices = mergeReview?.status === 'needs_choices';
 
   const handlePublish = async () => {
+    abortRef.current?.abort();
     setSubmitting(true);
     try {
       let publishTitle = title.trim() || session.title;
@@ -209,17 +305,20 @@ export function PublishModal({
 
   const handleRevertFile = async (filePath: string) => {
     await api.revertFile(session.id, filePath);
-    await loadReview({ invalidateScreenshots: true });
+    const loaded = await loadReview({ invalidateScreenshots: true });
     await onChangedFilesUpdated();
-    if (screenshotsEnabled || isPhone) {
-      void fetchScreenshotsFor(activeViewport);
+    if (loaded && loaded.routes.length > 0) {
+      fetchRoutesForViewport(activeViewport, loaded.routes);
     }
   };
 
   const handleSelectViewport = (vp: 'mobile' | 'desktop') => {
     setActiveViewport(vp);
-    if (!pagesByViewport[vp]) {
-      void fetchScreenshotsFor(vp);
+    const missing = targetRoutes.filter(
+      (r) => !pagesByViewport[vp][r] && !loadingRoutesByViewport[vp][r],
+    );
+    if (missing.length > 0) {
+      fetchRoutesForViewport(vp, missing);
     }
   };
 
@@ -268,7 +367,14 @@ export function PublishModal({
   })();
 
   const changes = includedCards;
-  const activePages = pagesByViewport[activeViewport] ?? [];
+  const activePagesMap = pagesByViewport[activeViewport];
+  const activeLoadingRoutes = loadingRoutesByViewport[activeViewport];
+  const activeFullPagesMap = fullPagesByViewport[activeViewport];
+  const activeLoadingFull = loadingFullByViewport[activeViewport];
+  const activePages = targetRoutes
+    .map((r) => activePagesMap[r])
+    .filter((p): p is VisualDiffPageDto => Boolean(p));
+  const anyScreenshotsLoading = Object.values(activeLoadingRoutes).some(Boolean);
   const progressPct = isPublished
     ? 100
     : Math.min(95, Math.max(12, Math.round(((Math.max(0, activeStepIdx) + 0.5) / STEPS.length) * 100)));
@@ -336,17 +442,17 @@ export function PublishModal({
                     review={mergeReview}
                     onUpdated={(next) => {
                       setMergeReview(next);
-                      void loadReview({ invalidateScreenshots: true }).then(() => {
-                        if (screenshotsEnabled || isPhone) {
-                          void fetchScreenshotsFor(activeViewport);
+                      void loadReview({ invalidateScreenshots: true }).then((loaded) => {
+                        if (loaded && loaded.routes.length > 0) {
+                          fetchRoutesForViewport(activeViewport, loaded.routes);
                         }
                       });
                     }}
                     onUndone={() => {
                       setMergeReview(null);
-                      void loadReview({ invalidateScreenshots: true }).then(() => {
-                        if (screenshotsEnabled || isPhone) {
-                          void fetchScreenshotsFor(activeViewport);
+                      void loadReview({ invalidateScreenshots: true }).then((loaded) => {
+                        if (loaded && loaded.routes.length > 0) {
+                          fetchRoutesForViewport(activeViewport, loaded.routes);
                         }
                       });
                     }}
@@ -361,6 +467,11 @@ export function PublishModal({
                 <VisualReview
                   cards={cards}
                   pages={activePages}
+                  targetRoutes={targetRoutes}
+                  loadingRoutes={activeLoadingRoutes}
+                  fullPagesByRoute={activeFullPagesMap}
+                  loadingFullByRoute={activeLoadingFull}
+                  onRequestFullPage={handleRequestFullPage}
                   isUndoMode={isUndoMode}
                   defaultShowTechnical={persona === 'developer'}
                   excludedPaths={excludedPaths}
@@ -368,11 +479,11 @@ export function PublishModal({
                     setExcludedPaths((prev) => ({ ...prev, [filePath]: !inc }))
                   }
                   onRevertFile={(filePath) => void handleRevertFile(filePath)}
-                  onRequestScreenshots={() => void fetchScreenshotsFor(activeViewport)}
-                  loadingScreenshots={loadingScreenshots}
+                  onRequestScreenshots={() => fetchRoutesForViewport(activeViewport, targetRoutes)}
+                  loadingScreenshots={anyScreenshotsLoading}
                   screenshotViewport={activeViewport}
                   onSelectScreenshotViewport={handleSelectViewport}
-                  screenshotsEnabled={screenshotsEnabled}
+                  screenshotsEnabled={true}
                 />
               )}
             </>

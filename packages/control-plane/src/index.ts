@@ -356,6 +356,7 @@ export function createControlPlane(
     void driver.ensureRunning(session).catch((err) => {
       db.updateSession(id, { status: 'error', publish_error: String(err) });
     });
+    screenshotService.prewarm();
 
     return c.json({ session: enrichSessionDto(session, user) }, 201);
   });
@@ -364,6 +365,9 @@ export function createControlPlane(
     const user = c.get('user');
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
+    if (s.status === 'running' || s.status === 'starting') {
+      screenshotService.prewarm();
+    }
     return c.json({ session: enrichSessionDto(s, user), spend: db.getSpendStatus(user.id) });
   });
 
@@ -379,6 +383,7 @@ export function createControlPlane(
     void driver.ensureRunning(updated).catch((err) => {
       db.updateSession(s.id, { status: 'error', publish_error: String(err) });
     });
+    screenshotService.prewarm();
     return c.json({ session: enrichSessionDto(updated, user) });
   });
 
@@ -1106,15 +1111,19 @@ export function createControlPlane(
     const includeScreenshots = c.req.query('screenshots') === '1';
     const rawViewport = c.req.query('viewport');
     const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
+    const activeRoute = c.req.query('activeRoute') || '';
     const qs = new URLSearchParams({
       baseRef: `origin/${s.base_branch}`,
     });
+    if (activeRoute) qs.set('activeRoute', activeRoute);
+
     const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
     const data = (await res
       .json()
-      .catch(() => ({ cards: [], pages: [], mergeReview: null }))) as {
+      .catch(() => ({ cards: [], pages: [], targetRoutes: [], mergeReview: null }))) as {
       cards: Array<{ route?: string }>;
       pages: unknown[];
+      targetRoutes?: string[];
       draftFiles?: string[];
       mergedFromLiveFiles?: string[];
       astroReady?: boolean;
@@ -1125,14 +1134,21 @@ export function createControlPlane(
       prevBaseSha?: string | null;
     };
 
+    const resolvedRoutes =
+      Array.isArray(data.targetRoutes) && data.targetRoutes.length > 0
+        ? data.targetRoutes
+        : [
+            ...new Set([
+              ...data.cards.map((card) => card.route || '/'),
+              ...(data.cards.length === 0 ? ['/'] : []),
+            ]),
+          ].slice(0, 4);
+    data.targetRoutes = resolvedRoutes;
+
     if (includeScreenshots && res.ok && data.astroReady !== false && ep.astroUrl) {
       const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
       const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
       const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
-      const routes = [
-        ...data.cards.map((card) => card.route || '/'),
-        ...(data.cards.length === 0 ? ['/'] : []),
-      ];
       const envLive = config.liveSiteUrl;
       const liveBaseUrl =
         envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off'
@@ -1140,11 +1156,12 @@ export function createControlPlane(
           : envLive || data.liveSiteUrl || null;
       data.pages = await screenshotService
         .captureLiveVsDraftPages({
-          routes,
+          routes: resolvedRoutes,
           draftFiles: data.draftFiles ?? [],
           mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
           draftBaseUrl,
           liveBaseUrl,
+          baseSha: data.baseSha ?? s.base_sha,
           viewport: screenshotViewport,
           liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
         })
@@ -1152,6 +1169,61 @@ export function createControlPlane(
     }
 
     return c.json(data, res.ok ? 200 : 502);
+  });
+
+  app.get('/api/sessions/:id/review/screenshot', auth.requireAuth, async (c) => {
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    const ep = await driver.ensureRunning(s);
+    const rawRoute = (c.req.query('route') || '/').trim();
+    const cleanRoute = rawRoute.startsWith('/') ? rawRoute : `/${rawRoute}`;
+    if (cleanRoute.includes('..')) {
+      return c.json({ error: 'Invalid route' }, 400);
+    }
+    const rawViewport = c.req.query('viewport');
+    const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
+    const rawMode = c.req.query('mode');
+    const mode = rawMode === 'full' ? 'full' : 'cropped';
+
+    const qs = new URLSearchParams({ baseRef: `origin/${s.base_branch}` });
+    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
+    if (!res.ok) {
+      return c.json({ error: 'Failed to load review metadata' }, 502);
+    }
+    const data = (await res.json().catch(() => ({}))) as {
+      draftFiles?: string[];
+      mergedFromLiveFiles?: string[];
+      astroReady?: boolean;
+      previewBase?: string;
+      liveSiteUrl?: string | null;
+      baseSha?: string;
+    };
+    if (data.astroReady === false || !ep.astroUrl) {
+      return c.json({ error: 'Preview server is not ready' }, 503);
+    }
+
+    const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
+    const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
+    const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
+    const envLive = config.liveSiteUrl;
+    const liveBaseUrl =
+      envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off'
+        ? null
+        : envLive || data.liveSiteUrl || null;
+
+    const page = await screenshotService.captureRouteReview({
+      route: cleanRoute,
+      draftFiles: data.draftFiles ?? [],
+      mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
+      draftBaseUrl,
+      liveBaseUrl,
+      baseSha: data.baseSha ?? s.base_sha,
+      viewport: screenshotViewport,
+      mode,
+      liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+    });
+
+    return c.json({ page });
   });
 
   app.get('/api/sessions/:id/upstream-status', auth.requireAuth, async (c) => {

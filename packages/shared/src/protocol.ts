@@ -566,12 +566,43 @@ export interface VisualDiffHighlightDto {
   file?: string;
 }
 
+export interface VisualDiffHunkDto {
+  id: string;
+  liveScreenshotDataUrl?: string;
+  draftScreenshotDataUrl: string;
+  highlights: VisualDiffHighlightDto[];
+  /** Cropped pixel dimensions (after any bottom height-alignment padding). */
+  width: number;
+  height: number;
+  /** Original Y range in Draft full-page coordinates (px). */
+  draftCropY: number;
+  draftCropHeight: number;
+  /** Original Y range in Live full-page coordinates (px), when Live was captured. */
+  liveCropY?: number;
+  liveCropHeight?: number;
+  /** Horizontal crop box in full-page coordinates (px). */
+  cropX: number;
+  cropWidth: number;
+  /** Unchanged vertical pixels trimmed immediately before this hunk. */
+  unchangedBeforePx: number;
+}
+
 export interface VisualDiffViewportShotDto {
   liveScreenshotDataUrl?: string;
   draftScreenshotDataUrl?: string;
   highlights: VisualDiffHighlightDto[];
   width?: number;
   height?: number;
+  /** Cropped diff hunks (1..4), or empty when identical === true. */
+  hunks?: VisualDiffHunkDto[];
+  /** Unchanged vertical pixels trimmed below the final hunk (or below 1400px Draft-only preview). */
+  unchangedAfterPx?: number;
+  /** True when Live and Draft rendered pixel-identically across the full page. */
+  identical?: boolean;
+  /** Full uncropped page dimensions (px) for context & "Full page" toggle. */
+  fullWidth?: number;
+  fullHeight?: number;
+  hasFullPage?: boolean;
 }
 
 export interface VisualDiffPageDto {
