@@ -43,6 +43,7 @@ import {
   Tablet,
   Undo2,
   X,
+  Zap,
 } from 'lucide-react';
 import { elementKey, friendlyElementKind } from '@halley/shared';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -1152,6 +1153,15 @@ export function EditorPage({
             <ArrowLeft className="h-4 w-4" />
           </button>
           <span className="truncate text-sm font-semibold text-stone-900">{session.title}</span>
+          {session.activeModelLabel && (
+            <span
+              title="Initial optimization refactor model — automatically steps back to default model once complete"
+              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-900"
+            >
+              <Zap className="h-3 w-3 text-amber-600" />
+              Optimizing ({session.activeModelLabel})
+            </span>
+          )}
           {!session.canEdit && (
             <span className="rounded-full bg-stone-100 px-2.5 py-0.5 text-xs font-medium text-stone-600">
               {session.status === 'published'

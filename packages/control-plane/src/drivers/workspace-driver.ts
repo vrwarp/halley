@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { BootProgressDto } from '@halley/shared';
+import type { AstroAuditReportDto, BootProgressDto } from '@halley/shared';
 import type { SessionRecord } from '../db.js';
 
 const execFileAsync = promisify(execFile);
@@ -197,6 +197,11 @@ export interface WorkspaceDriver {
   stopWarmPool?(): Promise<void>;
   reserveWarmWorkspace?(): Promise<WarmReservation | null> | WarmReservation | null;
   getWarmPoolStatus?(): WarmPoolStatus;
+  scanRepository?(baseBranch: string): Promise<{
+    sha: string;
+    report: AstroAuditReportDto;
+    digest: string;
+  }>;
   close?(): Promise<void>;
 }
 

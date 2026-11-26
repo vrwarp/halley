@@ -10,11 +10,16 @@ import {
   type ChatServerMessage,
   type ConflictResolutionRecordDto,
   type MergeReviewStateDto,
+  type OptimizationFindingDto,
 } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { AstroDevManager, detectAstroSiteUrl } from './astro-manager.js';
+import {
+  buildOptimizationPrompt,
+  runDeterministicOptimizationPrePass,
+} from './astro-optimizer.js';
 import {
   createCheckpoint,
   ensureGitRerere,
@@ -141,6 +146,18 @@ function notifySessionDiverged(): void {
   if (!CONTROL_PLANE_INTERNAL_URL || !WORKSPACE_TOKEN) return;
   const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/diverged`;
   void fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${WORKSPACE_TOKEN}`,
+    },
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
+async function notifyOptimizationSettled(): Promise<void> {
+  if (!CONTROL_PLANE_INTERNAL_URL || !WORKSPACE_TOKEN) return;
+  const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/optimization-settled`;
+  await fetch(endpoint, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${WORKSPACE_TOKEN}`,
@@ -1353,6 +1370,55 @@ async function main() {
     const buf = Buffer.from(await file.arrayBuffer());
     const staged = await uploadManager.stageImage(file.name, file.type || 'image/png', buf);
     return c.json({ attachment: staged });
+  });
+
+  app.post('/internal/optimize/start', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
+    const body = (await c.req.json().catch(() => ({}))) as {
+      findings?: OptimizationFindingDto[];
+      modelId?: string;
+      defaultModelId?: string;
+      thinkingLevel?: 'off' | 'low' | 'medium' | 'high';
+    };
+    const findings = body.findings ?? [];
+
+    const prePass = await runDeterministicOptimizationPrePass(REPO_ROOT, findings, gitIdentity);
+    if (prePass.checkpoint) {
+      const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
+      broadcast({
+        type: 'checkpoint_created',
+        checkpoint: prePass.checkpoint,
+        changedFilesCount: changes.length,
+      });
+      notifySessionDiverged();
+    }
+
+    if (prePass.agentFindings.length > 0 && piRuntime) {
+      const promptText = buildOptimizationPrompt({
+        agentFindings: prePass.agentFindings,
+        completedDeterministic: prePass.completedSummaries,
+      });
+      await piRuntime.submitOptimizationRequest(promptText, {
+        modelId: body.modelId || MODEL_ID,
+        defaultModelId: body.defaultModelId || MODEL_ID,
+        thinkingLevel: body.thinkingLevel,
+        defaultThinkingLevel: THINKING_LEVEL,
+        onSettled: () => notifyOptimizationSettled(),
+      });
+    } else {
+      await notifyOptimizationSettled();
+      if (prePass.completedSummaries.length > 0) {
+        scheduleIdleSpeculativeVerify(1_000);
+      }
+    }
+
+    return c.json({
+      ok: true,
+      completedDeterministic: prePass.completedSummaries,
+      agentRefactorCount: prePass.agentFindings.length,
+      checkpoint: prePass.checkpoint,
+    });
   });
 
   app.post('/internal/prompt', async (c) => {

@@ -368,6 +368,7 @@ export interface EditorSessionDto {
   volumeExpired: boolean;
   astroBase: string;
   changedFilesCount: number;
+  activeModelLabel?: string | null;
   lastActiveAt: string;
   createdAt: string;
 }
@@ -449,7 +450,7 @@ export interface RevertedCommitSummaryDto {
     deletions: number;
   }>;
 }
-export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff';
+export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff' | 'optimize';
 
 export type ConflictCategory =
   | 'adjacent_disjoint'
@@ -883,4 +884,87 @@ export function validateNewPageRoute(input: ValidateNewPageRouteInput): Validate
     normalizedSlug: cleanSlug,
   };
 }
+
+// ============================================================================
+// Optimize Astro — Halley Readiness & Speed Advisor DTOs
+// ============================================================================
+
+export type OptimizationPillar =
+  | 'inline_edit'
+  | 'agent_context'
+  | 'source_mapping'
+  | 'guardrails'
+  | 'speed_and_ci';
+
+export type OptimizationActionKind =
+  | 'deterministic_webp'
+  | 'deterministic_gitignore'
+  | 'agent_refactor'
+  | 'workflow_yaml';
+
+export interface OptimizationFindingDto {
+  id: string;
+  pillar: OptimizationPillar;
+  severity: 'high' | 'medium' | 'low';
+  actionKind: OptimizationActionKind;
+  source: 'static' | 'ai';
+  title: string;
+  description: string;
+  impactLabel: string;
+  files: Array<{ path: string; line?: number; detail?: string }>;
+  scorePenalty: number;
+  workflowSuggestion?: {
+    targetPath: string;
+    githubEditUrl: string;
+    yamlContent: string;
+  };
+  webpCandidate?: {
+    publicRelPath: string;
+    bytes: number;
+  };
+  agentInstructions?: string;
+}
+
+export interface AstroAuditMetricsDto {
+  totalTextElements: number;
+  inlineEditableElements: number;
+  inlineEditablePct: number;
+  intentionalDynamicElements: number;
+  avoidableLockedElements: number;
+  astroPageCount: number;
+  oversizedImageBytes: number;
+}
+
+export interface AstroAuditReportDto {
+  id: string;
+  sha: string;
+  shortSha: string;
+  baseBranch: string;
+  score: number;
+  pillarScores: Record<OptimizationPillar, number>;
+  metrics: AstroAuditMetricsDto;
+  findings: OptimizationFindingDto[];
+  aiReviewedAt: string | null;
+  aiSummary: string | null;
+  aiCostUsd: number;
+  createdAt: string;
+  previousReport?: {
+    sha: string;
+    shortSha: string;
+    score: number;
+    inlineEditablePct: number;
+    createdAt: string;
+  } | null;
+}
+
+export interface OptimizeAiEstimateDto {
+  sha: string;
+  modelId: string;
+  inputTokens: number;
+  estimatedUsd: number;
+  ceilingUsd: number;
+  remainingBudgetUsd: number;
+  alreadyReviewed: boolean;
+}
+
 

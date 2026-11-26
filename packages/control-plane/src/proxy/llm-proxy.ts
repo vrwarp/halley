@@ -76,6 +76,7 @@ export function isModelAllowedForPurpose(
   requestedModel: string,
   purpose: SpendPurpose,
   config: Pick<HalleyConfig, 'modelId' | 'conflictModelId' | 'escalationModelId'>,
+  opts?: { sessionEscalationAllowed?: boolean },
 ): boolean {
   const allowedBaseIds = new Set([config.modelId, config.conflictModelId]);
   if (allowedBaseIds.has(requestedModel)) return true;
@@ -86,7 +87,10 @@ export function isModelAllowedForPurpose(
   );
   if (reqFamily && baseFamilies.has(reqFamily)) return true;
 
-  if (purpose === 'conflict-escalation') {
+  if (
+    purpose === 'conflict-escalation' ||
+    (purpose === 'optimize' && opts?.sessionEscalationAllowed)
+  ) {
     if (requestedModel === config.escalationModelId) return true;
     const escFamily = modelFamily(config.escalationModelId);
     if (reqFamily && escFamily && reqFamily === escFamily) return true;
@@ -104,6 +108,7 @@ const VALID_PURPOSES = new Set<SpendPurpose>([
   'conflict',
   'conflict-escalation',
   'handoff',
+  'optimize',
 ]);
 
 // Tracks in-flight spend per escalation runId so streaming responses can abort at the ceiling (F16)
@@ -158,7 +163,11 @@ export function createLlmProxyHandler(
 
     // F15: Enforce model allowlist (count_tokens is allowed for escalation model estimation)
     const allowCheckPurpose: SpendPurpose = isCountTokens ? 'conflict-escalation' : purpose;
-    if (!isModelAllowedForPurpose(requestedModel, allowCheckPurpose, config)) {
+    if (
+      !isModelAllowedForPurpose(requestedModel, allowCheckPurpose, config, {
+        sessionEscalationAllowed: Boolean(session.optimize_escalation_allowed),
+      })
+    ) {
       return c.json(
         {
           type: 'error',

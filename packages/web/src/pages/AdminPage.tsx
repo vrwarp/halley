@@ -2,13 +2,15 @@ import type { AllowlistEntryDto, EditorSessionDto } from '@halley/shared';
 import { ArrowLeft, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { OptimizeAstroPanel } from '../components/OptimizeAstroPanel.js';
 
 interface Props {
   onBack: () => void;
   onOpenSession: (id: string) => void;
+  focusOptimize?: boolean;
 }
 
-export function AdminPage({ onBack, onOpenSession }: Props) {
+export function AdminPage({ onBack, onOpenSession, focusOptimize }: Props) {
   const [allowlist, setAllowlist] = useState<AllowlistEntryDto[]>([]);
   const [capInput, setCapInput] = useState('10');
   const [todaySpend, setTodaySpend] = useState<
@@ -54,11 +56,19 @@ export function AdminPage({ onBack, onOpenSession }: Props) {
           >
             <ArrowLeft className="h-4 w-4" />
           </button>
-          <h1 className="text-sm font-semibold text-stone-900">Admin &amp; Access Control</h1>
+          <h1 className="text-sm font-semibold text-stone-900">
+            Admin, Readiness &amp; Access Control
+          </h1>
         </div>
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8 space-y-8">
+        <OptimizeAstroPanel
+          onOpenSession={onOpenSession}
+          onSpendChanged={() => void load()}
+          autoFocus={focusOptimize}
+        />
+
         {/* Allowlist */}
         <section className="rounded-2xl border border-[#E7E5E4] bg-white p-6">
           <h2 className="text-base font-semibold text-stone-900">Allowed Editors</h2>

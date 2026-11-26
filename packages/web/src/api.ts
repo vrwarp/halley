@@ -1,5 +1,6 @@
 import type {
   AllowlistEntryDto,
+  AstroAuditReportDto,
   ChangeCardDto,
   CheckpointInfo,
   CreatePageRequest,
@@ -9,6 +10,7 @@ import type {
   GitFileChange,
   LiveHistoryEntryDto,
   MergeReviewStateDto,
+  OptimizeAiEstimateDto,
   PageCreationOptionsDto,
   PageRequestMetadata,
   SiteRouteEntryDto,
@@ -344,4 +346,45 @@ export const api = {
     }),
   sleepSession: (id: string) =>
     apiFetch<{ ok: boolean }>(`/api/admin/sessions/${id}/sleep`, { method: 'POST' }),
+
+  adminOptimizeLatest: () =>
+    apiFetch<{
+      report: AstroAuditReportDto | null;
+      defaultModelId: string;
+      escalationModelId: string;
+      aiCeilingUsd: number;
+    }>('/api/admin/optimize/latest'),
+  adminOptimizeScan: (force = false) =>
+    apiFetch<{
+      report: AstroAuditReportDto;
+      defaultModelId: string;
+      escalationModelId: string;
+    }>('/api/admin/optimize/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    }),
+  adminOptimizeAiEstimate: (sha: string) =>
+    apiFetch<{ estimate: OptimizeAiEstimateDto }>('/api/admin/optimize/ai-estimate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha }),
+    }),
+  adminOptimizeAiReview: (sha: string) =>
+    apiFetch<{ report: AstroAuditReportDto }>('/api/admin/optimize/ai-review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha }),
+    }),
+  adminCreateOptimizationDraft: (body: {
+    sha: string;
+    findingIds: string[];
+    useEscalationModel?: boolean;
+    title?: string;
+  }) =>
+    apiFetch<{ session: EditorSessionDto }>('/api/admin/optimize/create-draft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
 };

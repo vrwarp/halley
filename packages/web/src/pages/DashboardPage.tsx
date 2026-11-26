@@ -12,6 +12,7 @@ import {
   Settings,
   Sparkles,
   Trash2,
+  Zap,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
@@ -24,6 +25,7 @@ interface Props {
   spend: SpendStatusDto;
   onOpenSession: (id: string, opts?: { openPublish?: boolean }) => void;
   onOpenAdmin: () => void;
+  onOpenOptimize?: () => void;
   onRefresh: () => Promise<void>;
   onLogout: () => Promise<void>;
 }
@@ -103,6 +105,7 @@ export function DashboardPage({
   spend,
   onOpenSession,
   onOpenAdmin,
+  onOpenOptimize,
   onRefresh,
   onLogout,
 }: Props) {
@@ -238,14 +241,27 @@ export function DashboardPage({
               {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}
             </span>
             {user.isAdmin && (
-              <button
-                type="button"
-                onClick={onOpenAdmin}
-                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 sm:px-3"
-              >
-                <Settings className="h-3.5 w-3.5" />
-                <span>Admin</span>
-              </button>
+              <>
+                {onOpenOptimize && (
+                  <button
+                    type="button"
+                    onClick={onOpenOptimize}
+                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50/70 px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100/70 sm:px-3"
+                  >
+                    <Zap className="h-3.5 w-3.5 text-amber-600" />
+                    <span className="hidden sm:inline">Optimize Astro</span>
+                    <span className="sm:hidden">Optimize</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={onOpenAdmin}
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 sm:px-3"
+                >
+                  <Settings className="h-3.5 w-3.5" />
+                  <span>Admin</span>
+                </button>
+              </>
             )}
             <div className="flex items-center gap-1.5 border-l border-stone-200 pl-2 sm:gap-2 sm:pl-3">
               <span className="hidden max-w-[120px] truncate text-xs font-medium text-stone-700 sm:inline">

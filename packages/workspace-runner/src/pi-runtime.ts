@@ -6,6 +6,7 @@ import { anthropicProvider } from '@earendil-works/pi-ai/providers/anthropic';
 import {
   AssistantEntry,
   CompactionEntry,
+  configure,
   createRegistry,
   defineExtension,
   defineTool,
@@ -199,6 +200,7 @@ export class HalleyPiRuntime {
   private images!: Awaited<ReturnType<typeof createNodePhotonImages>>;
   private models = createModels();
   private resolvedModelId = '';
+  private activePurpose: 'chat' | 'optimize' = 'chat';
   private lastEditorContext: EditorContext | null = null;
   private agentsMdText: string | null = null;
   private systemContextNotes: string[] = [];
@@ -285,6 +287,7 @@ export class HalleyPiRuntime {
             auth: {
               headers: {
                 Authorization: `Bearer ${this.opts.workspaceToken}`,
+                'x-halley-purpose': this.activePurpose,
               },
             },
             source: 'Halley WORKSPACE_TOKEN',
@@ -1242,6 +1245,66 @@ export class HalleyPiRuntime {
         this.trackedPageRequestIds.delete(id);
       }
     }
+  }
+
+  async reconfigureModel(
+    modelAliasOrId: string,
+    purpose: 'chat' | 'optimize' = 'chat',
+    thinkingLevel?: 'off' | 'low' | 'medium' | 'high',
+  ): Promise<string> {
+    const nextResolved = resolveAnthropicModelId(modelAliasOrId, this.availableModelIds);
+    this.resolvedModelId = nextResolved;
+    this.activePurpose = purpose;
+    await this.root.commit(
+      (tx) =>
+        configure(tx, this.root.id, {
+          model: { provider: 'anthropic', modelId: nextResolved },
+          ...(thinkingLevel ? { thinkingLevel } : {}),
+        }),
+      BACKGROUND_CONTEXT,
+    );
+    return nextResolved;
+  }
+
+  async submitOptimizationRequest(
+    promptText: string,
+    opts: {
+      modelId: string;
+      defaultModelId: string;
+      thinkingLevel?: 'off' | 'low' | 'medium' | 'high';
+      defaultThinkingLevel?: 'off' | 'low' | 'medium' | 'high';
+      onSettled?: () => Promise<void> | void;
+    },
+  ): Promise<void> {
+    await this.reconfigureModel(opts.modelId, 'optimize', opts.thinkingLevel);
+    const sub = await this.root.submit(
+      {
+        type: 'input',
+        requestId: `optimize-${Date.now()}`,
+        content: [{ type: 'text', text: promptText }],
+      },
+      BACKGROUND_CONTEXT,
+    );
+
+    void sub
+      .wait(BACKGROUND_CONTEXT)
+      .catch(() => {})
+      .finally(async () => {
+        try {
+          await this.reconfigureModel(
+            opts.defaultModelId,
+            'chat',
+            opts.defaultThinkingLevel ?? this.opts.thinkingLevel,
+          );
+        } catch {
+          this.activePurpose = 'chat';
+        }
+        try {
+          await opts.onSettled?.();
+        } catch {
+          // ignore callback failure
+        }
+      });
   }
 
   async continueRun(): Promise<void> {

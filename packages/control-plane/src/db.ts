@@ -4,7 +4,9 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   AllowlistEntryDto,
+  AstroAuditReportDto,
   EditorSessionDto,
+  OptimizationFindingDto,
   PublishState,
   SessionArchiveDto,
   SessionKind,
@@ -46,6 +48,8 @@ export interface SessionRecord {
   workspace_token_hash: string;
   astro_base: string;
   changed_files_count: number;
+  optimize_escalation_allowed: number;
+  active_model_label: string | null;
   last_active_at: string;
   archived_at: string | null;
   node_modules_pruned_at: string | null;
@@ -160,6 +164,21 @@ export class ControlPlaneDb {
         output_tokens INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS astro_audit_reports (
+        sha TEXT PRIMARY KEY,
+        base_branch TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        inline_editable_pct REAL NOT NULL DEFAULT 0,
+        report_json TEXT NOT NULL,
+        digest_text TEXT NOT NULL DEFAULT '',
+        ai_reviewed_at TEXT,
+        ai_summary TEXT,
+        ai_findings_json TEXT,
+        ai_cost_usd REAL NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
 
     // Idempotent migrations for existing SQLite databases created before P0
@@ -181,6 +200,8 @@ export class ControlPlaneDb {
     addCol('prev_base_sha', 'TEXT');
     addCol('node_modules_pruned_at', 'TEXT');
     addCol('volume_expired_at', 'TEXT');
+    addCol('optimize_escalation_allowed', 'INTEGER NOT NULL DEFAULT 0');
+    addCol('active_model_label', 'TEXT');
 
     const existingCap = this.db
       .prepare('SELECT value FROM settings WHERE key = ?')
@@ -689,8 +710,178 @@ export class ControlPlaneDb {
       volumeExpired: Boolean(row.volume_expired_at),
       astroBase: row.astro_base,
       changedFilesCount: row.changed_files_count,
+      activeModelLabel: row.active_model_label ?? null,
       lastActiveAt: row.last_active_at,
       createdAt: row.created_at,
     };
+  }
+
+  private hydrateAuditReportRow(row: {
+    sha: string;
+    base_branch: string;
+    score: number;
+    inline_editable_pct: number;
+    report_json: string;
+    digest_text: string;
+    ai_reviewed_at: string | null;
+    ai_summary: string | null;
+    ai_findings_json: string | null;
+    ai_cost_usd: number;
+    created_at: string;
+    updated_at: string;
+  }): { report: AstroAuditReportDto; digest: string } {
+    const parsed = JSON.parse(row.report_json) as AstroAuditReportDto;
+    const aiFindings: OptimizationFindingDto[] = row.ai_findings_json
+      ? (JSON.parse(row.ai_findings_json) as OptimizationFindingDto[])
+      : [];
+    const staticFindings = parsed.findings.filter((f) => f.source !== 'ai');
+    const mergedFindings = [...staticFindings, ...aiFindings];
+
+    const prevRow = this.db
+      .prepare(
+        `SELECT sha, score, inline_editable_pct, created_at
+         FROM astro_audit_reports
+         WHERE base_branch = ?
+           AND sha != ?
+           AND rowid < (SELECT rowid FROM astro_audit_reports WHERE sha = ?)
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .get(row.base_branch, row.sha, row.sha) as
+      | { sha: string; score: number; inline_editable_pct: number; created_at: string }
+      | undefined;
+
+    return {
+      digest: row.digest_text,
+      report: {
+        ...parsed,
+        score: row.score,
+        findings: mergedFindings,
+        aiReviewedAt: row.ai_reviewed_at,
+        aiSummary: row.ai_summary,
+        aiCostUsd: Number((row.ai_cost_usd ?? 0).toFixed(4)),
+        createdAt: row.created_at,
+        previousReport: prevRow
+          ? {
+              sha: prevRow.sha,
+              shortSha: prevRow.sha.slice(0, 7),
+              score: prevRow.score,
+              inlineEditablePct: prevRow.inline_editable_pct,
+              createdAt: prevRow.created_at,
+            }
+          : null,
+      },
+    };
+  }
+
+  getAuditReport(sha: string): { report: AstroAuditReportDto; digest: string } | null {
+    const row = this.db
+      .prepare('SELECT * FROM astro_audit_reports WHERE sha = ?')
+      .get(sha) as
+      | {
+          sha: string;
+          base_branch: string;
+          score: number;
+          inline_editable_pct: number;
+          report_json: string;
+          digest_text: string;
+          ai_reviewed_at: string | null;
+          ai_summary: string | null;
+          ai_findings_json: string | null;
+          ai_cost_usd: number;
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (!row) return null;
+    return this.hydrateAuditReportRow(row);
+  }
+
+  getLatestAuditReport(baseBranch: string): { report: AstroAuditReportDto; digest: string } | null {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM astro_audit_reports WHERE base_branch = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(baseBranch) as
+      | {
+          sha: string;
+          base_branch: string;
+          score: number;
+          inline_editable_pct: number;
+          report_json: string;
+          digest_text: string;
+          ai_reviewed_at: string | null;
+          ai_summary: string | null;
+          ai_findings_json: string | null;
+          ai_cost_usd: number;
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (!row) return null;
+    return this.hydrateAuditReportRow(row);
+  }
+
+  upsertStaticAuditReport(input: {
+    sha: string;
+    baseBranch: string;
+    report: AstroAuditReportDto;
+    digest: string;
+  }): AstroAuditReportDto {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO astro_audit_reports (
+           sha, base_branch, score, inline_editable_pct, report_json, digest_text, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(sha) DO UPDATE SET
+           score = excluded.score,
+           inline_editable_pct = excluded.inline_editable_pct,
+           report_json = excluded.report_json,
+           digest_text = excluded.digest_text,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.sha,
+        input.baseBranch,
+        input.report.score,
+        input.report.metrics.inlineEditablePct,
+        JSON.stringify(input.report),
+        input.digest,
+        now,
+        now,
+      );
+    return this.getAuditReport(input.sha)!.report;
+  }
+
+  saveAiAuditReview(input: {
+    sha: string;
+    summary: string;
+    findings: OptimizationFindingDto[];
+    costUsd: number;
+    updatedScore?: number;
+  }): AstroAuditReportDto | null {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE astro_audit_reports
+         SET ai_reviewed_at = ?,
+             ai_summary = ?,
+             ai_findings_json = ?,
+             ai_cost_usd = ai_cost_usd + ?,
+             score = COALESCE(?, score),
+             updated_at = ?
+         WHERE sha = ?`,
+      )
+      .run(
+        now,
+        input.summary,
+        JSON.stringify(input.findings),
+        input.costUsd,
+        input.updatedScore ?? null,
+        now,
+        input.sha,
+      );
+    return this.getAuditReport(input.sha)?.report ?? null;
   }
 }
