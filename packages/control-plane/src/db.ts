@@ -22,6 +22,7 @@ export interface SessionRecord {
   parent_session_id: string | null;
   reverts_sha: string | null;
   revert_reason: string | null;
+  initial_revert_sha: string | null;
   owner_user_id: string;
   owner_name?: string;
   owner_email?: string;
@@ -108,6 +109,7 @@ export class ControlPlaneDb {
         parent_session_id TEXT,
         reverts_sha TEXT,
         revert_reason TEXT,
+        initial_revert_sha TEXT,
         owner_user_id TEXT NOT NULL REFERENCES users(id),
         repo TEXT NOT NULL,
         base_branch TEXT NOT NULL,
@@ -175,6 +177,7 @@ export class ControlPlaneDb {
     addCol('parent_session_id', 'TEXT');
     addCol('reverts_sha', 'TEXT');
     addCol('revert_reason', 'TEXT');
+    addCol('initial_revert_sha', 'TEXT');
     addCol('prev_base_sha', 'TEXT');
     addCol('node_modules_pruned_at', 'TEXT');
     addCol('volume_expired_at', 'TEXT');
@@ -626,6 +629,31 @@ export class ControlPlaneDb {
       )
       .get(revertsSha, excludeSessionId ?? '') as SessionRecord | undefined;
     return row ?? null;
+  }
+
+  /**
+   * Converts a `revert` draft into a standard `continuation` (when it has a parent session)
+   * or `edit` session once files diverge from the initial full revert. Clears `reverts_sha`
+   * so Live History does not badge the original commit as wholly undone, and updates an
+   * untouched `Undo: <X>` title to `Continued: <X>` / `Adjusted: <X>`.
+   */
+  convertRevertSession(sessionId: string): SessionRecord | null {
+    const existing = this.getSession(sessionId);
+    if (!existing || existing.kind !== 'revert') return null;
+
+    const nextKind: SessionKind = existing.parent_session_id ? 'continuation' : 'edit';
+    let nextTitle = existing.title;
+    if (existing.title.startsWith('Undo: ')) {
+      const base = existing.title.slice('Undo: '.length).trim() || 'Website update';
+      nextTitle = existing.parent_session_id ? `Continued: ${base}` : `Adjusted: ${base}`;
+    }
+
+    this.updateSession(sessionId, {
+      kind: nextKind,
+      reverts_sha: null,
+      title: nextTitle,
+    });
+    return this.getSession(sessionId);
   }
 
   toSessionDto(row: SessionRecord, viewer: UserDto): EditorSessionDto {

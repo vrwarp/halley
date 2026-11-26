@@ -464,6 +464,11 @@ export function EditorPage({
           if (!msg.checkpoint.message.startsWith('Inline edit in ')) {
             reloadPreview();
           }
+          if (session?.kind === 'revert') {
+            void loadSessionMeta();
+          }
+        } else if (msg.type === 'session_meta_updated') {
+          void loadSessionMeta();
         } else if (msg.type === 'publish_state') {
           setPublishProgress(msg.payload);
           if (msg.payload.state === 'published') {
@@ -1484,9 +1489,18 @@ export function EditorPage({
                 })}
                 <div className="flex items-center gap-2 py-1 text-[11px] font-medium text-stone-500">
                   <div className="h-px flex-1 bg-stone-200" />
-                  <span>
-                    Continued from &ldquo;{priorThread.parentTitle}&rdquo; ·{' '}
-                    {new Date(priorThread.parentPublishedAt).toLocaleDateString()}
+                  <span className="truncate max-w-[85%]">
+                    {session.kind === 'revert' ? (
+                      <>
+                        Undoing &ldquo;{priorThread.parentTitle}&rdquo;
+                        {session.revertReason ? ` · ${session.revertReason}` : ''}
+                      </>
+                    ) : (
+                      <>
+                        Continued from &ldquo;{priorThread.parentTitle}&rdquo; ·{' '}
+                        {new Date(priorThread.parentPublishedAt).toLocaleDateString()}
+                      </>
+                    )}
                   </span>
                   <div className="h-px flex-1 bg-stone-200" />
                 </div>
@@ -1494,20 +1508,35 @@ export function EditorPage({
             )}
 
             {entries.length === 0 && Object.keys(pageRequestsMap).length === 0 && !live.busy && (
-              <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
-                <div>
-                  <p className="font-medium text-stone-900">Ready when you are.</p>
-                  <p className="mt-1 text-xs leading-relaxed text-stone-500">
-                    Ask Halley to update schedules, add pages, or upload photos — or click any text in the preview using <strong>Edit</strong> mode to tweak copy directly.
-                  </p>
+              session.kind === 'revert' ? (
+                <div className="space-y-2.5 rounded-xl border border-amber-200 bg-amber-50/60 p-4 text-sm text-stone-700">
+                  <div>
+                    <p className="font-medium text-stone-900">
+                      Undo draft ready to review or refine.
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-stone-600">
+                      All changes from this update are currently undone in the preview
+                      {session.revertReason ? ` (Reason: “${session.revertReason}”)` : ''}. Click{' '}
+                      <strong>Publish</strong> to undo everything, or tell Halley here if you only
+                      want to undo a specific part and keep the rest.
+                    </p>
+                  </div>
                 </div>
-                {session.canEdit && (
-                  <div className="flex flex-wrap gap-1.5 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => openNewPageWizard()}
-                      className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50/70 px-2.5 py-1 text-left text-[11px] font-medium text-amber-900 transition hover:bg-amber-100"
-                    >
+              ) : (
+                <div className="space-y-3 rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 text-sm text-stone-600">
+                  <div>
+                    <p className="font-medium text-stone-900">Ready when you are.</p>
+                    <p className="mt-1 text-xs leading-relaxed text-stone-500">
+                      Ask Halley to update schedules, add pages, or upload photos — or click any text in the preview using <strong>Edit</strong> mode to tweak copy directly.
+                    </p>
+                  </div>
+                  {session.canEdit && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => openNewPageWizard()}
+                        className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50/70 px-2.5 py-1 text-left text-[11px] font-medium text-amber-900 transition hover:bg-amber-100"
+                      >
                       <FilePlus className="h-3 w-3" />
                       Add a new page
                     </button>
@@ -1528,6 +1557,7 @@ export function EditorPage({
                   </div>
                 )}
               </div>
+              )
             )}
 
             {groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
@@ -2278,14 +2308,28 @@ export function EditorPage({
                 })}
                 <div className="flex items-center gap-2 py-1 text-[11px] font-medium text-stone-500">
                   <div className="h-px flex-1 bg-stone-200" />
-                  <span>Continued from &ldquo;{priorThread.parentTitle}&rdquo;</span>
+                  <span className="truncate max-w-[85%]">
+                    {session.kind === 'revert'
+                      ? `Undoing “${priorThread.parentTitle}”`
+                      : `Continued from “${priorThread.parentTitle}”`}
+                  </span>
                   <div className="h-px flex-1 bg-stone-200" />
                 </div>
               </div>
             )}
 
             {entries.length === 0 && Object.keys(pageRequestsMap).length === 0 ? (
-              <p className="py-8 text-center text-xs text-stone-500">No messages yet.</p>
+              session.kind === 'revert' ? (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-3.5 text-xs text-stone-600">
+                  <p className="font-medium text-stone-900">Undo draft ready to review or refine.</p>
+                  <p className="mt-1 leading-relaxed">
+                    All changes from this update are currently undone in the preview. Tell Halley
+                    here if you only want to undo a specific part and keep the rest.
+                  </p>
+                </div>
+              ) : (
+                <p className="py-8 text-center text-xs text-stone-500">No messages yet.</p>
+              )
             ) : (
               groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
                 if (block.kind === 'steps') {

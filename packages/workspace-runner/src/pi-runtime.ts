@@ -956,6 +956,7 @@ export class HalleyPiRuntime {
       systemPrompt: {
         halleyRole: this.buildHalleyRolePrompt(),
         agentsMd: this.agentsMdText,
+        contextNotes: [...this.systemContextNotes],
       },
       usageUsd: mapped.usageUsd,
       usageByModel: (usageDoc?.models ?? {}) as Record<string, unknown>,

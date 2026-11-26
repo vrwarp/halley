@@ -133,6 +133,18 @@ function broadcast(msg: ChatServerMessage): void {
   }
 }
 
+function notifySessionDiverged(): void {
+  if (!CONTROL_PLANE_INTERNAL_URL || !WORKSPACE_TOKEN) return;
+  const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/diverged`;
+  void fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${WORKSPACE_TOKEN}`,
+    },
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
 let inlineEditTimer: NodeJS.Timeout | null = null;
 function scheduleInlineCheckpoint(summary: string): void {
   if (inlineEditTimer) clearTimeout(inlineEditTimer);
@@ -146,6 +158,7 @@ function scheduleInlineCheckpoint(summary: string): void {
           checkpoint: ckpt,
           changedFilesCount: changes.length,
         });
+        notifySessionDiverged();
       }
     } catch {
       // ignore background checkpoint error
@@ -191,7 +204,12 @@ async function main() {
     fileLock,
     getAstroPort: () => ASTRO_PORT,
     getPreviewBase: () => previewBase,
-    onBroadcast: (msg) => broadcast(msg),
+    onBroadcast: (msg) => {
+      broadcast(msg);
+      if (msg.type === 'checkpoint_created') {
+        notifySessionDiverged();
+      }
+    },
   });
   await pageService.load();
 
@@ -224,6 +242,7 @@ async function main() {
           checkpoint: ckpt,
           changedFilesCount: changes.length,
         });
+        notifySessionDiverged();
       }
     },
     pauseAstroForBuild: async () => {

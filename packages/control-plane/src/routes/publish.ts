@@ -16,6 +16,7 @@ export class PublishService {
     private driver: WorkspaceDriver,
     private github: GitHubService,
     private broadcastPublish: (sessionId: string, payload: PublishProgressPayload) => void,
+    private onSessionMetaUpdated?: (sessionId: string) => void,
   ) {}
 
   private setState(
@@ -33,20 +34,31 @@ export class PublishService {
   }
 
   async publish(
-    session: SessionRecord,
+    sessionInput: SessionRecord,
     actor: UserDto,
     input: { title?: string; summary?: string },
   ): Promise<void> {
+    let session = this.db.getSession(sessionInput.id) ?? sessionInput;
     const endpoint = await this.driver.ensureRunning(session);
     const runnerUrl = endpoint.runnerUrl;
 
     try {
       // 0. Commit any pending inline/working-tree edits so HEAD has the exact draft state
-      await fetch(`${runnerUrl}/internal/git/checkpoint`, {
+      const ckptRes = await fetch(`${runnerUrl}/internal/git/checkpoint`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ summary: 'Ready to publish' }),
-      }).catch(() => {});
+      }).catch(() => null);
+      if (ckptRes?.ok && session.kind === 'revert') {
+        const ckptData = (await ckptRes.json().catch(() => null)) as { checkpoint?: unknown } | null;
+        if (ckptData?.checkpoint) {
+          const converted = this.db.convertRevertSession(session.id);
+          if (converted) {
+            session = converted;
+            this.onSessionMetaUpdated?.(session.id);
+          }
+        }
+      }
 
       // 1. Hard-gate verification checks (keep Astro dev preview running under pooled 6 GB ceiling + max-1 build queue)
       this.setState(session.id, 'verifying');
@@ -181,6 +193,10 @@ export class PublishService {
       await this.driver.pushSessionBranch(session, ghToken);
 
       const prTitle = (input.title || session.title || 'Website update').trim();
+      if (prTitle && prTitle !== session.title) {
+        this.db.updateSession(session.id, { title: prTitle });
+        session = { ...session, title: prTitle };
+      }
       const prBody = [
         input.summary?.trim() || `Updates from Halley editing session **${session.title}**.`,
         '',

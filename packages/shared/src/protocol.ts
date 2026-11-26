@@ -298,6 +298,9 @@ export type ChatServerMessage =
       pageRequests: PageRequestMetadata[];
     }
   | {
+      type: 'session_meta_updated';
+    }
+  | {
       type: 'error';
       message: string;
     };
@@ -422,12 +425,28 @@ export interface DebugTraceDto {
   systemPrompt: {
     halleyRole: string;
     agentsMd: string | null;
+    contextNotes?: string[];
   };
   usageUsd: number;
   usageByModel: Record<string, unknown>;
   live: LiveRunStateDto;
   entries: DebugTraceEntryDto[];
   recentLogs?: string[];
+}
+
+export interface RevertedCommitSummaryDto {
+  sha: string;
+  shortSha: string;
+  author: string;
+  date: string;
+  subject: string;
+  body: string;
+  files: Array<{
+    path: string;
+    status: 'modified' | 'added' | 'deleted' | 'renamed';
+    additions: number;
+    deletions: number;
+  }>;
 }
 export type SpendPurpose = 'chat' | 'conflict' | 'conflict-escalation' | 'handoff';
 

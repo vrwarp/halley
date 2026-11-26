@@ -3,7 +3,13 @@ import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ChatServerMessage, LiveHistoryEntryDto, PublishProgressPayload, UserDto } from '@halley/shared';
+import type {
+  ChatServerMessage,
+  LiveHistoryEntryDto,
+  PublishProgressPayload,
+  RevertedCommitSummaryDto,
+  UserDto,
+} from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
@@ -15,6 +21,7 @@ import { WorkspaceCrashLoopError, type WorkspaceDriver } from './drivers/workspa
 import { WorkspaceHostDriver } from './drivers/workspace-host-driver.js';
 import { createInternalGitHttpHandler } from './git-http.js';
 import { GitHubService } from './github/client.js';
+import { buildContinuationHandoffSummary, buildUndoHandoffSummary } from './handoff.js';
 import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
 import { createPreviewProxy } from './proxy/preview-proxy.js';
 import { startSessionReaper } from './reaper.js';
@@ -69,6 +76,14 @@ export function createControlPlane(
     bootProgress: driver.getBootProgress?.(s.id) ?? null,
   });
 
+  const convertAndBroadcastIfRevert = (sessionId: string) => {
+    const converted = db.convertRevertSession(sessionId);
+    if (converted) {
+      broadcastToSession(sessionId, { type: 'session_meta_updated' });
+    }
+    return converted;
+  };
+
   const publishService = new PublishService(
     config,
     db,
@@ -76,6 +91,9 @@ export function createControlPlane(
     github,
     (sessionId, payload: PublishProgressPayload) => {
       broadcastToSession(sessionId, { type: 'publish_state', payload });
+    },
+    (sessionId) => {
+      broadcastToSession(sessionId, { type: 'session_meta_updated' });
     },
   );
 
@@ -196,6 +214,21 @@ export function createControlPlane(
         500,
       );
     }
+  });
+
+  // Internal hook called by workspace-runner when an edit checkpoint is created
+  app.post('/internal/session/diverged', (c) => {
+    const authHeader = c.req.header('authorization') || '';
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!rawToken) {
+      return c.json({ error: 'Missing workspace token' }, 401);
+    }
+    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    if (!session) {
+      return c.json({ error: 'Invalid workspace token' }, 401);
+    }
+    const converted = convertAndBroadcastIfRevert(session.id);
+    return c.json({ ok: true, converted: Boolean(converted), kind: converted?.kind ?? session.kind });
   });
 
   // Auth routes
@@ -368,65 +401,6 @@ export function createControlPlane(
     return c.json({ session: enrichSessionDto(updated, user) });
   });
 
-  const buildDeterministicHandoffSummary = (
-    src: ReturnType<ControlPlaneDb['getSession']> & object,
-    archive: ReturnType<ControlPlaneDb['getSessionArchive']>,
-    priorHandoff?: string | null,
-  ): string => {
-    const lines: string[] = [];
-    if (priorHandoff) {
-      lines.push(`Earlier lineage summary: ${priorHandoff.slice(0, 600)}`);
-    }
-    const statusLabel =
-      src.status === 'published'
-        ? `published${src.pr_number ? ` as PR #${src.pr_number}` : ''}`
-        : src.status === 'merged'
-          ? `merged${src.pr_number ? ` as PR #${src.pr_number}` : ''}`
-          : 'in-progress draft';
-    lines.push(
-      `This session continues "${src.title}" (${statusLabel}, edited by ${src.owner_name || 'a teammate'}).`,
-    );
-    if (src.status === 'published' || src.status === 'merged') {
-      lines.push('Those published changes are already live on the main branch.');
-    }
-    if (archive?.diffSummary && archive.diffSummary !== '[]') {
-      try {
-        const diffs = JSON.parse(archive.diffSummary) as Array<{ path: string; status: string }>;
-        if (diffs.length > 0) {
-          lines.push(
-            `Files touched previously: ${diffs.map((d) => `${d.path} (${d.status})`).slice(0, 12).join(', ')}.`,
-          );
-        }
-      } catch {
-        // ignore
-      }
-    }
-    if (archive?.transcriptJson) {
-      try {
-        const t = JSON.parse(archive.transcriptJson) as {
-          entries?: Array<{ role: string; text?: string; attachments?: Array<{ stagedId: string; filename: string }> }>;
-        };
-        const userPrompts = (t.entries ?? [])
-          .filter((e) => e.role === 'user' && e.text)
-          .slice(-6)
-          .map((e) => e.text!.replace(/\s+/g, ' ').trim().slice(0, 180));
-        if (userPrompts.length > 0) {
-          lines.push(`Recent requests from the prior thread:\n- ${userPrompts.join('\n- ')}`);
-        }
-        const uploads = (t.entries ?? [])
-          .flatMap((e) => e.attachments ?? [])
-          .slice(-10)
-          .map((a) => `${a.filename} (stagedId=${a.stagedId})`);
-        if (uploads.length > 0 && src.status !== 'published' && src.status !== 'merged') {
-          lines.push(`Staged uploads carried over: ${uploads.join(', ')}.`);
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return lines.join('\n');
-  };
-
   app.post('/api/sessions/:id/duplicate', auth.requireAuth, async (c) => {
     const user = c.get('user');
     const src = db.getSession(c.req.param('id')!);
@@ -450,7 +424,7 @@ export function createControlPlane(
     const parentArchive = src.parent_session_id ? db.getSessionArchive(src.parent_session_id) : null;
     let handoffSummary = srcArchive?.handoffSummary ?? null;
     if (!handoffSummary) {
-      handoffSummary = buildDeterministicHandoffSummary(src, srcArchive, parentArchive?.handoffSummary);
+      handoffSummary = buildContinuationHandoffSummary(src, srcArchive, parentArchive?.handoffSummary);
       if (srcArchive) {
         db.setArchiveHandoffSummary(src.id, handoffSummary);
       }
@@ -552,6 +526,24 @@ export function createControlPlane(
       }
     }
 
+    // Ensure source transcript is captured if undoing a Halley session whose archive wasn't saved yet
+    let srcArchive = srcSession ? db.getSessionArchive(srcSession.id) : null;
+    if (srcSession && !srcArchive && srcSession.runner_url) {
+      await publishService
+        .archiveSessionDeterministically(
+          srcSession.id,
+          srcSession.runner_url,
+          srcSession.base_branch,
+          srcSession.merged_sha,
+          srcSession.pr_url,
+        )
+        .catch(() => {});
+      srcArchive = db.getSessionArchive(srcSession.id);
+    }
+    const parentArchive = srcSession?.parent_session_id
+      ? db.getSessionArchive(srcSession.parent_session_id)
+      : null;
+
     const id = crypto.randomUUID();
     const short = id.slice(0, 6);
     const baseTitle = body.title || srcSession?.title || `commit ${primarySha.slice(0, 7)}`;
@@ -577,7 +569,14 @@ export function createControlPlane(
 
     driver.setRawWorkspaceToken?.(id, rawToken);
 
-    let revertResult: Record<string, unknown> | null = null;
+    type RevertStartResult = {
+      status?: 'clean' | 'conflict' | 'nothing_to_undo';
+      revertCheckpointSha?: string;
+      revertedCommits?: RevertedCommitSummaryDto[];
+      conflictedFiles?: string[];
+      [key: string]: unknown;
+    };
+    let revertResult: RevertStartResult | null = null;
     try {
       const ep = await driver.ensureRunning(revertSession);
       const res = await fetch(`${ep.runnerUrl}/internal/git/revert-start`, {
@@ -585,14 +584,43 @@ export function createControlPlane(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shas: targetShas }),
       });
-      revertResult = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      revertResult = (await res.json().catch(() => null)) as RevertStartResult | null;
+      if (revertResult?.revertCheckpointSha) {
+        db.updateSession(revertSession.id, {
+          initial_revert_sha: revertResult.revertCheckpointSha,
+        });
+      }
+
+      const undoSummary = buildUndoHandoffSummary({
+        baseBranch: config.baseBranch,
+        targetTitle: baseTitle,
+        targetShas,
+        revertReason: reason,
+        revertStatus: revertResult?.status ?? null,
+        revertCheckpointSha: revertResult?.revertCheckpointSha ?? null,
+        revertedCommits: Array.isArray(revertResult?.revertedCommits)
+          ? revertResult.revertedCommits
+          : [],
+        conflictedFiles: Array.isArray(revertResult?.conflictedFiles)
+          ? revertResult.conflictedFiles
+          : [],
+        srcSession,
+        srcArchive,
+        priorHandoff: parentArchive?.handoffSummary ?? null,
+      });
+
+      await fetch(`${ep.runnerUrl}/internal/context-note`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note: undoSummary, persist: true }),
+      }).catch(() => {});
     } catch {
       // Workspace may still be booting; UI can retry
     }
 
     return c.json(
       {
-        session: db.toSessionDto(db.getSession(revertSession.id)!, user),
+        session: enrichSessionDto(db.getSession(revertSession.id)!, user),
         revertResult,
       },
       201,
@@ -789,6 +817,9 @@ export function createControlPlane(
     if (res.ok && typeof data.changedFilesCount === 'number') {
       db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
     }
+    if (res.ok) {
+      convertAndBroadcastIfRevert(check.session.id);
+    }
     return c.json(data, res.status as 200);
   });
 
@@ -819,6 +850,9 @@ export function createControlPlane(
       `${ep.runnerUrl}/internal/pages?route=${encodeURIComponent(route)}`,
       { method: 'DELETE' },
     );
+    if (res.ok) {
+      convertAndBroadcastIfRevert(check.session.id);
+    }
     return c.json(await res.json(), res.status as 200);
   });
 
@@ -837,6 +871,9 @@ export function createControlPlane(
     if (res.ok && typeof data.changedFilesCount === 'number') {
       db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
     }
+    if (res.ok) {
+      convertAndBroadcastIfRevert(check.session.id);
+    }
     return c.json(data, res.status as 200);
   });
 
@@ -853,6 +890,9 @@ export function createControlPlane(
     const data = (await res.json()) as { changedFilesCount?: number };
     if (res.ok && typeof data.changedFilesCount === 'number') {
       db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
+    if (res.ok) {
+      convertAndBroadcastIfRevert(check.session.id);
     }
     return c.json(data, res.status as 200);
   });
@@ -883,6 +923,9 @@ export function createControlPlane(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, baseRef: `origin/${check.session.base_branch}` }),
     });
+    if (res.ok) {
+      convertAndBroadcastIfRevert(check.session.id);
+    }
     return c.json(await res.json(), res.status as 200);
   });
 
