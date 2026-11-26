@@ -28,6 +28,7 @@ import {
   GitBranch,
   History,
   ImagePlus,
+  LayoutGrid,
   Loader2,
   Monitor,
   MoreHorizontal,
@@ -1042,11 +1043,14 @@ export function EditorPage({
         <button
           type="button"
           onClick={onBack}
-          aria-label="Back to edits"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-stone-600 hover:bg-stone-100"
+          aria-label="All edits"
+          title="All edits"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-stone-100 text-stone-700 hover:bg-stone-200/80 hover:text-stone-900"
         >
-          <ArrowLeft className="h-4 w-4" />
+          <LayoutGrid className="h-4 w-4" />
         </button>
+
+        <span aria-hidden="true" className="mx-0.5 h-5 w-px shrink-0 bg-stone-200" />
 
         <button
           type="button"
@@ -2532,6 +2536,17 @@ export function EditorPage({
             )}
 
             <div className="divide-y divide-stone-100 rounded-xl border border-stone-200 bg-white">
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileSheet(null);
+                  onBack();
+                }}
+                className="flex min-h-[48px] w-full items-center gap-3 px-4 text-left text-sm font-medium text-stone-800"
+              >
+                <LayoutGrid className="h-4 w-4 text-stone-500" />
+                All edits
+              </button>
               {session.canEdit && (
                 <>
                   <button
