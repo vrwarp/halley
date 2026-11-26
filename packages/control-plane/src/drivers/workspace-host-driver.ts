@@ -715,8 +715,9 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
     // 3. Push the received branch from control-plane's bare mirror to GitHub (or devLocalRepo)
     const refspec = `refs/heads/${session.working_branch}:refs/heads/${session.working_branch}`;
+    await runGit(mirrorDir, ['config', '--unset-all', 'remote.origin.mirror']).catch(() => {});
     if (this.config.devLocalRepo) {
-      await runGit(mirrorDir, ['push', '--force', 'origin', refspec]);
+      await runGit(mirrorDir, ['-c', 'remote.origin.mirror=false', 'push', '--force', 'origin', refspec]);
       return;
     }
     await withGitAskPass(token, async (env) => {
@@ -726,7 +727,11 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         ['fetch', 'origin', `refs/heads/${session.working_branch}:refs/remotes/origin/${session.working_branch}`],
         env,
       ).catch(() => {});
-      await runGit(mirrorDir, ['push', '--force-with-lease', 'origin', refspec], env);
+      await runGit(
+        mirrorDir,
+        ['-c', 'remote.origin.mirror=false', 'push', '--force-with-lease', 'origin', refspec],
+        env,
+      );
     });
   }
 

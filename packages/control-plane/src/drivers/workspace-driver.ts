@@ -273,6 +273,8 @@ export async function ensureBareMirror(
     await runGit(mirrorDir, ['remote', 'add', 'origin', remoteUrl]);
   } else {
     await runGit(mirrorDir, ['remote', 'set-url', 'origin', remoteUrl]).catch(() => {});
+    // Self-heal legacy `git clone --mirror` volumes where remote.origin.mirror=true breaks explicit refspec pushes
+    await runGit(mirrorDir, ['config', '--unset-all', 'remote.origin.mirror']).catch(() => {});
   }
 
   await runWithAuth(
