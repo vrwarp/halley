@@ -713,7 +713,10 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       throw new Error(`Workspace git push to control-plane failed (${res.status}): ${await res.text()}`);
     }
 
-    // 3. Push the received branch from control-plane's bare mirror to GitHub (or devLocalRepo)
+    // 3. Push the received halley/* branch from control-plane's bare mirror to GitHub (or devLocalRepo)
+    if (!session.working_branch.startsWith('halley/')) {
+      throw new Error(`Refusing to push non-halley branch: ${session.working_branch}`);
+    }
     const refspec = `refs/heads/${session.working_branch}:refs/heads/${session.working_branch}`;
     await runGit(mirrorDir, ['config', '--unset-all', 'remote.origin.mirror']).catch(() => {});
     if (this.config.devLocalRepo) {
@@ -721,15 +724,12 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       return;
     }
     await withGitAskPass(token, async (env) => {
-      // Best-effort fetch existing remote branch so --force-with-lease has an up-to-date lease
+      // Bare mirrors don't maintain standard refs/remotes/origin/* tracking refs (and legacy --mirror
+      // configs map +refs/*:refs/*), which causes bare --force-with-lease to fail with "(stale info)".
+      // Each halley/* branch is owned exclusively by this single session.
       await runGit(
         mirrorDir,
-        ['fetch', 'origin', `refs/heads/${session.working_branch}:refs/remotes/origin/${session.working_branch}`],
-        env,
-      ).catch(() => {});
-      await runGit(
-        mirrorDir,
-        ['-c', 'remote.origin.mirror=false', 'push', '--force-with-lease', 'origin', refspec],
+        ['-c', 'remote.origin.mirror=false', 'push', '--force', 'origin', refspec],
         env,
       );
     });
