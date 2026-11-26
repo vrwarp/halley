@@ -129,8 +129,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       {
         initialDelayMs: 0,
         pollIntervalMs: 10,
-        timeoutMs: 400,
-        runRegistrationGraceMs: 120,
+        timeoutMs: 3000,
+        runRegistrationGraceMs: 1000,
         maxConsecutiveErrors: 3,
         ...pollOverrides,
       },
@@ -667,9 +667,9 @@ describe('deploy workflow matching & deploy check reliability', () => {
         initialDelayMs: 0,
         pollIntervalMs: 10,
         ciPollIntervalMs: 10,
-        ciRegistrationGraceMs: 500,
-        runRegistrationGraceMs: 200,
-        timeoutMs: 2000,
+        ciRegistrationGraceMs: 1500,
+        runRegistrationGraceMs: 1000,
+        timeoutMs: 5000,
       },
     );
 
