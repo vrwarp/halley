@@ -164,7 +164,6 @@ export default {
   ...baseConfig,
   base: ${JSON.stringify(this.previewBase)},
   cacheDir: ${JSON.stringify(astroCacheDir)},
-  devToolbar: { enabled: false },
   integrations: [
     ...existingIntegrations,
     halleyDevEdit({
