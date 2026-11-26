@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import type { CheckpointInfo, GitFileChange } from '@halley/shared';
+import type { CheckpointInfo, GitFileChange, RevertedCommitSummaryDto } from '@halley/shared';
 
 const execFileAsync = promisify(execFile);
 
@@ -467,6 +467,87 @@ export async function rebaseOnBase(
   return mergeWithBase(repoRoot, opts);
 }
 
+function mapGitStatusCode(code: string): 'modified' | 'added' | 'deleted' | 'renamed' {
+  const c = code.trim().charAt(0).toUpperCase();
+  if (c === 'A') return 'added';
+  if (c === 'D') return 'deleted';
+  if (c === 'R' || c === 'C') return 'renamed';
+  return 'modified';
+}
+
+export async function inspectCommitsForRevert(
+  repoRoot: string,
+  shas: string[],
+): Promise<RevertedCommitSummaryDto[]> {
+  const summaries: RevertedCommitSummaryDto[] = [];
+  for (const rawSha of shas) {
+    const metaRes = await git(repoRoot, [
+      'show',
+      '-s',
+      '--format=%H%x00%h%x00%an%x00%aI%x00%s%x00%b',
+      rawSha,
+    ]);
+    if (metaRes.code !== 0 || !metaRes.stdout.trim()) continue;
+    const [sha = rawSha, shortSha = rawSha.slice(0, 7), author = '', date = '', subject = '', body = ''] =
+      metaRes.stdout.split('\0');
+
+    const statusRes = await git(repoRoot, [
+      'diff-tree',
+      '--no-commit-id',
+      '--name-status',
+      '-r',
+      '--root',
+      sha,
+    ]);
+    const statusByPath = new Map<string, 'modified' | 'added' | 'deleted' | 'renamed'>();
+    for (const line of statusRes.stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const parts = line.split('\t');
+      const code = parts[0] ?? 'M';
+      const filePath = (parts.length >= 3 ? parts[2] : parts[1])?.trim();
+      if (filePath) {
+        statusByPath.set(filePath, mapGitStatusCode(code));
+      }
+    }
+
+    const numstatRes = await git(repoRoot, [
+      'diff-tree',
+      '--no-commit-id',
+      '--numstat',
+      '-r',
+      '--root',
+      sha,
+    ]);
+    const files: RevertedCommitSummaryDto['files'] = [];
+    for (const line of numstatRes.stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      const parts = line.split('\t');
+      if (parts.length < 3) continue;
+      const additions = parts[0] === '-' ? 0 : Number.parseInt(parts[0] ?? '0', 10) || 0;
+      const deletions = parts[1] === '-' ? 0 : Number.parseInt(parts[1] ?? '0', 10) || 0;
+      const filePath = parts.slice(2).join('\t').trim();
+      if (!filePath) continue;
+      files.push({
+        path: filePath,
+        status: statusByPath.get(filePath) ?? 'modified',
+        additions,
+        deletions,
+      });
+    }
+
+    summaries.push({
+      sha: sha.trim(),
+      shortSha: shortSha.trim(),
+      author: author.trim(),
+      date: date.trim(),
+      subject: subject.trim(),
+      body: body.trim(),
+      files,
+    });
+  }
+  return summaries;
+}
+
 /**
  * Starts reverting one or more published commits on top of HEAD using `git revert --no-commit`.
  * Clean reverts are committed as a checkpoint immediately ($0 AI); conflicting reverts leave
@@ -476,25 +557,37 @@ export async function startRevertCommits(
   repoRoot: string,
   shas: string[],
   identity: GitIdentity,
-): Promise<{ status: 'clean' | 'conflict' | 'nothing_to_undo'; conflictedFiles: string[]; error?: string }> {
+): Promise<{
+  status: 'clean' | 'conflict' | 'nothing_to_undo';
+  revertCheckpointSha?: string;
+  revertedCommits: RevertedCommitSummaryDto[];
+  conflictedFiles: string[];
+  error?: string;
+}> {
   if (shas.length === 0) {
-    return { status: 'nothing_to_undo', conflictedFiles: [] };
+    return { status: 'nothing_to_undo', revertedCommits: [], conflictedFiles: [] };
   }
   await ensureGitRerere(repoRoot);
+  const revertedCommits = await inspectCommitsForRevert(repoRoot, shas).catch(() => []);
 
   const res = await git(repoRoot, ['revert', '--no-commit', ...shas]);
   if (res.code === 0) {
     await sanitizeProtectedPaths(repoRoot);
     const status = await git(repoRoot, ['status', '--porcelain']);
     if (!status.stdout.trim()) {
-      return { status: 'nothing_to_undo', conflictedFiles: [] };
+      return { status: 'nothing_to_undo', revertedCommits, conflictedFiles: [] };
     }
-    await createCheckpoint(
+    const ckpt = await createCheckpoint(
       repoRoot,
       `Undo published edit (${shas.map((s) => s.slice(0, 7)).join(', ')})`,
       identity,
     );
-    return { status: 'clean', conflictedFiles: [] };
+    return {
+      status: 'clean',
+      revertCheckpointSha: ckpt?.sha,
+      revertedCommits,
+      conflictedFiles: [],
+    };
   }
 
   const unmerged = await git(repoRoot, ['diff', '--name-only', '--diff-filter=U']);
@@ -503,11 +596,12 @@ export async function startRevertCommits(
     await git(repoRoot, ['revert', '--abort']).catch(() => {});
     return {
       status: 'conflict',
+      revertedCommits,
       conflictedFiles: [],
       error: res.stderr || 'Could not revert the selected commit.',
     };
   }
-  return { status: 'conflict', conflictedFiles };
+  return { status: 'conflict', revertedCommits, conflictedFiles };
 }
 
 /** Single-step "Undo update" back to the pre-sync snapshot SHA. */

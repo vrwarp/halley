@@ -11,6 +11,7 @@ import {
   CheckCircle2,
   ExternalLink,
   Loader2,
+  MessageSquare,
   Sparkles,
   X,
 } from 'lucide-react';
@@ -68,6 +69,7 @@ export function PublishModal({
 }: Props) {
   const isPhone = typeof window !== 'undefined' && window.matchMedia('(max-width: 639px)').matches;
   const [title, setTitle] = useState(session.title);
+  const [titleDirty, setTitleDirty] = useState(false);
   const [cards, setCards] = useState<ChangeCardDto[]>([]);
   const [activeViewport, setActiveViewport] = useState<'mobile' | 'desktop'>(
     isPhone ? 'mobile' : 'desktop',
@@ -83,6 +85,12 @@ export function PublishModal({
   const [showDetails, setShowDetails] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [publishElapsedSec, setPublishElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!titleDirty) {
+      setTitle(session.title);
+    }
+  }, [session.title, titleDirty]);
 
   const state = publishProgress?.state ?? session.publishState;
   const prUrl = publishProgress?.prUrl ?? session.prUrl;
@@ -159,21 +167,24 @@ export function PublishModal({
   }, [state]);
 
   const includedCards = cards.filter((c) => !excludedPaths[c.path]);
+  const hasExcludedFiles = isUndoMode && Object.values(excludedPaths).some(Boolean);
+  const fileListSummary = `Updated ${includedCards.length} file${includedCards.length === 1 ? '' : 's'}: ${includedCards
+    .slice(0, 4)
+    .map((c) => c.path.replace(/^src\/pages\//, '').replace(/^public\//, ''))
+    .join(', ')}${includedCards.length > 4 ? ` and ${includedCards.length - 4} more` : ''}.`;
   const plainSummary =
     includedCards.length === 0
       ? 'No file changes selected yet.'
-      : isUndoMode && session.revertReason
+      : isUndoMode && !hasExcludedFiles && session.revertReason
         ? `Undo publication: ${session.revertReason}`
-        : `Updated ${includedCards.length} file${includedCards.length === 1 ? '' : 's'}: ${includedCards
-            .slice(0, 4)
-            .map((c) => c.path.replace(/^src\/pages\//, '').replace(/^public\//, ''))
-            .join(', ')}${includedCards.length > 4 ? ` and ${includedCards.length - 4} more` : ''}.`;
+        : fileListSummary;
 
   const hasPendingChoices = mergeReview?.status === 'needs_choices';
 
   const handlePublish = async () => {
     setSubmitting(true);
     try {
+      let publishTitle = title.trim() || session.title;
       // Q16: For partial undo, revert any unticked files back to current main before publishing
       if (isUndoMode) {
         const toExclude = Object.entries(excludedPaths)
@@ -182,8 +193,12 @@ export function PublishModal({
         for (const p of toExclude) {
           await api.revertFile(session.id, p);
         }
+        if (toExclude.length > 0 && !titleDirty && publishTitle.startsWith('Undo: ')) {
+          const base = publishTitle.slice('Undo: '.length).trim() || 'Website update';
+          publishTitle = session.parentSessionId ? `Continued: ${base}` : `Adjusted: ${base}`;
+        }
       }
-      await api.publish(session.id, title.trim() || session.title, plainSummary);
+      await api.publish(session.id, publishTitle, plainSummary);
     } finally {
       setSubmitting(false);
     }
@@ -276,10 +291,20 @@ export function PublishModal({
                 <input
                   type="text"
                   value={title}
-                  onChange={(e) => setTitle(e.target.value)}
+                  onChange={(e) => {
+                    setTitle(e.target.value);
+                    setTitleDirty(true);
+                  }}
                   className="w-full rounded-xl border border-stone-300 bg-[#FAF9F7] px-3.5 py-2 text-sm text-stone-900 outline-none focus:border-amber-600 focus:bg-white"
                 />
                 <p className="mt-2 text-xs text-stone-500">{plainSummary}</p>
+                {isUndoMode && (
+                  <p className="mt-1.5 text-[11px] text-stone-500">
+                    Want to undo only part of a page? Click{' '}
+                    <strong className="font-medium text-stone-700">Edit / partial undo in chat</strong>{' '}
+                    below and tell Halley what to keep.
+                  </p>
+                )}
               </div>
 
               {mergeReview &&
@@ -512,7 +537,17 @@ export function PublishModal({
             </button>
           ) : (
             <>
-              {!isInFlight && (
+              {!isInFlight && isUndoMode && (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-stone-200 bg-white px-3.5 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                >
+                  <MessageSquare className="h-4 w-4 text-stone-500" />
+                  Edit / partial undo in chat
+                </button>
+              )}
+              {!isInFlight && !isUndoMode && (
                 <button
                   type="button"
                   onClick={onClose}
@@ -529,9 +564,11 @@ export function PublishModal({
               >
                 {isInFlight
                   ? 'Publishing…'
-                  : isUndoMode
+                  : isUndoMode && !hasExcludedFiles
                     ? 'Publish Undo to Live Site'
-                    : 'Publish to Live Site'}
+                    : isUndoMode && hasExcludedFiles
+                      ? 'Publish Selected Changes'
+                      : 'Publish to Live Site'}
               </button>
             </>
           )}

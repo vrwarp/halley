@@ -61,6 +61,15 @@ export function formatDebugTraceAsMarkdown(trace: DebugTraceDto, sessionTitle: s
     lines.push('');
   }
 
+  if (trace.systemPrompt.contextNotes && trace.systemPrompt.contextNotes.length > 0) {
+    lines.push('## Session & Live-Site Context Notes (`halley_context_notes`)');
+    lines.push('');
+    lines.push('```text');
+    lines.push(trace.systemPrompt.contextNotes.map((n) => `- ${n}`).join('\n\n'));
+    lines.push('```');
+    lines.push('');
+  }
+
   lines.push(`## Conversation Thread (${trace.entries.length} entries)`);
   lines.push('');
 
@@ -173,6 +182,7 @@ export function DebugTraceDrawer({
   const [filter, setFilter] = useState<FilterMode>('all');
   const [showSystemPrompt, setShowSystemPrompt] = useState(false);
   const [showAgentsMd, setShowAgentsMd] = useState(false);
+  const [showContextNotes, setShowContextNotes] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const loadTrace = async () => {
@@ -404,6 +414,16 @@ export function DebugTraceDrawer({
                   <ChevronDown className={`h-3 w-3 transition ${showAgentsMd ? 'rotate-180' : ''}`} />
                 </button>
               )}
+              {trace.systemPrompt.contextNotes && trace.systemPrompt.contextNotes.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowContextNotes((v) => !v)}
+                  className="inline-flex items-center gap-1 rounded border border-amber-200 bg-amber-50 px-2 py-1 font-medium text-amber-900 hover:bg-amber-100"
+                >
+                  Context notes ({trace.systemPrompt.contextNotes.length})
+                  <ChevronDown className={`h-3 w-3 transition ${showContextNotes ? 'rotate-180' : ''}`} />
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -472,6 +492,39 @@ export function DebugTraceDrawer({
               </pre>
             </div>
           )}
+
+          {trace &&
+            showContextNotes &&
+            trace.systemPrompt.contextNotes &&
+            trace.systemPrompt.contextNotes.length > 0 && (
+              <div className="rounded-xl border border-amber-200 bg-white p-3.5">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-800">
+                    Session &amp; Live-Site Context Notes · halley_context_notes
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleCopy(
+                        'context-notes',
+                        (trace.systemPrompt.contextNotes ?? []).join('\n\n---\n\n'),
+                      )
+                    }
+                    className="inline-flex items-center gap-1 text-[11px] text-stone-500 hover:text-stone-900"
+                  >
+                    {copiedId === 'context-notes' ? (
+                      <Check className="h-3 w-3 text-emerald-600" />
+                    ) : (
+                      <Copy className="h-3 w-3" />
+                    )}
+                    {copiedId === 'context-notes' ? 'Copied' : 'Copy'}
+                  </button>
+                </div>
+                <pre className="max-h-72 overflow-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-stone-700">
+                  {trace.systemPrompt.contextNotes.map((n) => `- ${n}`).join('\n\n')}
+                </pre>
+              </div>
+            )}
 
           {trace && filteredEntries.length === 0 && (
             <div className="rounded-xl border border-dashed border-stone-300 bg-white p-8 text-center text-xs text-stone-500">

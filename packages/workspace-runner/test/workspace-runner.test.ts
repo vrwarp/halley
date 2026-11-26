@@ -14,6 +14,7 @@ import {
   mergeWithBase,
   rebaseOnBase,
   sanitizeProtectedPaths,
+  startRevertCommits,
   undoToCheckpoint,
 } from '../src/checkpoints-and-git.js';
 import { UploadManager } from '../src/uploads.js';
@@ -742,6 +743,64 @@ process.on('SIGTERM', () => srv.close(() => process.exit(0)));
       expect(body.error).toContain('simulated Astro config failure');
       expect(elapsed).toBeLessThan(10_000);
       await sup.stopAll();
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('startRevertCommits returns revertCheckpointSha and per-file commit stats for reverted commits', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-revert-meta-'));
+    try {
+      await execFileAsync('git', ['init', '-b', 'main'], { cwd: tmp });
+      await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: tmp });
+      await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: tmp });
+
+      await fs.mkdir(path.join(tmp, 'src/pages/events'), { recursive: true });
+      await fs.writeFile(path.join(tmp, 'src/pages/index.astro'), '<p>Home</p>\n');
+      await fs.writeFile(path.join(tmp, 'src/pages/events/index.astro'), '<p>Events</p>\n');
+      await execFileAsync('git', ['add', '-A'], { cwd: tmp });
+      await execFileAsync('git', ['commit', '-m', 'init'], { cwd: tmp });
+
+      await fs.writeFile(
+        path.join(tmp, 'src/pages/index.astro'),
+        '<p>Home</p>\n<p>Joint Service</p>\n',
+      );
+      await fs.writeFile(
+        path.join(tmp, 'src/pages/events/index.astro'),
+        '<p>Events</p>\n<p>Brunch</p>\n<p>Christmas</p>\n<p>Joint Service</p>\n',
+      );
+      await execFileAsync('git', ['add', '-A'], { cwd: tmp });
+      await execFileAsync('git', ['commit', '-m', 'test10'], { cwd: tmp });
+
+      const { stdout: targetShaRaw } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: tmp });
+      const targetSha = targetShaRaw.trim();
+
+      const res = await startRevertCommits(tmp, [targetSha], identity);
+      expect(res.status).toBe('clean');
+      expect(res.revertCheckpointSha).toBeTruthy();
+      expect(res.revertedCommits).toHaveLength(1);
+      expect(res.revertedCommits[0]?.shortSha).toBe(targetSha.slice(0, 7));
+      expect(res.revertedCommits[0]?.subject).toBe('test10');
+      expect(res.revertedCommits[0]?.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: 'src/pages/index.astro',
+            status: 'modified',
+            additions: 1,
+            deletions: 0,
+          }),
+          expect.objectContaining({
+            path: 'src/pages/events/index.astro',
+            status: 'modified',
+            additions: 3,
+            deletions: 0,
+          }),
+        ]),
+      );
+
+      // Working tree should have the commit cleanly reverted
+      const eventsContent = await fs.readFile(path.join(tmp, 'src/pages/events/index.astro'), 'utf8');
+      expect(eventsContent).toBe('<p>Events</p>\n');
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }

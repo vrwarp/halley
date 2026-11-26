@@ -799,4 +799,219 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('pushes Undo + prior-chat digest to context-note and converts diverged revert drafts so History does not mark them wholly undone', async () => {
+    const http = await import('node:http');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-undo-ctx-'));
+    const capturedContextNotes: Array<{ note: string; persist?: boolean }> = [];
+    const tokensBySession = new Map<string, string>();
+
+    const mockRunner = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+      });
+      req.on('end', () => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url === '/internal/git/revert-start') {
+          res.end(
+            JSON.stringify({
+              status: 'clean',
+              revertCheckpointSha: 'ffd9078000000000000000000000000000000000',
+              revertedCommits: [
+                {
+                  sha: '318648242c35b6c3e6bba74a94c35a844c2d95bb',
+                  shortSha: '3186482',
+                  author: 'Sarah',
+                  date: '2026-11-25T17:13:06-08:00',
+                  subject: 'test10',
+                  body: '',
+                  files: [
+                    { path: 'src/pages/events/index.astro', status: 'modified', additions: 37, deletions: 1 },
+                    { path: 'src/pages/im-new/index.astro', status: 'modified', additions: 10, deletions: 0 },
+                  ],
+                },
+              ],
+              conflictedFiles: [],
+            }),
+          );
+          return;
+        }
+        if (req.url === '/internal/context-note') {
+          capturedContextNotes.push(JSON.parse(body || '{}'));
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        if (req.url === '/internal/git/revert-file') {
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+
+    await new Promise<void>((resolve) => mockRunner.listen(0, '127.0.0.1', resolve));
+    const addr = mockRunner.address();
+    const runnerUrl = typeof addr === 'object' && addr ? `http://127.0.0.1:${addr.port}` : '';
+
+    try {
+      const baseDriver = createMockDriver();
+      const driver = {
+        ...baseDriver,
+        setRawWorkspaceToken(sessionId: string, token: string) {
+          tokensBySession.set(sessionId, token);
+        },
+        async ensureRunning(session: { id: string }) {
+          return {
+            sessionId: session.id,
+            runnerUrl,
+            astroUrl: 'http://127.0.0.1:4321',
+            astroBase: '/',
+          };
+        },
+      };
+
+      const cfg = {
+        ...loadConfig(),
+        dataDir: path.join(tmp, 'data'),
+        devLoginEnabled: true,
+        adminEmails: ['sarah@thecrossing.website'],
+      };
+      const cp = createControlPlane(cfg, driver as never);
+
+      const login = await cp.app.request('/api/auth/dev-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'sarah@thecrossing.website', name: 'Sarah' }),
+      });
+      const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
+      const { user: sarah } = (await login.json()) as { user: { id: string } };
+
+      // Create a published parent session with archived transcript
+      const parent = cp.db.createSession({
+        id: 'parent-test10',
+        title: 'test10',
+        slug: 'test10',
+        ownerUserId: sarah.id,
+        repo: cfg.repo,
+        baseBranch: 'main',
+        workingBranch: 'halley/test10-123456',
+        volumeName: 'halley-ws-parent-test10',
+        workspaceTokenHash: 'parent-hash',
+      });
+      cp.db.updateSession(parent.id, {
+        status: 'published',
+        publish_state: 'published',
+        merged_sha: '318648242c35b6c3e6bba74a94c35a844c2d95bb',
+        merged_at: '2026-11-25T17:13:06Z',
+      });
+      cp.db.upsertSessionArchive({
+        sessionId: parent.id,
+        transcriptJson: JSON.stringify({
+          entries: [
+            {
+              id: 'u1',
+              role: 'user',
+              text: '[Current Preview] route=/events viewport=desktop mode=browse\n\nAdd Brunch, Christmas, and Joint Service.',
+            },
+            {
+              id: 'a1',
+              role: 'assistant',
+              text: 'I added Community Brunch, Christmas Celebration, and the Joint Service notice.',
+            },
+          ],
+        }),
+        diffSummary: JSON.stringify([{ path: 'src/pages/events/index.astro', status: 'modified' }]),
+        mergedSha: '318648242c35b6c3e6bba74a94c35a844c2d95bb',
+      });
+
+      // 1. Start an Undo session -> should push Undo + Prior-Chat digest to /internal/context-note
+      const revRes = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({
+          sessionId: parent.id,
+          reason: 'Joint service cancelled',
+        }),
+      });
+      expect(revRes.status).toBe(201);
+      const { session: revSession } = (await revRes.json()) as {
+        session: { id: string; kind: string; title: string; revertsSha: string | null };
+      };
+      expect(revSession.kind).toBe('revert');
+      expect(revSession.title).toBe('Undo: test10');
+      expect(revSession.revertsSha).toBe('318648242c35b6c3e6bba74a94c35a844c2d95bb');
+      expect(cp.db.getSession(revSession.id)?.initial_revert_sha).toBe(
+        'ffd9078000000000000000000000000000000000',
+      );
+
+      expect(capturedContextNotes).toHaveLength(1);
+      expect(capturedContextNotes[0]?.persist).toBe(true);
+      expect(capturedContextNotes[0]?.note).toContain('UNDO DRAFT CONTEXT');
+      expect(capturedContextNotes[0]?.note).toContain('Partial-undo rule:');
+      expect(capturedContextNotes[0]?.note).toContain('Joint service cancelled');
+      expect(capturedContextNotes[0]?.note).toContain('src/pages/events/index.astro (modified, +37/-1)');
+      expect(capturedContextNotes[0]?.note).toContain('User: Add Brunch, Christmas, and Joint Service.');
+      expect(capturedContextNotes[0]?.note).toContain(
+        'Halley: I added Community Brunch, Christmas Celebration, and the Joint Service notice.',
+      );
+
+      // 2. Workspace notifies /internal/session/diverged after chat file edit -> converts to continuation
+      const wsToken = tokensBySession.get(revSession.id)!;
+      const divRes = await cp.app.request('/internal/session/diverged', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${wsToken}` },
+      });
+      expect(divRes.status).toBe(200);
+      const divData = (await divRes.json()) as { converted: boolean; kind: string };
+      expect(divData.converted).toBe(true);
+      expect(divData.kind).toBe('continuation');
+
+      const updated = cp.db.getSession(revSession.id)!;
+      expect(updated.kind).toBe('continuation');
+      expect(updated.reverts_sha).toBeNull();
+      expect(updated.title).toBe('Continued: test10');
+
+      // Publishing the converted session must NOT mark parent test10 as revertedBy in /api/history
+      cp.db.updateSession(revSession.id, {
+        status: 'published',
+        publish_state: 'published',
+        merged_sha: '9999999000000000000000000000000000000000',
+        merged_at: '2026-11-26T00:00:00Z',
+      });
+      const histRes = await cp.app.request('/api/history', { headers: { Cookie: cookie } });
+      expect(histRes.status).toBe(200);
+      const hist = (await histRes.json()) as {
+        entries: Array<{ sessionId?: string; revertedBy?: unknown }>;
+      };
+      const parentEntry = hist.entries.find((e) => e.sessionId === parent.id);
+      expect(parentEntry?.revertedBy).toBeNull();
+
+      // 3. Unchecking files via /revert-file on a standalone revert converts kind -> 'edit' & title -> 'Adjusted: ...'
+      const rawRev = await cp.app.request('/api/sessions/revert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({
+          sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          title: 'Footer fix',
+          reason: 'Keep one file',
+        }),
+      });
+      expect(rawRev.status).toBe(201);
+      const { session: rawRevSession } = (await rawRev.json()) as { session: { id: string } };
+      const rfRes = await cp.app.request(`/api/sessions/${rawRevSession.id}/revert-file`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ path: 'src/pages/index.astro' }),
+      });
+      expect(rfRes.status).toBe(200);
+      const rawUpdated = cp.db.getSession(rawRevSession.id)!;
+      expect(rawUpdated.kind).toBe('edit');
+      expect(rawUpdated.reverts_sha).toBeNull();
+      expect(rawUpdated.title).toBe('Adjusted: Footer fix');
+    } finally {
+      mockRunner.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
