@@ -14,6 +14,41 @@ export interface CheckStatusSummary {
   failedLogs?: string;
 }
 
+export interface MainDeployStatusResult {
+  state: 'waiting_for_run' | 'pending' | 'deployed' | 'failed';
+  workflowName?: string;
+  runUrl?: string;
+  conclusion?: string | null;
+}
+
+export class GitHubApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly path: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'GitHubApiError';
+  }
+}
+
+const DEFAULT_DEPLOY_WORKFLOW_RE = /(?:^|[\s/_-])(deploy|pages)(?:$|[\s/._-])/i;
+
+export function matchesDeployWorkflow(
+  workflow: { name?: string | null; path?: string | null },
+  configured?: string,
+): boolean {
+  const name = (workflow.name ?? '').trim();
+  const wfPath = (workflow.path ?? '').trim();
+  const target = (configured ?? '').trim().toLowerCase();
+  if (target) {
+    const lowerName = name.toLowerCase();
+    const lowerPath = wfPath.toLowerCase();
+    return lowerName === target || lowerPath === target || lowerPath.endsWith(`/${target}`);
+  }
+  return DEFAULT_DEPLOY_WORKFLOW_RE.test(wfPath) || DEFAULT_DEPLOY_WORKFLOW_RE.test(name);
+}
+
 export class GitHubService {
   private cachedInstallToken: { token: string; expiresAt: number } | null = null;
 
@@ -60,7 +95,11 @@ export class GitHubService {
         },
       );
       if (!res.ok) {
-        throw new Error(`GitHub App token failed: ${res.status} ${await res.text()}`);
+        throw new GitHubApiError(
+          res.status,
+          `/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
+          `GitHub App token failed: ${res.status} ${await res.text()}`,
+        );
       }
       const data = (await res.json()) as { token: string; expires_at: string };
       this.cachedInstallToken = {
@@ -89,7 +128,11 @@ export class GitHubService {
       },
     });
     if (!res.ok) {
-      throw new Error(`GitHub API ${path} failed (${res.status}): ${await res.text()}`);
+      throw new GitHubApiError(
+        res.status,
+        path,
+        `GitHub API ${path} failed (${res.status}): ${await res.text()}`,
+      );
     }
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
@@ -255,26 +298,84 @@ export class GitHubService {
     return res.sha;
   }
 
-  async checkMainDeployStatus(mergeSha: string): Promise<'pending' | 'deployed' | 'failed'> {
+  async hasActiveDeployWorkflow(): Promise<boolean> {
+    const { owner, repo } = this.ownerRepo;
+    const data = await this.api<{
+      workflows: Array<{
+        id: number;
+        name: string;
+        path: string;
+        state: string;
+      }>;
+    }>(`/repos/${owner}/${repo}/actions/workflows?per_page=50`);
+
+    return (data.workflows ?? []).some(
+      (w) => w.state === 'active' && matchesDeployWorkflow(w, this.config.deployWorkflow),
+    );
+  }
+
+  async checkMainDeployStatus(mergeSha: string): Promise<MainDeployStatusResult> {
     const { owner, repo } = this.ownerRepo;
     const runs = await this.api<{
       workflow_runs: Array<{
         id: number;
         name: string;
+        path?: string;
+        event?: string;
         status: string;
         conclusion: string | null;
+        html_url?: string;
       }>;
-    }>(`/repos/${owner}/${repo}/actions/runs?head_sha=${mergeSha}&per_page=10`);
+    }>(`/repos/${owner}/${repo}/actions/runs?head_sha=${encodeURIComponent(mergeSha)}&per_page=20`);
 
-    if (runs.workflow_runs.length === 0) {
-      return 'deployed';
+    const matchingRuns = (runs.workflow_runs ?? []).filter((r) => {
+      if (r.event && !['push', 'workflow_dispatch', 'dynamic'].includes(r.event)) {
+        return false;
+      }
+      return matchesDeployWorkflow(r, this.config.deployWorkflow);
+    });
+
+    if (matchingRuns.length === 0) {
+      return { state: 'waiting_for_run' };
     }
-    const anyFailed = runs.workflow_runs.some(
-      (r) => r.status === 'completed' && r.conclusion && !['success', 'neutral', 'skipped'].includes(r.conclusion),
-    );
-    if (anyFailed) return 'failed';
-    const anyPending = runs.workflow_runs.some((r) => r.status !== 'completed');
-    return anyPending ? 'pending' : 'deployed';
+
+    // Group by workflow identity and evaluate only the latest run per workflow (handles re-runs/dispatches)
+    const latestByWorkflow = new Map<string, (typeof matchingRuns)[number]>();
+    for (const run of matchingRuns) {
+      const key = (run.path || run.name || String(run.id)).toLowerCase();
+      const prev = latestByWorkflow.get(key);
+      if (!prev || run.id > prev.id) {
+        latestByWorkflow.set(key, run);
+      }
+    }
+    const latestRuns = [...latestByWorkflow.values()];
+
+    const pendingRun = latestRuns.find((r) => r.status !== 'completed');
+    if (pendingRun) {
+      return {
+        state: 'pending',
+        workflowName: pendingRun.name,
+        runUrl: pendingRun.html_url,
+      };
+    }
+
+    const failedRun = latestRuns.find((r) => r.conclusion !== 'success');
+    if (failedRun) {
+      return {
+        state: 'failed',
+        workflowName: failedRun.name,
+        runUrl: failedRun.html_url,
+        conclusion: failedRun.conclusion,
+      };
+    }
+
+    const primary = latestRuns[0];
+    return {
+      state: 'deployed',
+      workflowName: primary?.name,
+      runUrl: primary?.html_url,
+      conclusion: 'success',
+    };
   }
 
   async listMainCommits(
