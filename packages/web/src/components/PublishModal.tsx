@@ -265,6 +265,9 @@ export function PublishModal({
           const syncRes = await api.syncSession(session.id, { kind: 'publish' });
           if (active && syncRes.review) {
             setMergeReview(syncRes.review);
+            if (!syncRes.review.alreadyUpToDate) {
+              void onChangedFilesUpdated();
+            }
           }
         } catch {
           // Non-fatal in offline/dev mode
@@ -474,6 +477,7 @@ export function PublishModal({
                     review={mergeReview}
                     onUpdated={(next) => {
                       setMergeReview(next);
+                      void onChangedFilesUpdated();
                       void loadReview({ invalidateScreenshots: true }).then((loaded) => {
                         if (loaded && loaded.routes.length > 0) {
                           fetchRoutesForViewport(activeViewport, loaded.routes);
@@ -482,6 +486,7 @@ export function PublishModal({
                     }}
                     onUndone={() => {
                       setMergeReview(null);
+                      void onChangedFilesUpdated();
                       void loadReview({ invalidateScreenshots: true }).then((loaded) => {
                         if (loaded && loaded.routes.length > 0) {
                           fetchRoutesForViewport(activeViewport, loaded.routes);

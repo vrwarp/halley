@@ -240,11 +240,13 @@ export async function runGit(
   cwd: string,
   args: string[],
   extraEnv?: Record<string, string>,
+  timeoutMs = 30_000,
 ): Promise<string> {
   const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', ...args], {
     cwd,
     env: { ...process.env, ...extraEnv },
     maxBuffer: 16 * 1024 * 1024,
+    timeout: timeoutMs,
   });
   return stdout.trim();
 }
@@ -265,11 +267,11 @@ export async function ensureBareMirror(
     .then(() => true)
     .catch(() => false);
 
-  const runWithAuth = async (args: string[], cwd: string) => {
+  const runWithAuth = async (args: string[], cwd: string, timeoutMs = 45_000) => {
     if (token && !localSourcePath) {
-      return withGitAskPass(token, (env) => runGit(cwd, args, env));
+      return withGitAskPass(token, (env) => runGit(cwd, args, env, timeoutMs));
     }
-    return runGit(cwd, args);
+    return runGit(cwd, args, undefined, timeoutMs);
   };
 
   if (!exists) {
@@ -287,12 +289,13 @@ export async function ensureBareMirror(
       '-c',
       'http.lowSpeedLimit=1',
       '-c',
-      'http.lowSpeedTime=30',
+      'http.lowSpeedTime=20',
       'fetch',
       'origin',
       `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`,
     ],
     mirrorDir,
+    45_000,
   );
   await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});
   return mirrorDir;

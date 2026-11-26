@@ -9,11 +9,15 @@ import {
 } from '@halley/shared';
 import { describe, expect, it } from 'vitest';
 import {
+  PerFileMutex,
   discoverSiteStructure,
   extractNavGroupsFromHtml,
   generatePageSkeleton,
+  inspectAstroElement,
   isPageSourceUnlisted,
+  patchStaticSpan,
   rewriteRelativeImportsInAstroSource,
+  toggleMarkdownUnlistedInSource,
   togglePageUnlistedInSource,
 } from '../src/index.js';
 
@@ -195,6 +199,67 @@ describe('AST unlisted detection, skeleton generation & helpers', () => {
       const movedAbs = path.join(tmp, 'src/pages/events/give.astro');
       const rewritten = rewriteRelativeImportsInAstroSource(src, pageAbs, movedAbs);
       expect(rewritten).toContain("import BaseLayout from '../../layouts/BaseLayout.astro';");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('handles JSX arrow-function props, @/ layout aliases, markdown unlisted toggling, and line deltas', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-skel-regress-'));
+    try {
+      await fs.mkdir(path.join(tmp, 'src/layouts'), { recursive: true });
+      await fs.mkdir(path.join(tmp, 'src/pages'), { recursive: true });
+      await fs.writeFile(
+        path.join(tmp, 'src/layouts/BaseLayout.astro'),
+        `---\nexport interface Props { title: string; indexable?: boolean; }\n---\n<html><body><slot /></body></html>\n`,
+      );
+      const pageAbs = path.join(tmp, 'src/pages/arrow.astro');
+      const src = [
+        '---',
+        "import BaseLayout from '@/layouts/BaseLayout.astro';",
+        '---',
+        '<BaseLayout title="Arrow" formatter={(x) => x > 0 ? "ok" : "no"}><p>Hi</p></BaseLayout>',
+        '',
+      ].join('\n');
+
+      const hidden = await togglePageUnlistedInSource(src, pageAbs, true);
+      expect(hidden).toContain('formatter={(x) => x > 0 ? "ok" : "no"} indexable={false}>');
+      expect(await isPageSourceUnlisted(hidden, '.astro')).toBe(true);
+
+      const unhidden = await togglePageUnlistedInSource(hidden, pageAbs, false);
+      expect(unhidden).toContain('formatter={(x) => x > 0 ? "ok" : "no"}>');
+      expect(await isPageSourceUnlisted(unhidden, '.astro')).toBe(false);
+
+      // Markdown frontmatter toggling
+      const mdHidden = toggleMarkdownUnlistedInSource('---\ntitle: Notes\n---\nHello\n', true);
+      expect(mdHidden).toContain('indexable: false');
+      expect(await isPageSourceUnlisted(mdHidden, '.md')).toBe(true);
+      const mdUnhidden = toggleMarkdownUnlistedInSource(mdHidden, false);
+      expect(mdUnhidden).not.toContain('indexable: false');
+      expect(await isPageSourceUnlisted(mdUnhidden, '.md')).toBe(false);
+
+      // patchStaticSpan line delta reporting on multi-line edit
+      const patchFile = path.join(tmp, 'src/pages/delta.astro');
+      const deltaSrc = '---\n---\n<p>One line</p>\n<h2>Next heading</h2>\n';
+      await fs.writeFile(patchFile, deltaSrc, 'utf8');
+      const inspected = await inspectAstroElement(deltaSrc, '3:1');
+      expect(inspected?.snapshotHash).toBeTruthy();
+      const res = await patchStaticSpan({
+        repoRoot: tmp,
+        relFile: 'src/pages/delta.astro',
+        loc: '3:1',
+        expectedHash: inspected!.snapshotHash,
+        newHtml: 'Line one\nLine two\nLine three',
+        previewBase: '/p/s1',
+        originalBase: '/',
+        fileLock: new PerFileMutex(),
+      });
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.topLineDelta).toBe(0);
+        expect(res.afterLine).toBe(3);
+        expect(res.afterLineDelta).toBe(2);
+      }
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }

@@ -451,6 +451,7 @@ export function buildClientBridgeScript(previewBase: string): string {
 
   async function selectElement(el, meta, opts) {
     if (activeEl && activeEl !== el) await finishEditing(true);
+    meta = metaOf(el) || meta;
     selEl = el;
     selMeta = meta;
     selInfo = null;
@@ -648,6 +649,41 @@ export function buildClientBridgeScript(previewBase: string): string {
     document.execCommand('unlink', false);
   });
 
+  function shiftSourceMapLines(targetFile, topLineDelta, afterLine, afterLineDelta) {
+    if (!topLineDelta && !afterLineDelta) return;
+    const all = document.body ? document.body.querySelectorAll('*') : [];
+    const remapLoc = (loc) => {
+      const parts = String(loc || '').split(':');
+      const line = parseInt(parts[0], 10);
+      if (Number.isNaN(line)) return loc;
+      let nextLine = line;
+      if (afterLineDelta && line > afterLine) nextLine += afterLineDelta;
+      if (topLineDelta) nextLine += topLineDelta;
+      return nextLine + (parts.length > 1 ? ':' + parts.slice(1).join(':') : '');
+    };
+    const nextKnown = new Map();
+    for (let i = 0; i < all.length; i++) {
+      const node = all[i];
+      const m = metaOf(node);
+      if (!m || m.file !== targetFile) continue;
+      const nextLoc = remapLoc(m.loc);
+      if (nextLoc !== m.loc) {
+        const updated = { file: m.file, loc: nextLoc };
+        sourceMap.set(node, updated);
+        if (node.hasAttribute && node.hasAttribute('data-astro-source-loc')) {
+          node.setAttribute('data-astro-source-loc', nextLoc);
+        }
+        nextKnown.set(keyOf(updated), node);
+      }
+    }
+    if (selMeta && selMeta.file === targetFile) {
+      selMeta = { file: selMeta.file, loc: remapLoc(selMeta.loc) };
+    }
+    for (const [k, v] of nextKnown.entries()) {
+      knownEls.set(k, v);
+    }
+  }
+
   async function finishEditing(save) {
     if (!activeEl || !activeMeta) return;
     const el = activeEl;
@@ -678,6 +714,12 @@ export function buildClientBridgeScript(previewBase: string): string {
         window.parent.postMessage({ type: 'halley:edit-error', message: data.error || 'Save failed' }, '*');
         return;
       }
+      shiftSourceMapLines(
+        meta.file,
+        Number(data.topLineDelta || 0),
+        Number(data.afterLine || 0),
+        Number(data.afterLineDelta || 0),
+      );
       showToast('Saved');
       window.parent.postMessage({
         type: 'halley:patch-saved',

@@ -17,6 +17,7 @@ export async function runReaperPass(
   driver: WorkspaceDriver,
   now = Date.now(),
 ): Promise<void> {
+  await driver.reconcileSessions?.().catch(() => {});
   const sessions = db.listSessions();
   const pruneMs = config.nodeModulesPruneDays * 24 * 60 * 60 * 1000;
   const retentionMs = config.archiveRetentionDays * 24 * 60 * 60 * 1000;
@@ -90,8 +91,13 @@ export function startSessionReaper(
   db: ControlPlaneDb,
   driver: WorkspaceDriver,
 ): () => void {
+  let inFlight = false;
   const interval = setInterval(() => {
-    void runReaperPass(config, db, driver);
+    if (inFlight) return;
+    inFlight = true;
+    void runReaperPass(config, db, driver).finally(() => {
+      inFlight = false;
+    });
   }, 60_000);
 
   return () => clearInterval(interval);

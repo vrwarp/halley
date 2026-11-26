@@ -68,6 +68,7 @@ export function NewPageModal({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
+  const initialRouteRef = useRef(currentRoute);
 
   useEffect(() => {
     titleInputRef.current?.focus();
@@ -75,6 +76,7 @@ export function NewPageModal({
 
   useEffect(() => {
     let active = true;
+    const initialRoute = initialRouteRef.current;
     setLoadingOptions(true);
     void api
       .getPageOptions(sessionId)
@@ -83,11 +85,11 @@ export function NewPageModal({
         setOptions(opts);
         // Default section to the current route's section if it's a known section folder
         const currentSec =
-          currentRoute !== '/' && opts.sections.some((s) => s.section === currentRoute)
-            ? currentRoute
+          initialRoute !== '/' && opts.sections.some((s) => s.section === initialRoute)
+            ? initialRoute
             : (() => {
-                const idx = currentRoute.lastIndexOf('/');
-                const parent = idx > 0 ? currentRoute.slice(0, idx) : '/';
+                const idx = initialRoute.lastIndexOf('/');
+                const parent = idx > 0 ? initialRoute.slice(0, idx) : '/';
                 return opts.sections.some((s) => s.section === parent) ? parent : '/';
               })();
         setSection(currentSec);
@@ -106,7 +108,7 @@ export function NewPageModal({
     return () => {
       active = false;
     };
-  }, [sessionId, currentRoute]);
+  }, [sessionId]);
 
   // Keep slug synced to title until user edits slug manually
   useEffect(() => {

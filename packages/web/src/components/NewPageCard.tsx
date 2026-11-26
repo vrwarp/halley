@@ -16,6 +16,7 @@ import { useState } from 'react';
 
 interface Props {
   pageRequest: PageRequestMetadata;
+  liveUnlisted?: boolean;
   persona: 'non-technical' | 'developer';
   canEdit: boolean;
   spendCapped: boolean;
@@ -47,6 +48,7 @@ export function pageStatusText(status: PageRequestMetadata['status']): string {
 
 export function NewPageCard({
   pageRequest,
+  liveUnlisted,
   persona,
   canEdit,
   spendCapped,
@@ -57,6 +59,7 @@ export function NewPageCard({
   const [showInstructions, setShowInstructions] = useState(false);
   const [busyAction, setBusyAction] = useState<'retry' | 'delete' | null>(null);
 
+  const isUnlisted = liveUnlisted !== undefined ? liveUnlisted : pageRequest.unlisted;
   const isWorking =
     pageRequest.status === 'created' ||
     pageRequest.status === 'writing' ||
@@ -83,7 +86,7 @@ export function NewPageCard({
 
       {/* Metadata badges */}
       <div className="flex flex-wrap items-center gap-1.5">
-        {pageRequest.unlisted && (
+        {isUnlisted && (
           <span className="inline-flex items-center gap-1 rounded-full bg-stone-200/80 px-2 py-0.5 text-[10px] font-medium text-stone-700">
             <EyeOff className="h-2.5 w-2.5" /> Unlisted
           </span>

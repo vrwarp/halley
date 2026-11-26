@@ -104,15 +104,44 @@ export function createInternalGitHttpHandler(
       const child = spawn(backendPath, [], { env, stdio: ['pipe', 'pipe', 'pipe'] });
       const outChunks: Buffer[] = [];
       const errChunks: Buffer[] = [];
+      let settled = false;
+      const finish = (err: Error | null, buf?: Buffer) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killTimer);
+        c.req.raw.signal?.removeEventListener('abort', onAbort);
+        if (err) reject(err);
+        else resolve(buf ?? Buffer.alloc(0));
+      };
+      const onAbort = () => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        finish(new Error('git-http-backend request aborted'));
+      };
+      const killTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        finish(new Error('git-http-backend timed out after 45s'));
+      }, 45_000);
+      c.req.raw.signal?.addEventListener('abort', onAbort, { once: true });
+
+      // Swallow EPIPE if git-http-backend exits early before consuming a >64KB request body
+      child.stdin.on('error', () => {});
       child.stdout.on('data', (chunk: Buffer) => outChunks.push(chunk));
       child.stderr.on('data', (chunk: Buffer) => errChunks.push(chunk));
-      child.on('error', reject);
+      child.on('error', (err) => finish(err));
       child.on('close', (code) => {
         if (code !== 0 && outChunks.length === 0) {
-          reject(new Error(`git-http-backend exited ${code}: ${Buffer.concat(errChunks).toString('utf8')}`));
+          finish(new Error(`git-http-backend exited ${code}: ${Buffer.concat(errChunks).toString('utf8')}`));
           return;
         }
-        resolve(Buffer.concat(outChunks));
+        finish(null, Buffer.concat(outChunks));
       });
       if (body.length > 0) child.stdin.write(body);
       child.stdin.end();

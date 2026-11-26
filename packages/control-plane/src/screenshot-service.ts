@@ -129,6 +129,7 @@ export interface CaptureRouteReviewOptions {
   baseSha?: string | null;
   liveTimestamp: string;
   viewport?: ScreenshotViewport;
+  signal?: AbortSignal;
 }
 
 export class ScreenshotService {
@@ -160,6 +161,7 @@ export class ScreenshotService {
       (() =>
         chromium.launch({
           headless: true,
+          timeout: 30_000,
           args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
         }));
   }
@@ -192,7 +194,14 @@ export class ScreenshotService {
     this.browser = null;
 
     if (!this.launchPromise) {
-      this.launchPromise = this.launchBrowser()
+      let launchTimer: ReturnType<typeof setTimeout> | null = null;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        launchTimer = setTimeout(
+          () => reject(new Error('Timed out launching Chromium browser after 30s')),
+          30_000,
+        );
+      });
+      this.launchPromise = Promise.race([this.launchBrowser(), timeoutPromise])
         .then((b) => {
           this.browser = b;
           b.on('disconnected', () => {
@@ -204,6 +213,7 @@ export class ScreenshotService {
           return b;
         })
         .finally(() => {
+          if (launchTimer) clearTimeout(launchTimer);
           this.launchPromise = null;
         });
     }
@@ -220,17 +230,39 @@ export class ScreenshotService {
     }
   }
 
-  private async withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  private async withSlot<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.closed) {
       throw new Error('ScreenshotService has been closed');
     }
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error('Screenshot request aborted');
+    }
     if (this.activeSlots >= this.maxConcurrency) {
-      await new Promise<void>((resolve) => {
-        this.waitQueue.push(resolve);
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        const onAbort = () => {
+          const idx = this.waitQueue.indexOf(wake);
+          if (idx !== -1) this.waitQueue.splice(idx, 1);
+          reject(
+            signal?.reason instanceof Error
+              ? signal.reason
+              : new Error('Screenshot request aborted'),
+          );
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        this.waitQueue.push(wake);
       });
     }
     if (this.closed) {
       throw new Error('ScreenshotService has been closed');
+    }
+    if (signal?.aborted) {
+      const next = this.waitQueue.shift();
+      if (next) next();
+      throw signal.reason instanceof Error ? signal.reason : new Error('Screenshot request aborted');
     }
     this.activeSlots += 1;
     this.clearIdleTimer();
@@ -341,13 +373,22 @@ export class ScreenshotService {
     if (typeof (context as { newCDPSession?: unknown }).newCDPSession === 'function') {
       try {
         const cdp = await context.newCDPSession(page);
+        let cdpTimer: ReturnType<typeof setTimeout> | null = null;
         try {
-          const result = (await cdp.send('Page.captureScreenshot', {
-            format: 'webp',
-            quality: REVIEW_IMAGE_QUALITY,
-            captureBeyondViewport: true,
-            clip: { x: 0, y: 0, width, height: captureHeight, scale: 1 },
-          })) as { data?: string };
+          const result = (await Promise.race([
+            cdp.send('Page.captureScreenshot', {
+              format: 'webp',
+              quality: REVIEW_IMAGE_QUALITY,
+              captureBeyondViewport: true,
+              clip: { x: 0, y: 0, width, height: captureHeight, scale: 1 },
+            }),
+            new Promise<never>((_, reject) => {
+              cdpTimer = setTimeout(
+                () => reject(new Error('CDP Page.captureScreenshot timed out after 20s')),
+                20_000,
+              );
+            }),
+          ])) as { data?: string };
           if (result?.data) {
             return {
               dataUrl: `data:image/webp;base64,${result.data}`,
@@ -356,6 +397,7 @@ export class ScreenshotService {
             };
           }
         } finally {
+          if (cdpTimer) clearTimeout(cdpTimer);
           await cdp.detach().catch(() => {});
         }
       } catch {
@@ -427,6 +469,7 @@ export class ScreenshotService {
     draftFiles: string[],
     mergedFromLiveFiles: string[],
     fallbackTitle: string,
+    signal?: AbortSignal,
   ): Promise<{ title: string; capture: CompressedCapture; highlights: VisualDiffHighlightDto[] } | null> {
     return this.withSlot(async () => {
       const browser = await this.ensureBrowser();
@@ -527,7 +570,7 @@ export class ScreenshotService {
       } finally {
         await context.close().catch(() => {});
       }
-    });
+    }, signal);
   }
 
   private async captureLiveFull(
@@ -535,6 +578,7 @@ export class ScreenshotService {
     viewport: ScreenshotViewport,
     size: { width: number; height: number },
     baseSha?: string | null,
+    signal?: AbortSignal,
   ): Promise<CompressedCapture | null> {
     const cacheKey = `${liveUrl}|${viewport}|${baseSha || 'live'}`;
     const cached = this.liveCache.get(cacheKey);
@@ -576,7 +620,7 @@ export class ScreenshotService {
       } finally {
         await context.close().catch(() => {});
       }
-    });
+    }, signal);
   }
 
   /**
@@ -604,8 +648,11 @@ export class ScreenshotService {
         [...new Set(opts.draftFiles)],
         [...new Set(opts.mergedFromLiveFiles)],
         fallbackTitle,
+        opts.signal,
       ),
-      liveUrl ? this.captureLiveFull(liveUrl, viewport, size, opts.baseSha) : Promise.resolve(null),
+      liveUrl
+        ? this.captureLiveFull(liveUrl, viewport, size, opts.baseSha, opts.signal)
+        : Promise.resolve(null),
     ]);
 
     if (!draftRes) {

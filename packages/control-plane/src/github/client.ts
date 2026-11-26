@@ -93,6 +93,7 @@ export class GitHubService {
             Accept: 'application/vnd.github+json',
             'User-Agent': 'halley-editor',
           },
+          signal: AbortSignal.timeout(15_000),
         },
       );
       if (!res.ok) {
@@ -120,6 +121,7 @@ export class GitHubService {
     const token = await this.getAccessToken();
     const res = await fetch(`${this.config.githubApiBaseUrl}${path}`, {
       ...init,
+      signal: init?.signal ?? AbortSignal.timeout(15_000),
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/vnd.github+json',
@@ -211,6 +213,7 @@ export class GitHubService {
           }`,
           variables: { id: prNodeId, headline: commitHeadline },
         }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) return false;
       const json = (await res.json()) as { errors?: unknown[] };

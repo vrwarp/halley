@@ -47,9 +47,33 @@ export class BuildQueueTimeoutError extends Error {
 
 export class FifoBuildQueue {
   private active: ActiveLease | null = null;
+  private activeTimer: NodeJS.Timeout | null = null;
   private queue: Waiter[] = [];
 
-  constructor(private readonly defaultTimeoutMs = 10 * 60_000) {}
+  constructor(
+    private readonly defaultTimeoutMs = 10 * 60_000,
+    private readonly maxLeaseMs = 15 * 60_000,
+  ) {}
+
+  private clearActiveTimer(): void {
+    if (this.activeTimer) {
+      clearTimeout(this.activeTimer);
+      this.activeTimer = null;
+    }
+  }
+
+  private armActiveTimer(leaseId: string): void {
+    this.clearActiveTimer();
+    if (this.maxLeaseMs <= 0) return;
+    this.activeTimer = setTimeout(() => {
+      if (this.active?.leaseId === leaseId) {
+        this.active = null;
+        this.activeTimer = null;
+        this.pump();
+      }
+    }, this.maxLeaseMs);
+    this.activeTimer.unref?.();
+  }
 
   getStatus(): BuildQueueStatus {
     return {
@@ -76,6 +100,7 @@ export class FifoBuildQueue {
     if (this.active && this.active.priority === 'speculative' && priority === 'foreground') {
       const preempted = this.active;
       this.active = null;
+      this.clearActiveTimer();
       try {
         preempted.onPreempted?.();
       } catch {
@@ -86,6 +111,7 @@ export class FifoBuildQueue {
     if (!this.active) {
       const leaseId = crypto.randomUUID();
       this.active = { leaseId, sessionId, priority, onPreempted: opts?.onPreempted };
+      this.armActiveTimer(leaseId);
       return Promise.resolve({
         leaseId,
         sessionId,
@@ -173,6 +199,7 @@ export class FifoBuildQueue {
   releaseByLease(leaseId: string): boolean {
     if (this.active?.leaseId !== leaseId) return false;
     this.active = null;
+    this.clearActiveTimer();
     this.pump();
     return true;
   }
@@ -197,6 +224,7 @@ export class FifoBuildQueue {
 
     if (this.active?.sessionId === sessionId) {
       this.active = null;
+      this.clearActiveTimer();
       this.pump();
     }
   }
@@ -216,6 +244,7 @@ export class FifoBuildQueue {
       priority: next.priority,
       onPreempted: next.onPreempted,
     };
+    this.armActiveTimer(leaseId);
     this.notifyPositions();
     next.resolve({
       leaseId,

@@ -88,6 +88,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   private resolvedHostUrl: string | null = null;
   private startingSupervisor: Promise<string> | null = null;
   private lastSupervisorInstanceId: string | null = null;
+  private cachedHealth: { data: SupervisorHealthResponse; at: number } | null = null;
   private mirrorSyncInflight: Promise<string> | null = null;
   private lastMirrorSyncAt = 0;
   private lastWarmPoolStatus: WarmPoolStatus = {
@@ -289,7 +290,18 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     if (data.warmPool) {
       this.lastWarmPoolStatus = data.warmPool;
     }
+    this.cachedHealth = { data, at: Date.now() };
     return data;
+  }
+
+  private async getCachedSupervisorHealth(
+    hostUrl: string,
+    maxAgeMs = 3_000,
+  ): Promise<SupervisorHealthResponse> {
+    if (this.cachedHealth && Date.now() - this.cachedHealth.at < maxAgeMs) {
+      return this.cachedHealth.data;
+    }
+    return this.fetchSupervisorHealth(hostUrl);
   }
 
   /**
@@ -422,6 +434,29 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     const pending = this.booting.get(session.id);
     if (pending) return pending;
 
+    // Fast path: if the session already has live URLs, a valid in-memory workspace token,
+    // and the supervisor confirms it is active, return immediately without hitting GitHub,
+    // emitting boot_progress, polling /progress, or writing to SQLite.
+    if (session.runner_url && session.astro_url && this.sessionTokens.has(session.id)) {
+      try {
+        const hostUrl = await this.getHostUrl();
+        const health = await this.getCachedSupervisorHealth(hostUrl);
+        if (health.activeSessionIds?.includes(session.id)) {
+          return {
+            runnerUrl: session.runner_url,
+            astroUrl: session.astro_url,
+            astroBase: session.astro_base || '/',
+            baseSha: session.base_sha,
+          };
+        }
+        // Supervisor no longer has this session active (e.g. LRU eviction or restart)
+        this.reconcileFromHealth(health);
+        this.cachedHealth = null;
+      } catch {
+        // Fall through to full startOrWake with retries
+      }
+    }
+
     try {
       this.crashTracker.assertCanAttempt(session.id);
     } catch (err) {
@@ -466,16 +501,17 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
           await new Promise((r) => setTimeout(r, 1_000));
         }
       }
-      if (
-        this.lastSupervisorInstanceId === null ||
-        this.lastSupervisorInstanceId !== health.instanceId
-      ) {
-        this.reconcileFromHealth(health);
-      }
+      // Always reconcile DB state against supervisor activeSessionIds so LRU-evicted
+      // sessions (where instanceId did not change) have their stale URLs cleared promptly.
+      this.reconcileFromHealth(health);
+
+      const alreadyActiveOnSupervisor = health.activeSessionIds?.includes(session.id) ?? false;
 
       // Refresh control-plane's bare mirror before asking workspaces to clone/sync
-      this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
-      await this.ensureControlPlaneMirror(session.base_branch, { allowStaleOnError: true });
+      if (!alreadyActiveOnSupervisor) {
+        this.emitProgress(session.id, 'syncing_repo', 'Syncing latest website repository…');
+        await this.ensureControlPlaneMirror(session.base_branch, { allowStaleOnError: true });
+      }
 
       const workspaceToken = this.ensureSessionToken(session.id);
       const persona = this.db.getUserById(session.owner_user_id)?.persona ?? 'non-technical';
@@ -485,15 +521,18 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         .map((s) => s.id);
 
       // Poll supervisor boot progress while /start runs
-      let stopPolling = false;
+      const pollAbort = new AbortController();
       const pollProgress = async () => {
-        while (!stopPolling) {
+        while (!pollAbort.signal.aborted) {
           try {
             const pRes = await fetch(
               `${hostUrl}/api/sessions/${encodeURIComponent(session.id)}/progress`,
-              { headers: this.authHeaders(), signal: AbortSignal.timeout(1500) },
+              {
+                headers: this.authHeaders(),
+                signal: AbortSignal.any([pollAbort.signal, AbortSignal.timeout(1500)]),
+              },
             );
-            if (pRes.ok) {
+            if (pRes.ok && !pollAbort.signal.aborted) {
               const pData = (await pRes.json()) as { progress: BootProgressDto | null };
               if (pData.progress && pData.progress.stage !== 'ready') {
                 this.emitProgress(session.id, pData.progress.stage, pData.progress.message, {
@@ -504,12 +543,23 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
               }
             }
           } catch {
-            // ignore transient progress poll failure
+            // ignore transient progress poll failure or abort
           }
-          await new Promise((r) => setTimeout(r, 400));
+          if (pollAbort.signal.aborted) break;
+          await new Promise<void>((resolve) => {
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(() => {
+              pollAbort.signal.removeEventListener('abort', onAbort);
+              resolve();
+            }, 400);
+            pollAbort.signal.addEventListener('abort', onAbort, { once: true });
+          });
         }
       };
-      const pollLoop = pollProgress();
+      const pollLoop = alreadyActiveOnSupervisor ? Promise.resolve() : pollProgress();
 
       let startRes: Response;
       try {
@@ -533,7 +583,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
           },
         );
       } finally {
-        stopPolling = true;
+        pollAbort.abort();
         await pollLoop.catch(() => {});
       }
 
@@ -566,8 +616,11 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         last_active_at: new Date().toISOString(),
       });
 
+      this.cachedHealth = null;
       this.crashTracker.recordSuccess(session.id);
-      this.emitProgress(session.id, 'ready', 'Workspace ready!');
+      if (!alreadyActiveOnSupervisor) {
+        this.emitProgress(session.id, 'ready', 'Workspace ready!');
+      }
       return { runnerUrl, astroUrl, astroBase, baseSha };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -593,6 +646,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
   async stop(session: SessionRecord): Promise<void> {
     this.bootProgress.delete(session.id);
+    this.cachedHealth = null;
     try {
       const hostUrl = await this.getHostUrl();
       await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}/stop`, {
@@ -614,6 +668,8 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   async restart(session: SessionRecord): Promise<WorkspaceEndpoint> {
     this.crashTracker.reset(session.id);
     this.bootProgress.delete(session.id);
+    this.booting.delete(session.id);
+    this.cachedHealth = null;
     try {
       const hostUrl = await this.getHostUrl();
       await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}/restart`, {
@@ -635,6 +691,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
   async destroy(session: SessionRecord): Promise<void> {
     this.bootProgress.delete(session.id);
+    this.cachedHealth = null;
     try {
       const hostUrl = await this.getHostUrl();
       await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}`, {
@@ -747,8 +804,20 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       // Each halley/* branch is owned exclusively by this single session.
       await runGit(
         mirrorDir,
-        ['-c', 'remote.origin.mirror=false', 'push', '--force', 'origin', refspec],
+        [
+          '-c',
+          'remote.origin.mirror=false',
+          '-c',
+          'http.lowSpeedLimit=1',
+          '-c',
+          'http.lowSpeedTime=20',
+          'push',
+          '--force',
+          'origin',
+          refspec,
+        ],
         env,
+        45_000,
       );
     });
   }

@@ -70,23 +70,24 @@ async function runPackageInstall(workspaceDir: string, pkgCacheDir: string): Pro
   if (!hasPkgJson) return;
 
   await fs.mkdir(pkgCacheDir, { recursive: true });
+  const installTimeoutMs = 180_000;
   if (hasPkgLock) {
     await execFileAsync(
       'npm',
       ['ci', '--cache', path.join(pkgCacheDir, 'npm'), '--prefer-offline', '--ignore-scripts'],
-      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024 },
+      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024, timeout: installTimeoutMs },
     );
   } else if (hasPnpmLock) {
     await execFileAsync(
       'pnpm',
       ['install', '--store-dir', path.join(pkgCacheDir, 'pnpm'), '--frozen-lockfile'],
-      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024 },
+      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024, timeout: installTimeoutMs },
     );
   } else {
     await execFileAsync(
       'npm',
       ['install', '--cache', path.join(pkgCacheDir, 'npm'), '--prefer-offline', '--ignore-scripts'],
-      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024 },
+      { cwd: workspaceDir, maxBuffer: 32 * 1024 * 1024, timeout: installTimeoutMs },
     );
   }
 }
@@ -198,7 +199,10 @@ export class NodeModulesCacheManager {
     const cachedNmPath = await this.ensureCachedInstall(hash, workspaceDir);
     const stagingNmPath = path.join(workspaceDir, `.node_modules.tmp-${crypto.randomUUID().slice(0, 8)}`);
     try {
-      await execFileAsync('cp', ['-al', cachedNmPath, stagingNmPath], { maxBuffer: 16 * 1024 * 1024 });
+      await execFileAsync('cp', ['-al', cachedNmPath, stagingNmPath], {
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 60_000,
+      });
       await fs.rename(stagingNmPath, nmPath);
       if (!(await isNodeModulesHealthy(nmPath, workspaceDir))) {
         throw new Error('Hardlinked node_modules failed health check');

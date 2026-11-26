@@ -20,6 +20,7 @@ import {
 import { useEffect, useState, type RefObject } from 'react';
 import { ChatMessageContent, parseUserMessageDisplay } from './ChatMessageContent.js';
 import type { BubblePos } from './MobileChatBubble.js';
+import { NewPageCard } from './NewPageCard.js';
 
 export interface MobileNotice {
   text: string;
@@ -49,10 +50,14 @@ interface Props {
   onRemoveAttachment: (stagedId: string) => void;
   uploading: boolean;
   onTriggerPhotoUpload: () => void;
-  onSend: (whenBusy?: 'followUp', overrideText?: string) => void;
+  onSend: (whenBusy?: 'steer' | 'followUp', overrideText?: string) => void;
   onAbort: () => void;
   onOpenNewPage: () => void;
   onNavigateRouteAndClose: (route: string) => void;
+  onRetryPageRequest?: (pageRequestId: string) => Promise<void>;
+  onDeletePageRequest?: (route: string) => Promise<void>;
+  liveUnlistedByRoute?: Map<string, boolean>;
+  pageRequestsMap?: Record<string, import('@halley/shared').PageRequestMetadata>;
   onShowHistory: () => void;
   onClose: () => void;
   notice: MobileNotice | null;
@@ -94,6 +99,10 @@ export function MobileChatCard({
   onAbort,
   onOpenNewPage,
   onNavigateRouteAndClose,
+  onRetryPageRequest,
+  onDeletePageRequest,
+  liveUnlistedByRoute,
+  pageRequestsMap,
   onShowHistory,
   onClose,
   notice,
@@ -164,7 +173,7 @@ export function MobileChatCard({
 
   if (!rendered) return null;
 
-  const submitPrompt = (whenBusy?: 'followUp', overrideText?: string) => {
+  const submitPrompt = (whenBusy?: 'steer' | 'followUp', overrideText?: string) => {
     const raw = (overrideText ?? input).trim();
     if (!raw && attachments.length === 0 && chips.length === 0) return;
     const displayText =
@@ -192,13 +201,23 @@ export function MobileChatCard({
   const turnEntries = lastUserIdx >= 0 ? entries.slice(lastUserIdx + 1) : entries;
   let lastAssistant: TranscriptEntryDto | null = null;
   let completedToolsInTurn = 0;
+  let turnPageRequest = lastUser?.pageRequest ?? null;
   for (let i = 0; i < turnEntries.length; i++) {
     const e = turnEntries[i]!;
-    if (e.role === 'tool') completedToolsInTurn += 1;
+    if (e.role === 'tool') {
+      completedToolsInTurn += 1;
+      if (e.pageRequest) turnPageRequest = e.pageRequest;
+    }
     if (e.role === 'assistant' && !e.isIntermediate && e.text.trim()) {
       lastAssistant = e;
     }
   }
+  const liveTurnPageRequest = turnPageRequest
+    ? (pageRequestsMap?.[turnPageRequest.pageRequestId] ?? turnPageRequest)
+    : null;
+
+  const totalBudget = spend.dailyCapUsd + spend.extraGrantedUsd;
+  const spendPct = totalBudget > 0 ? Math.round((spend.spentTodayUsd / totalBudget) * 100) : 0;
 
   const isWorking = live.busy || Boolean(pendingSend);
   const activeTool = live.activeTools[0];
@@ -213,7 +232,7 @@ export function MobileChatCard({
         : parseUserMessageDisplay(lastUser.text).body
       : null;
 
-  const isEmpty = !displayedUserText && !lastAssistant && !isWorking;
+  const isEmpty = !displayedUserText && !lastAssistant && !liveTurnPageRequest && !isWorking;
   const keyboardOpen = vvMetrics.offsetBottom > 80;
   const winW = typeof window !== 'undefined' ? window.innerWidth : 390;
   const winH = typeof window !== 'undefined' ? window.innerHeight : 844;
@@ -337,6 +356,19 @@ export function MobileChatCard({
               </div>
             )}
 
+            {liveTurnPageRequest && onRetryPageRequest && onDeletePageRequest && (
+              <NewPageCard
+                pageRequest={liveTurnPageRequest}
+                liveUnlisted={liveUnlistedByRoute?.get(liveTurnPageRequest.route)}
+                persona={persona}
+                canEdit={canEdit}
+                spendCapped={spend.capped}
+                onNavigateRoute={onNavigateRouteAndClose}
+                onRetry={onRetryPageRequest}
+                onDelete={onDeletePageRequest}
+              />
+            )}
+
             {isWorking ? (
               <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-200/80 bg-amber-50/60 px-3 py-2 text-xs text-amber-950">
                 <div className="flex items-center gap-2 min-w-0">
@@ -378,11 +410,15 @@ export function MobileChatCard({
       {/* Compact Composer */}
       {canEdit && (
         <div className="shrink-0 border-t border-stone-100 bg-white px-2.5 py-2 space-y-1.5">
-          {spend.capped && (
+          {spend.capped ? (
             <div className="rounded-lg border border-red-200 bg-red-50 px-2 py-1 text-[11px] text-red-800">
               Daily AI budget reached. Ask an admin for extra allowance.
             </div>
-          )}
+          ) : spendPct >= 75 ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-900">
+              {spendPct}% of today&apos;s AI editing budget used (${spend.spentTodayUsd.toFixed(2)} / ${totalBudget.toFixed(2)}).
+            </div>
+          ) : null}
 
           {chips.length > 0 && (
             <div className="space-y-1">

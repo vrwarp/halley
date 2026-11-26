@@ -42,8 +42,7 @@ export class AuthService {
     private db: ControlPlaneDb,
   ) {}
 
-  getUserFromContext(c: Context): UserDto | null {
-    const raw = getCookie(c, COOKIE_NAME);
+  private resolveUserFromRawToken(raw: string | undefined): UserDto | null {
     if (!raw) return null;
     const payload = verifyToken<SessionPayload>(raw, this.config.sessionSecret);
     if (!payload) return null;
@@ -51,6 +50,28 @@ export class AuthService {
     if (!user) return null;
     if (!this.db.isEmailAllowed(user.email)) return null;
     return user;
+  }
+
+  getUserFromContext(c: Context): UserDto | null {
+    return this.resolveUserFromRawToken(getCookie(c, COOKIE_NAME));
+  }
+
+  getUserFromCookieHeader(cookieHeader?: string): UserDto | null {
+    if (!cookieHeader) return null;
+    for (const part of cookieHeader.split(';')) {
+      const idx = part.indexOf('=');
+      if (idx === -1) continue;
+      const name = part.slice(0, idx).trim();
+      if (name === COOKIE_NAME) {
+        const raw = part.slice(idx + 1).trim();
+        try {
+          return this.resolveUserFromRawToken(decodeURIComponent(raw));
+        } catch {
+          return this.resolveUserFromRawToken(raw);
+        }
+      }
+    }
+    return null;
   }
 
   issueSessionCookie(c: Context, userId: string): void {
@@ -128,6 +149,7 @@ export class AuthService {
         grant_type: 'authorization_code',
         code_verifier: saved.codeVerifier,
       }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!tokenRes.ok) {
       return { ok: false, reason: 'Failed to exchange Google authorization code' };
@@ -139,6 +161,7 @@ export class AuthService {
 
     const userRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+      signal: AbortSignal.timeout(15_000),
     });
     if (!userRes.ok) {
       return { ok: false, reason: 'Failed to fetch Google profile' };

@@ -6,7 +6,8 @@ import { promisify } from 'node:util';
 import { PerFileMutex } from '@halley/astro-dev-edit';
 import { HALLEY_PLACEHOLDER_ATTR, type ChatServerMessage } from '@halley/shared';
 import { describe, expect, it } from 'vitest';
-import { listCheckpoints, undoToCheckpoint } from '../src/checkpoints-and-git.js';
+import { FifoBuildQueue } from '../src/build-queue.js';
+import { createCheckpoint, listCheckpoints, undoToCheckpoint } from '../src/checkpoints-and-git.js';
 import { PageCreationService, PageValidationError } from '../src/pages.js';
 import { runUnfinishedPagesCheck, runUnlistedIntegrityCheck } from '../src/verify.js';
 
@@ -200,6 +201,73 @@ describe('PageCreationService & verification checks', () => {
       expect(unfinished.passed).toBe(false);
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('syncs page requests from disk, toggles markdown visibility, blocks checkpoint during MERGE_HEAD, and enforces build lease TTL', async () => {
+    const { repoDir, stateDir } = await initTempAstroRepo();
+    try {
+      const broadcasts: ChatServerMessage[] = [];
+      const svc = new PageCreationService({
+        repoRoot: repoDir,
+        stateDir,
+        baseBranch: 'main',
+        gitIdentity: identity,
+        fileLock: new PerFileMutex(),
+        getAstroPort: () => 0,
+        getPreviewBase: () => '/',
+        onBroadcast: (msg) => broadcasts.push(msg),
+      });
+      await svc.load();
+
+      // Create an unlisted page, then flip it public on disk (simulating Pi writing a public page)
+      const created = await svc.createPage({
+        title: 'Bigfoot',
+        slug: 'bigfoot',
+        section: '/',
+        unlisted: true,
+        nav: { mode: 'none' },
+      });
+      expect(created.pageRequest.unlisted).toBe(true);
+      await fs.writeFile(
+        path.join(repoDir, 'src/pages/bigfoot.astro'),
+        `---\nimport BaseLayout from '../layouts/BaseLayout.astro';\n---\n<BaseLayout title="Bigfoot"><main><h1>Bigfoot</h1></main></BaseLayout>\n`,
+        'utf8',
+      );
+      await svc.syncPageRequestsFromDisk({ reconcileInterrupted: true, broadcast: true });
+      const synced = svc.getPageRequest(created.pageRequest.pageRequestId);
+      expect(synced?.unlisted).toBe(false);
+      expect(synced?.status).toBe('done');
+      expect(broadcasts.some((m) => m.type === 'page_requests_sync')).toBe(true);
+
+      // Markdown page visibility toggle
+      await fs.writeFile(
+        path.join(repoDir, 'src/pages/notes.md'),
+        `---\ntitle: Notes\n---\n# Notes\n`,
+        'utf8',
+      );
+      const vis = await svc.setPageVisibility('/notes', true);
+      expect(vis.unlisted).toBe(true);
+      const mdContent = await fs.readFile(path.join(repoDir, 'src/pages/notes.md'), 'utf8');
+      expect(mdContent).toContain('indexable: false');
+
+      // createCheckpoint refuses to commit while MERGE_HEAD exists
+      await fs.writeFile(path.join(repoDir, 'src/pages/conflict.astro'), '<<<<<<< HEAD\n', 'utf8');
+      await fs.writeFile(path.join(repoDir, '.git/MERGE_HEAD'), 'deadbeef\n', 'utf8');
+      const blocked = await createCheckpoint(repoDir, 'Should not commit', identity);
+      expect(blocked).toBeNull();
+      await fs.rm(path.join(repoDir, '.git/MERGE_HEAD'), { force: true });
+
+      // FifoBuildQueue releases a stuck active lease automatically after maxLeaseMs
+      const queue = new FifoBuildQueue(1000, 80);
+      const lease1 = await queue.acquire('sess-stuck', { timeoutMs: 1000, priority: 'foreground' });
+      const start = Date.now();
+      const lease2 = await queue.acquire('sess-next', { timeoutMs: 1000, priority: 'foreground' });
+      expect(Date.now() - start).toBeGreaterThanOrEqual(60);
+      expect(lease1.leaseId).not.toBe(lease2.leaseId);
+      lease2.release();
+    } finally {
+      await fs.rm(path.dirname(repoDir), { recursive: true, force: true });
     }
   });
 });
