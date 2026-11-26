@@ -8,7 +8,7 @@ export interface HalleyConfig {
   baseBranch: string;
   /** Optional GitHub Actions workflow filename or name used to confirm live site deployment. */
   deployWorkflow: string;
-  /** Optional override for live site URL used in Live vs Draft screenshots ("none" disables auto-detected URL). */
+  /** Optional override for live site URL used in Live vs Draft screenshots (defaults to https://<owner>.github.io/<repo> from HALLEY_REPO; "none" disables). */
   liveSiteUrl: string;
   githubAppId: string;
   githubAppPrivateKey: string;
@@ -45,6 +45,44 @@ export interface HalleyConfig {
   devLoginEnabled: boolean;
   devLocalRepo: string;
   webDistDir: string;
+}
+
+/**
+ * Derives the default GitHub Pages URL for an `owner/repo` slug:
+ * - Project site: `https://<owner>.github.io/<repo>`
+ * - User/org site (`<owner>.github.io`): `https://<owner>.github.io`
+ */
+export function deriveGitHubPagesUrl(repo: string): string | null {
+  const parts = repo.trim().split('/').filter(Boolean);
+  if (parts.length !== 2) return null;
+  const [owner, repoName] = parts;
+  if (!owner || !repoName) return null;
+  const host = `${owner.toLowerCase()}.github.io`;
+  if (repoName.toLowerCase() === host) {
+    return `https://${host}`;
+  }
+  return `https://${host}/${repoName}`;
+}
+
+/**
+ * Resolves the live site base URL used for Live vs Draft screenshots.
+ * Precedence:
+ * 1. `HALLEY_LIVE_SITE_URL` (`none`/`off` disables; any other value overrides)
+ * 2. Derived GitHub Pages URL from `HALLEY_REPO` (`https://<owner>.github.io/<repo>`)
+ * 3. Fallback to `detectedSiteUrl` from `astro.config.*` if `HALLEY_REPO` is not `owner/repo`
+ */
+export function resolveLiveSiteUrl(
+  config: Pick<HalleyConfig, 'liveSiteUrl' | 'repo'>,
+  detectedSiteUrl?: string | null,
+): string | null {
+  const envLive = config.liveSiteUrl.trim().replace(/\/+$/, '');
+  if (envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off') {
+    return null;
+  }
+  if (envLive) {
+    return envLive;
+  }
+  return deriveGitHubPagesUrl(config.repo) || detectedSiteUrl?.trim().replace(/\/+$/, '') || null;
 }
 
 function splitCsv(val: string | undefined): string[] {

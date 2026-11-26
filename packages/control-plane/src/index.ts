@@ -15,7 +15,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from './auth/google.js';
-import { loadConfig, type HalleyConfig } from './config.js';
+import { loadConfig, resolveLiveSiteUrl, type HalleyConfig } from './config.js';
 import { ControlPlaneDb } from './db.js';
 import { WorkspaceCrashLoopError, type WorkspaceDriver } from './drivers/workspace-driver.js';
 import { WorkspaceHostDriver } from './drivers/workspace-host-driver.js';
@@ -1283,11 +1283,7 @@ export function createControlPlane(
       const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
       const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
       const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
-      const envLive = config.liveSiteUrl;
-      const liveBaseUrl =
-        envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off'
-          ? null
-          : envLive || data.liveSiteUrl || null;
+      const liveBaseUrl = resolveLiveSiteUrl(config, data.liveSiteUrl);
       data.pages = await screenshotService
         .captureLiveVsDraftPages({
           routes: resolvedRoutes,
@@ -1339,11 +1335,7 @@ export function createControlPlane(
     const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
     const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
     const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
-    const envLive = config.liveSiteUrl;
-    const liveBaseUrl =
-      envLive.toLowerCase() === 'none' || envLive.toLowerCase() === 'off'
-        ? null
-        : envLive || data.liveSiteUrl || null;
+    const liveBaseUrl = resolveLiveSiteUrl(config, data.liveSiteUrl);
 
     const page = await screenshotService.captureRouteReview({
       route: cleanRoute,
