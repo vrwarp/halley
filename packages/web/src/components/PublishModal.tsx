@@ -29,16 +29,32 @@ interface Props {
   onChangedFilesUpdated: () => Promise<void>;
 }
 
-const STEPS: Array<{ key: string; label: string; shortLabel: string }> = [
-  { key: 'verifying', label: 'Checking links, SEO & page build', shortLabel: 'Checking build' },
-  { key: 'rebasing', label: 'Syncing with current live website', shortLabel: 'Syncing live site' },
-  { key: 'waiting_ci', label: 'Verifying on GitHub', shortLabel: 'Verifying on GitHub' },
+const STEPS: Array<{ key: string; label: string; detail: string }> = [
+  {
+    key: 'verifying',
+    label: 'Checking links, SEO & page build',
+    detail: 'Building every page and checking links, images, and SEO.',
+  },
+  {
+    key: 'rebasing',
+    label: 'Syncing with current live website',
+    detail: 'Making sure your draft stays in sync with any recent live updates.',
+  },
+  {
+    key: 'waiting_ci',
+    label: 'Verifying on GitHub',
+    detail: 'Running final automated checks before updating the live site.',
+  },
   {
     key: 'deploying_pages',
     label: 'Live on GitHub ✓ — deploying to website (~1 min)',
-    shortLabel: 'Deploying (~1 min)',
+    detail: 'Publishing the built pages to the live website.',
   },
-  { key: 'published', label: 'Published to Live Site ✓', shortLabel: 'Published ✓' },
+  {
+    key: 'published',
+    label: 'Published to Live Site ✓',
+    detail: 'Everything is live for visitors now.',
+  },
 ];
 
 export function PublishModal({
@@ -65,7 +81,6 @@ export function PublishModal({
   const [loadingChanges, setLoadingChanges] = useState(true);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
-  const [showMobileProgressSteps, setShowMobileProgressSteps] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [publishElapsedSec, setPublishElapsedSec] = useState(0);
 
@@ -221,7 +236,6 @@ export function PublishModal({
 
   const changes = includedCards;
   const activePages = pagesByViewport[activeViewport] ?? [];
-  const activeStepDef = STEPS[Math.max(0, Math.min(STEPS.length - 1, activeStepIdx))];
   const progressPct = isPublished
     ? 100
     : Math.min(95, Math.max(12, Math.round(((Math.max(0, activeStepIdx) + 0.5) / STEPS.length) * 100)));
@@ -320,73 +334,95 @@ export function PublishModal({
           )}
 
           {(isInFlight || isPublished) && (
-            <div className="rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 space-y-3">
-              {/* Terse mobile progress header */}
-              <div className="sm:hidden space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-stone-900">
-                    {isPublished ? (
-                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    ) : (
-                      <Loader2 className="h-4 w-4 shrink-0 animate-spin text-amber-600" />
+            <div className="space-y-4">
+              {/* Progress summary & always-visible checklist */}
+              <div className="rounded-xl border border-stone-200 bg-[#FAF9F7] p-4 space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-stone-900 truncate">
+                        {title.trim() || (isUndoMode ? 'Undo publication' : 'Site update')}
+                      </p>
+                      <p className="mt-0.5 text-xs text-stone-500">{plainSummary}</p>
+                    </div>
+                    {!isPublished && (
+                      <span className="shrink-0 rounded-full border border-stone-200 bg-white px-2.5 py-0.5 font-mono text-[11px] font-medium text-stone-600">
+                        Step {Math.max(1, activeStepIdx + 1)}/{STEPS.length} · {publishElapsedSec}s
+                      </span>
                     )}
-                    <span>
-                      {state === 'verifying' && publishProgress?.queueMessage
-                        ? publishProgress.queueMessage
-                        : (activeStepDef?.shortLabel ?? 'Publishing…')}
-                    </span>
                   </div>
-                  {!isPublished && (
-                    <span className="font-mono text-xs text-stone-400">
-                      {Math.max(1, activeStepIdx + 1)}/{STEPS.length} · {publishElapsedSec}s
-                    </span>
-                  )}
+
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-stone-200">
+                    <div
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        isPublished ? 'bg-emerald-600' : 'bg-amber-600'
+                      }`}
+                      style={{ width: `${progressPct}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-stone-200">
-                  <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      isPublished ? 'bg-emerald-600' : 'bg-amber-600'
-                    }`}
-                    style={{ width: `${progressPct}%` }}
-                  />
+
+                {/* Full 5-step checklist (always shown on both mobile & desktop) */}
+                <div className="space-y-3 border-t border-stone-200/80 pt-3.5">
+                  {STEPS.map((step, idx) => {
+                    const done = isPublished || idx < activeStepIdx;
+                    const active = !isPublished && idx === activeStepIdx;
+                    return (
+                      <div key={step.key} className="flex items-start gap-3 text-sm">
+                        <div className="mt-0.5 shrink-0">
+                          {done ? (
+                            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                          ) : active ? (
+                            <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                          ) : (
+                            <div className="h-4 w-4 rounded-full border border-stone-300 bg-white" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
+                            {step.label}
+                          </span>
+                          {active && (
+                            <p className="mt-0.5 text-xs text-stone-500">
+                              {step.key === 'verifying' && publishProgress?.queueMessage
+                                ? publishProgress.queueMessage
+                                : step.detail}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowMobileProgressSteps((v) => !v)}
-                  className="text-[11px] font-medium text-stone-500 underline"
-                >
-                  {showMobileProgressSteps ? 'Hide details' : 'Details'}
-                </button>
+
+                {isPublished ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-900">
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                    <span>Your changes are now live on the website.</span>
+                  </div>
+                ) : (
+                  <p className="text-[11px] leading-relaxed text-stone-500">
+                    Usually takes 1–2 minutes. Every page and link is checked before updating the live website.
+                  </p>
+                )}
               </div>
 
-              {/* Full step list (always visible on sm+, collapsible on mobile) */}
-              <div className={`space-y-3 ${showMobileProgressSteps ? 'block pt-2 border-t border-stone-200 sm:pt-0 sm:border-t-0' : 'hidden sm:block'}`}>
-                {STEPS.map((step, idx) => {
-                  const done = isPublished || idx < activeStepIdx;
-                  const active = !isPublished && idx === activeStepIdx;
-                  return (
-                    <div key={step.key} className="flex items-start gap-3 text-sm">
-                      <div className="mt-0.5 shrink-0">
-                        {done ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-                        ) : active ? (
-                          <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
-                        ) : (
-                          <div className="h-4 w-4 rounded-full border border-stone-300 bg-white" />
-                        )}
+              {/* Summary of changes going live */}
+              {changes.length > 0 && (
+                <div>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-stone-500">
+                    {isPublished ? `Published changes (${changes.length})` : `Changes being published (${changes.length})`}
+                  </h4>
+                  <div className="divide-y divide-stone-200 rounded-xl border border-stone-200 bg-white">
+                    {changes.map((card) => (
+                      <div key={card.id} className="px-3.5 py-2.5 text-xs">
+                        <p className="font-semibold text-stone-900">{card.title}</p>
+                        <p className="mt-0.5 text-[11px] text-stone-500">{card.summary}</p>
                       </div>
-                      <div className="min-w-0">
-                        <span className={done || active ? 'font-medium text-stone-900' : 'text-stone-400'}>
-                          {step.label}
-                        </span>
-                        {active && step.key === 'verifying' && publishProgress?.queueMessage && (
-                          <p className="mt-0.5 text-xs text-amber-800">{publishProgress.queueMessage}</p>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
