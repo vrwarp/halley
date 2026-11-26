@@ -1000,6 +1000,14 @@ export function createControlPlane(
         last_active_at: new Date().toISOString(),
       });
     }
+    if (
+      res.ok &&
+      body.kind === 'publish' &&
+      !(data as { heldForUser?: boolean }).heldForUser &&
+      data.review?.status !== 'needs_choices'
+    ) {
+      void fetch(`${ep.runnerUrl}/internal/verify/speculative`, { method: 'POST' }).catch(() => {});
+    }
     return c.json(data, res.status as 200);
   });
 
@@ -1118,6 +1126,9 @@ export function createControlPlane(
     if (activeRoute) qs.set('activeRoute', activeRoute);
 
     const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
+    if (res.ok && !includeScreenshots && s.status === 'running' && s.kind === 'revert') {
+      void fetch(`${ep.runnerUrl}/internal/verify/speculative`, { method: 'POST' }).catch(() => {});
+    }
     const data = (await res
       .json()
       .catch(() => ({ cards: [], pages: [], targetRoutes: [], mergeReview: null }))) as {

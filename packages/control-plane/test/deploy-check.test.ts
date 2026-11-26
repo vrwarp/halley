@@ -129,8 +129,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       {
         initialDelayMs: 0,
         pollIntervalMs: 10,
-        timeoutMs: 400,
-        runRegistrationGraceMs: 120,
+        timeoutMs: 3000,
+        runRegistrationGraceMs: 1000,
         maxConsecutiveErrors: 3,
         ...pollOverrides,
       },
@@ -444,5 +444,254 @@ describe('deploy workflow matching & deploy check reliability', () => {
     expect(second.db.getSession(second.session.id)?.status).toBe('merged');
     expect(second.db.getSession(second.session.id)?.publish_state).toBe('failed_deploy');
     expect(second.db.getSession(second.session.id)?.publish_error).toContain('no live site deploy workflow run appeared');
+  });
+
+  it('syncs main before running /internal/verify once and waits for PR check-runs to register before merging', async () => {
+    const runnerCalls: string[] = [];
+    const runnerServer = http.createServer((req, res) => {
+      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      runnerCalls.push(url.pathname);
+      res.setHeader('Content-Type', 'application/json');
+      if (url.pathname === '/internal/git/checkpoint') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, checkpoint: null }));
+        return;
+      }
+      if (url.pathname === '/internal/sync/start') {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            review: {
+              status: 'applied',
+              alreadyUpToDate: false,
+              prevBaseSha: 'base000',
+              newBaseSha: 'base111',
+              touchedUserFiles: [],
+            },
+          }),
+        );
+        return;
+      }
+      if (url.pathname === '/internal/verify') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ allPassed: true, results: [] }));
+        return;
+      }
+      if (url.pathname === '/internal/git/protected-diff') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ clean: true, protectedFiles: [] }));
+        return;
+      }
+      if (url.pathname === '/internal/read-only') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (url.pathname === '/internal/transcript') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ entries: [], usageUsd: 0 }));
+        return;
+      }
+      if (url.pathname === '/internal/git/changes') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ changes: [] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Not found' }));
+    });
+    await new Promise<void>((resolve) => runnerServer.listen(0, '127.0.0.1', () => resolve()));
+    const runnerAddr = runnerServer.address() as net.AddressInfo;
+    const runnerUrl = `http://127.0.0.1:${runnerAddr.port}`;
+    cleanups.push(() => new Promise((r) => runnerServer.close(() => r())));
+
+    let checkRunPolls = 0;
+    let mergeCalls = 0;
+    let merged = false;
+    const ghMock = await startMockGitHub((req, res, url) => {
+      if (req.method === 'POST' && url.pathname === '/graphql') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ errors: [{ message: 'auto-merge disabled' }] }));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname.endsWith('/pulls')) {
+        res.writeHead(200);
+        res.end('[]');
+        return;
+      }
+      if (req.method === 'POST' && url.pathname.endsWith('/pulls')) {
+        res.writeHead(201);
+        res.end(
+          JSON.stringify({
+            number: 99,
+            html_url: 'https://github.com/vrwarp/thecrossing.website/pull/99',
+            node_id: 'PR_99',
+            head: { sha: 'head999' },
+          }),
+        );
+        return;
+      }
+      if (req.method === 'GET' && url.pathname.endsWith('/pulls/99')) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            merged,
+            merge_commit_sha: merged ? 'merge999' : null,
+            state: merged ? 'closed' : 'open',
+            head: { sha: 'head999' },
+          }),
+        );
+        return;
+      }
+      if (url.pathname.endsWith('/actions/workflows')) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            workflows: [
+              { id: 1, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' },
+              { id: 2, name: 'Deploy to GitHub Pages', path: '.github/workflows/deploy.yml', state: 'active' },
+            ],
+          }),
+        );
+        return;
+      }
+      if (url.pathname.endsWith('/check-runs')) {
+        checkRunPolls += 1;
+        res.writeHead(200);
+        if (checkRunPolls === 1) {
+          // Race immediately after PR creation: 0 check-runs registered yet
+          res.end(JSON.stringify({ total_count: 0, check_runs: [] }));
+        } else if (checkRunPolls === 2) {
+          res.end(
+            JSON.stringify({
+              total_count: 1,
+              check_runs: [{ id: 1, name: 'verify', status: 'in_progress', conclusion: null }],
+            }),
+          );
+        } else {
+          res.end(
+            JSON.stringify({
+              total_count: 1,
+              check_runs: [{ id: 1, name: 'verify', status: 'completed', conclusion: 'success' }],
+            }),
+          );
+        }
+        return;
+      }
+      if (req.method === 'PUT' && url.pathname.endsWith('/pulls/99/merge')) {
+        // Must NEVER merge while checkRunPolls < 3
+        expect(checkRunPolls).toBeGreaterThanOrEqual(3);
+        mergeCalls += 1;
+        merged = true;
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+        return;
+      }
+      if (url.pathname.endsWith('/actions/runs')) {
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            workflow_runs: [
+              {
+                id: 500,
+                name: 'Deploy to GitHub Pages',
+                path: '.github/workflows/deploy.yml',
+                event: 'push',
+                status: 'completed',
+                conclusion: 'success',
+                html_url: 'https://github.com/vrwarp/thecrossing.website/actions/runs/500',
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ message: 'Not found' }));
+    });
+    cleanups.push(() => ghMock.close());
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-pub-order-'));
+    const cfg = {
+      ...loadConfig(),
+      dataDir: tmp,
+      repo: 'vrwarp/thecrossing.website',
+      deployWorkflow: '',
+      githubApiBaseUrl: ghMock.url,
+      githubToken: 'test-token',
+      githubAppId: '',
+      githubAppPrivateKey: '',
+      githubAppInstallationId: '',
+    };
+    const db = new ControlPlaneDb(path.join(tmp, 'halley.db'), cfg);
+    cleanups.push(async () => {
+      db.db.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    });
+
+    const user = db.upsertUser({
+      email: 'editor@thecrossing.website',
+      name: 'Editor',
+      picture: null,
+    });
+    const session = db.createSession({
+      id: 'sess-order-1',
+      title: 'Order test',
+      slug: 'order-test',
+      ownerUserId: user.id,
+      repo: cfg.repo,
+      baseBranch: 'main',
+      workingBranch: 'halley/order-1',
+      volumeName: 'vol-order-1',
+      workspaceTokenHash: 'hash-order-1',
+    });
+
+    const driver: WorkspaceDriver = {
+      ...createStubDriver(),
+      ensureRunning: async () => ({
+        runnerUrl,
+        astroUrl: '',
+        astroBase: '',
+        baseSha: 'base000',
+      }),
+    };
+    const states: string[] = [];
+    const publish = new PublishService(
+      cfg,
+      db,
+      driver,
+      new GitHubService(cfg),
+      (_id, payload) => states.push(payload.state),
+      undefined,
+      {
+        initialDelayMs: 0,
+        pollIntervalMs: 10,
+        ciPollIntervalMs: 10,
+        ciRegistrationGraceMs: 1500,
+        runRegistrationGraceMs: 1000,
+        timeoutMs: 5000,
+      },
+    );
+
+    await publish.publish(
+      session,
+      { id: user.id, email: user.email, name: user.name, picture: null, isAdmin: true, persona: 'non-technical' },
+      { title: 'Order test', summary: 'Updated 1 file.' },
+    );
+
+    // Sync happened before verify, and verify ran ONCE despite alreadyUpToDate: false
+    const syncIdx = runnerCalls.indexOf('/internal/sync/start');
+    const verifyIndices = runnerCalls
+      .map((p, idx) => (p === '/internal/verify' ? idx : -1))
+      .filter((i) => i !== -1);
+    expect(syncIdx).toBeGreaterThan(-1);
+    expect(verifyIndices).toHaveLength(1);
+    expect(syncIdx).toBeLessThan(verifyIndices[0]!);
+    expect(states.indexOf('rebasing')).toBeLessThan(states.indexOf('verifying'));
+
+    // PR waited through the 0-check-runs race and merged after poll 3
+    expect(checkRunPolls).toBe(3);
+    expect(mergeCalls).toBe(1);
+    expect(db.getSession(session.id)?.publish_state).toBe('published');
   });
 });

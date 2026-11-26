@@ -15,14 +15,18 @@ export interface DeployPollOptions {
   timeoutMs?: number;
   runRegistrationGraceMs?: number;
   maxConsecutiveErrors?: number;
+  ciPollIntervalMs?: number;
+  ciRegistrationGraceMs?: number;
 }
 
 const DEFAULT_DEPLOY_POLL_OPTIONS: Required<DeployPollOptions> = {
-  initialDelayMs: 2500,
-  pollIntervalMs: 5000,
+  initialDelayMs: 1000,
+  pollIntervalMs: 2000,
   timeoutMs: 6 * 60_000,
   runRegistrationGraceMs: 45_000,
   maxConsecutiveErrors: 5,
+  ciPollIntervalMs: 1500,
+  ciRegistrationGraceMs: 15_000,
 };
 
 export class PublishService {
@@ -82,29 +86,9 @@ export class PublishService {
         }
       }
 
-      // 1. Hard-gate verification checks (keep Astro dev preview running under pooled 6 GB ceiling + max-1 build queue)
-      this.setState(session.id, 'verifying');
-      const verifyRes = await fetch(`${runnerUrl}/internal/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pausePreview: false }),
-      });
-      const verifyData = (await verifyRes.json()) as {
-        allPassed: boolean;
-        results: VerificationCheckResult[];
-      };
-      if (!verifyData.allPassed) {
-        const failed = verifyData.results.filter((r) => !r.passed);
-        this.setState(session.id, 'failed_checks', {
-          checks: verifyData.results,
-          error: `Checks failed: ${failed.map((f) => f.name).join(', ')}`,
-        });
-        return;
-      }
-
-      // 2. Q21: Sync with latest base branch; if main moved mid-publish on overlapping/conflicting
-      // files, pause and return to the modal so no unreviewed resolution ever ships.
-      this.setState(session.id, 'rebasing', { checks: verifyData.results });
+      // 1. Q21: Sync with latest base branch FIRST so we never run verification twice when main moved
+      //    cleanly and we catch overlapping conflicts immediately before spending build time.
+      this.setState(session.id, 'rebasing');
       const ghToken = await this.github.getAccessToken().catch(() => '');
       let fetchedByDriver = false;
       if (ghToken) {
@@ -174,25 +158,25 @@ export class PublishService {
         return;
       }
 
-      if (syncData.review && !syncData.review.alreadyUpToDate) {
-        // Non-overlapping mid-publish update merged cleanly: re-verify before pushing
-        this.setState(session.id, 'verifying');
-        const reVerify = await fetch(`${runnerUrl}/internal/verify`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pausePreview: false }),
+      // 2. Hard-gate verification checks ONCE on the synced tree (hits tree-SHA cache / coalesces
+      //    speculative build immediately when alreadyUpToDate).
+      this.setState(session.id, 'verifying');
+      const verifyRes = await fetch(`${runnerUrl}/internal/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pausePreview: false }),
+      });
+      const verifyData = (await verifyRes.json()) as {
+        allPassed: boolean;
+        results: VerificationCheckResult[];
+      };
+      if (!verifyData.allPassed) {
+        const failed = verifyData.results.filter((r) => !r.passed);
+        this.setState(session.id, 'failed_checks', {
+          checks: verifyData.results,
+          error: `Checks failed: ${failed.map((f) => f.name).join(', ')}`,
         });
-        const reData = (await reVerify.json()) as {
-          allPassed: boolean;
-          results: VerificationCheckResult[];
-        };
-        if (!reData.allPassed) {
-          this.setState(session.id, 'failed_checks', {
-            checks: reData.results,
-            error: 'Checks failed after merging updates from the live site.',
-          });
-          return;
-        }
+        return;
       }
 
       // 3. Layer-3 .github/** hard gate before pushing
@@ -362,7 +346,12 @@ export class PublishService {
     commitMessage: string;
     nativeAutoMerge: boolean;
   }): Promise<string | null> {
-    const deadline = Date.now() + 15 * 60_000;
+    const startedAt = Date.now();
+    const deadline = startedAt + 15 * 60_000;
+    const ciRegDeadline = startedAt + this.deployPollOptions.ciRegistrationGraceMs;
+    let checkedCiPresence = false;
+    let hasCiWorkflow = false;
+
     while (Date.now() < deadline) {
       const prState = await this.github.getPrState(opts.prNumber);
       if (prState.merged && prState.mergeCommitSha) {
@@ -388,7 +377,18 @@ export class PublishService {
         return null;
       }
 
-      if (ci.state === 'passed' && !opts.nativeAutoMerge) {
+      let effectiveState = ci.state;
+      if (ci.state === 'passed' && ci.totalCount === 0 && Date.now() < ciRegDeadline) {
+        if (!checkedCiPresence) {
+          checkedCiPresence = true;
+          hasCiWorkflow = await this.github.hasActiveCiWorkflow().catch(() => false);
+        }
+        if (hasCiWorkflow) {
+          effectiveState = 'pending';
+        }
+      }
+
+      if (effectiveState === 'passed' && !opts.nativeAutoMerge) {
         try {
           return await this.github.squashMergePr({
             prNumber: opts.prNumber,
@@ -400,7 +400,7 @@ export class PublishService {
         }
       }
 
-      await new Promise((r) => setTimeout(r, 4000));
+      await new Promise((r) => setTimeout(r, this.deployPollOptions.ciPollIntervalMs));
     }
 
     this.setState(opts.session.id, 'failed_ci', {

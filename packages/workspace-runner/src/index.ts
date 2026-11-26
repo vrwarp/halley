@@ -41,7 +41,11 @@ import { PageCreationService, PageValidationError } from './pages.js';
 import { detachHardlinkedNodeModules } from './nm-cache.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
-import { runAllVerificationChecks } from './verify.js';
+import {
+  invalidateSpeculativeVerification,
+  runAllVerificationChecks,
+  runSpeculativeVerification,
+} from './verify.js';
 import { buildChangeCards, resolveVisualReviewRoutes } from './visual-diff.js';
 
 const execFileAsync = promisify(execFile);
@@ -145,10 +149,57 @@ function notifySessionDiverged(): void {
   }).catch(() => {});
 }
 
+const IDLE_SPECULATIVE_DELAY_MS = Number(process.env.HALLEY_SPECULATIVE_IDLE_MS || 15_000);
+let idleSpeculativeTimer: NodeJS.Timeout | null = null;
+
+function cancelSpeculativeVerify(): void {
+  if (idleSpeculativeTimer) {
+    clearTimeout(idleSpeculativeTimer);
+    idleSpeculativeTimer = null;
+  }
+  invalidateSpeculativeVerification(REPO_ROOT);
+}
+
+function triggerImmediateSpeculativeVerify(): void {
+  if (idleSpeculativeTimer) {
+    clearTimeout(idleSpeculativeTimer);
+    idleSpeculativeTimer = null;
+  }
+  if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
+  void runSpeculativeVerification(REPO_ROOT, {
+    supervisorUrl: SUPERVISOR_URL || undefined,
+    hostSecret: WORKSPACE_HOST_SECRET || undefined,
+    sessionId: SESSION_ID,
+  });
+}
+
+function scheduleIdleSpeculativeVerify(delayMs = IDLE_SPECULATIVE_DELAY_MS): void {
+  cancelSpeculativeVerify();
+  if (shuttingDown || readOnly || delayMs <= 0) return;
+  idleSpeculativeTimer = setTimeout(async () => {
+    idleSpeculativeTimer = null;
+    if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
+    try {
+      const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`);
+      if (changes.length === 0) return;
+    } catch {
+      return;
+    }
+    void runSpeculativeVerification(REPO_ROOT, {
+      supervisorUrl: SUPERVISOR_URL || undefined,
+      hostSecret: WORKSPACE_HOST_SECRET || undefined,
+      sessionId: SESSION_ID,
+    });
+  }, delayMs);
+  idleSpeculativeTimer.unref?.();
+}
+
 let inlineEditTimer: NodeJS.Timeout | null = null;
 function scheduleInlineCheckpoint(summary: string): void {
+  cancelSpeculativeVerify();
   if (inlineEditTimer) clearTimeout(inlineEditTimer);
   inlineEditTimer = setTimeout(async () => {
+    inlineEditTimer = null;
     try {
       const ckpt = await createCheckpoint(REPO_ROOT, summary, gitIdentity);
       if (ckpt) {
@@ -159,6 +210,9 @@ function scheduleInlineCheckpoint(summary: string): void {
           changedFilesCount: changes.length,
         });
         notifySessionDiverged();
+        if (changes.length > 0) {
+          scheduleIdleSpeculativeVerify();
+        }
       }
     } catch {
       // ignore background checkpoint error
@@ -184,6 +238,7 @@ let shuttingDown = false;
 const shutdown = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
+  cancelSpeculativeVerify();
   await piRuntime?.stop().catch(() => {});
   await astroManager.stop().catch(() => {});
   process.exit(0);
@@ -243,6 +298,9 @@ async function main() {
           changedFilesCount: changes.length,
         });
         notifySessionDiverged();
+        if (changes.length > 0) {
+          scheduleIdleSpeculativeVerify();
+        }
       }
     },
     pauseAstroForBuild: async () => {
@@ -383,6 +441,7 @@ async function main() {
   app.post('/internal/read-only', async (c) => {
     const body = (await c.req.json()) as { readOnly: boolean };
     readOnly = Boolean(body.readOnly);
+    if (readOnly) cancelSpeculativeVerify();
     await savePersistedSessionMeta().catch(() => {});
     return c.json({ ok: true, readOnly });
   });
@@ -413,6 +472,7 @@ async function main() {
 
   app.post('/internal/pages', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     try {
       const body = (await c.req.json()) as Record<string, unknown>;
       const capped = Boolean(body.capped);
@@ -428,6 +488,8 @@ async function main() {
           isBusy ? 'followUp' : undefined,
           reqViewport,
         );
+      } else {
+        scheduleIdleSpeculativeVerify();
       }
 
       return c.json(
@@ -457,6 +519,7 @@ async function main() {
 
   app.post('/internal/pages/:pageRequestId/retry', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const id = c.req.param('pageRequestId')!;
     const body = (await c.req.json().catch(() => ({}))) as {
       capped?: boolean;
@@ -483,10 +546,12 @@ async function main() {
 
   app.delete('/internal/pages', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const route = c.req.query('route') || ((await c.req.json().catch(() => ({}))) as { route?: string }).route;
     if (!route) return c.json({ error: 'Missing route' }, 400);
     try {
       const res = await pageService.deletePage(route);
+      scheduleIdleSpeculativeVerify();
       return c.json(res);
     } catch (err) {
       if (err instanceof PageValidationError) {
@@ -498,6 +563,7 @@ async function main() {
 
   app.post('/internal/pages/visibility', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as {
       route: string;
       unlisted: boolean;
@@ -513,6 +579,8 @@ async function main() {
           editorContext: { currentRoute: res.route, viewport: body.viewport, mode: 'browse' },
           whenBusy: piRuntime.isBusy() ? 'followUp' : undefined,
         });
+      } else {
+        scheduleIdleSpeculativeVerify();
       }
       return c.json({
         ok: true,
@@ -535,6 +603,7 @@ async function main() {
 
   app.post('/internal/pages/rename', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as {
       fromRoute: string;
       toSection: string;
@@ -542,6 +611,7 @@ async function main() {
     };
     try {
       const res = await pageService.renamePage(body);
+      scheduleIdleSpeculativeVerify();
       return c.json(res);
     } catch (err) {
       if (err instanceof PageValidationError) {
@@ -572,18 +642,24 @@ async function main() {
 
   app.post('/internal/git/revert-file', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as { path: string; baseRef?: string };
     await revertSingleFile(REPO_ROOT, body.path, body.baseRef || `origin/${BASE_BRANCH}`, gitIdentity);
+    scheduleIdleSpeculativeVerify();
     return c.json({ ok: true });
   });
 
   app.post('/internal/git/undo', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as { targetSha: string };
     const ckpt = await undoToCheckpoint(REPO_ROOT, body.targetSha, gitIdentity);
     const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     if (ckpt) {
       broadcast({ type: 'checkpoint_created', checkpoint: ckpt, changedFilesCount: changes.length });
+    }
+    if (changes.length > 0) {
+      scheduleIdleSpeculativeVerify();
     }
     return c.json({ ok: true, checkpoint: ckpt, changedFilesCount: changes.length });
   });
@@ -718,6 +794,8 @@ async function main() {
       activeMergeState = review;
       return c.json({ review });
     }
+
+    cancelSpeculativeVerify();
 
     const upstreamCommits = await getUpstreamCommits(REPO_ROOT, mergeBaseSha, baseRef);
     const userChanged = (await getGitChanges(REPO_ROOT, mergeBaseSha)).map((ch) => ch.path);
@@ -886,6 +964,7 @@ async function main() {
   app.post('/internal/sync/choose', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     if (!activeMergeState) return c.json({ error: 'No active merge review' }, 404);
+    cancelSpeculativeVerify();
 
     const body = (await c.req.json()) as {
       choices: Array<{ recordId: string; optionId: string; customInstruction?: string }>;
@@ -970,6 +1049,7 @@ async function main() {
 
   app.post('/internal/sync/undo', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json().catch(() => ({}))) as { targetSha?: string };
     const targetSha = body.targetSha || activeMergeState?.preSyncSha;
     if (!targetSha) return c.json({ error: 'No pre-sync snapshot to restore' }, 400);
@@ -1086,6 +1166,7 @@ async function main() {
   app.post('/internal/sync/apply-advanced', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     if (!activeMergeState?.advancedAttempt) return c.json({ error: 'No advanced attempt available' }, 404);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as {
       picks: Array<{ path: string; use: 'advanced' | 'first' }>;
     };
@@ -1105,11 +1186,13 @@ async function main() {
       }
     }
     await createCheckpoint(REPO_ROOT, 'Applied Advanced merge improvements', gitIdentity).catch(() => null);
+    scheduleIdleSpeculativeVerify();
     return c.json({ review: activeMergeState });
   });
 
   app.post('/internal/git/revert-start', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
     const body = (await c.req.json()) as { shas: string[] };
     const result = await startRevertCommits(REPO_ROOT, body.shas ?? [], gitIdentity);
     if (result.status === 'conflict' && result.conflictedFiles.length > 0) {
@@ -1187,6 +1270,12 @@ async function main() {
     });
   });
 
+  app.post('/internal/verify/speculative', (c) => {
+    if (readOnly) return c.json({ ok: false, reason: 'read-only' });
+    triggerImmediateSpeculativeVerify();
+    return c.json({ ok: true });
+  });
+
   app.post('/internal/verify', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { pausePreview?: boolean };
     const shouldPause = Boolean(body.pausePreview);
@@ -1203,6 +1292,7 @@ async function main() {
         supervisorUrl: SUPERVISOR_URL || undefined,
         hostSecret: WORKSPACE_HOST_SECRET || undefined,
         sessionId: SESSION_ID,
+        priority: 'foreground',
         onQueued: (position, message) => {
           broadcast({
             type: 'publish_state',
@@ -1269,10 +1359,12 @@ async function main() {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     const body = ChatClientMessageSchema.parse(await c.req.json());
     if (body.type === 'submit_input') {
+      cancelSpeculativeVerify();
       await piRuntime?.submitUserInput(body);
     } else if (body.type === 'abort') {
       await piRuntime?.abort();
     } else if (body.type === 'continue_run') {
+      cancelSpeculativeVerify();
       await piRuntime?.continueRun();
     }
     return c.json({ ok: true });
@@ -1335,10 +1427,12 @@ async function main() {
       try {
         const parsed = ChatClientMessageSchema.parse(JSON.parse(raw.toString('utf8')));
         if (parsed.type === 'submit_input') {
+          cancelSpeculativeVerify();
           await piRuntime?.submitUserInput(parsed);
         } else if (parsed.type === 'abort') {
           await piRuntime?.abort();
         } else if (parsed.type === 'continue_run') {
+          cancelSpeculativeVerify();
           await piRuntime?.continueRun();
         }
       } catch (err) {

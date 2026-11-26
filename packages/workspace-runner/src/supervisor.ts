@@ -969,13 +969,18 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     return c.json({ progress: bootProgressBySession.get(sessionId) ?? null });
   });
 
-  // Container-wide FIFO build lock (NDJSON stream)
+  // Track open speculative NDJSON stream closers by leaseId so release/promote closes them cleanly
+  const speculativeStreamClosers = new Map<string, () => void>();
+
+  // Container-wide priority FIFO build lock (NDJSON stream)
   app.post('/internal/build-lock/acquire', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as {
       sessionId?: string;
+      priority?: 'foreground' | 'speculative';
       timeoutMs?: number;
     };
     const sessionId = body.sessionId || 'unknown';
+    const priority = body.priority === 'speculative' ? 'speculative' : 'foreground';
     const encoder = new TextEncoder();
     const ac = new AbortController();
 
@@ -983,7 +988,22 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
     const stream = new ReadableStream({
       start(controller) {
+        let closed = false;
+        let acquiredLeaseId: string | null = null;
+        const closeStream = () => {
+          if (closed) return;
+          closed = true;
+          if (acquiredLeaseId) {
+            speculativeStreamClosers.delete(acquiredLeaseId);
+          }
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        };
         const send = (obj: Record<string, unknown>) => {
+          if (closed) return;
           try {
             controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
           } catch {
@@ -993,6 +1013,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
         void buildQueue
           .acquire(sessionId, {
+            priority,
             timeoutMs: body.timeoutMs,
             signal: ac.signal,
             onQueued: (position) => {
@@ -1002,13 +1023,21 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
                 message: `Waiting for another editor's checks to finish (position ${position})…`,
               });
             },
+            onPreempted:
+              priority === 'speculative'
+                ? () => {
+                    send({ event: 'preempted', leaseId: acquiredLeaseId });
+                    closeStream();
+                  }
+                : undefined,
           })
           .then((lease) => {
+            acquiredLeaseId = lease.leaseId;
             send({ event: 'acquired', leaseId: lease.leaseId });
-            try {
-              controller.close();
-            } catch {
-              // already closed
+            if (priority === 'speculative') {
+              speculativeStreamClosers.set(lease.leaseId, closeStream);
+            } else {
+              closeStream();
             }
           })
           .catch((err) => {
@@ -1016,11 +1045,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
               event: err instanceof BuildQueueTimeoutError ? 'timeout' : 'error',
               message: err instanceof Error ? err.message : String(err),
             });
-            try {
-              controller.close();
-            } catch {
-              // already closed
-            }
+            closeStream();
           });
       },
       cancel() {
@@ -1037,9 +1062,21 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     });
   });
 
+  app.post('/internal/build-lock/promote', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { leaseId?: string };
+    const promoted = body.leaseId ? buildQueue.promoteToForeground(body.leaseId) : false;
+    if (body.leaseId) {
+      speculativeStreamClosers.get(body.leaseId)?.();
+    }
+    return c.json({ ok: true, promoted });
+  });
+
   app.post('/internal/build-lock/release', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { leaseId?: string };
     const released = body.leaseId ? buildQueue.releaseByLease(body.leaseId) : false;
+    if (body.leaseId) {
+      speculativeStreamClosers.get(body.leaseId)?.();
+    }
     return c.json({ ok: true, released });
   });
 

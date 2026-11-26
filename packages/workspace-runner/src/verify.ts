@@ -1,6 +1,9 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { discoverSiteRoutes } from '@halley/astro-dev-edit';
 import {
   HALLEY_PLACEHOLDER_ATTR,
@@ -9,6 +12,9 @@ import {
   type VerificationCheckResult,
 } from '@halley/shared';
 import { detectAstroBase } from './astro-manager.js';
+import type { BuildPriority } from './build-queue.js';
+
+const execFileAsync = promisify(execFile);
 
 const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 
@@ -44,20 +50,151 @@ export function formatCompactCheckSummary(results: VerificationCheckResult[]): s
     .join('\n');
 }
 
+/**
+ * Ensures `.astro/` and `dist/` are listed in `.git/info/exclude` so keeping
+ * `.astro/` warm across verification runs never pollutes `git status` or gets
+ * staged by `git add -A` in repos that omit `.astro/` from `.gitignore`.
+ */
+export async function ensureBuildArtifactsExcluded(repoRoot: string): Promise<void> {
+  const gitInfoDir = path.join(repoRoot, '.git', 'info');
+  const excludePath = path.join(gitInfoDir, 'exclude');
+  try {
+    await fs.access(path.join(repoRoot, '.git'));
+  } catch {
+    return;
+  }
+  try {
+    await fs.mkdir(gitInfoDir, { recursive: true });
+    let content = '';
+    try {
+      content = await fs.readFile(excludePath, 'utf8');
+    } catch {
+      // file does not exist yet
+    }
+    const existingLines = new Set(content.split(/\r?\n/).map((l) => l.trim()));
+    const toAdd: string[] = [];
+    for (const pattern of ['.astro/', 'dist/']) {
+      if (!existingLines.has(pattern) && !existingLines.has(pattern.replace(/\/$/, ''))) {
+        toAdd.push(pattern);
+      }
+    }
+    if (toAdd.length > 0) {
+      const prefix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+      await fs.writeFile(excludePath, `${content}${prefix}${toAdd.join('\n')}\n`, 'utf8');
+    }
+  } catch {
+    // non-fatal (e.g. git worktree with .git file)
+  }
+}
+
+/**
+ * Computes a side-effect-free Git tree SHA representing the current working tree
+ * (excluding `.astro/`, `dist/`, and any `.github/` mutations). Identical file
+ * contents before and after `createCheckpoint` produce the exact same tree SHA.
+ * Returns `null` when `repoRoot` is not a Git repository.
+ */
+export async function computeWorkingTreeKey(repoRoot: string): Promise<string | null> {
+  try {
+    const inside = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: repoRoot,
+    });
+    if (inside.stdout.trim() !== 'true') return null;
+  } catch {
+    return null;
+  }
+
+  await ensureBuildArtifactsExcluded(repoRoot);
+
+  // Fast path: clean working tree -> HEAD^{tree}
+  try {
+    const status = await execFileAsync('git', ['status', '--porcelain'], {
+      cwd: repoRoot,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    if (!status.stdout.trim()) {
+      const tree = await execFileAsync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repoRoot });
+      const sha = tree.stdout.trim();
+      if (sha) return sha;
+    }
+  } catch {
+    // Fall through to temp-index tree calculation (e.g. unborn HEAD)
+  }
+
+  // Dirty working tree: compute tree SHA using a temporary GIT_INDEX_FILE
+  const tmpIndex = path.join(os.tmpdir(), `halley-tree-idx-${crypto.randomUUID()}`);
+  try {
+    const realIndex = path.join(repoRoot, '.git', 'index');
+    try {
+      await fs.copyFile(realIndex, tmpIndex);
+    } catch {
+      // No index yet; git will create tmpIndex on git add -A
+    }
+    const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+    await execFileAsync('git', ['add', '-A'], { cwd: repoRoot, env, maxBuffer: 8 * 1024 * 1024 });
+    // Mirror sanitizeProtectedPaths so .github edits don't alter tree hash unexpectedly
+    await execFileAsync('git', ['reset', '-q', 'HEAD', '--', '.github'], { cwd: repoRoot, env }).catch(
+      async () => {
+        await execFileAsync('git', ['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', '.github'], {
+          cwd: repoRoot,
+          env,
+        }).catch(() => {});
+      },
+    );
+    const { stdout } = await execFileAsync('git', ['write-tree'], { cwd: repoRoot, env });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  } finally {
+    await fs.rm(tmpIndex, { force: true }).catch(() => {});
+  }
+}
+
+export interface RunShellOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  priority?: BuildPriority;
+}
+
 export async function runShell(
   cwd: string,
   command: string,
-  timeoutMs = 180_000,
-): Promise<{ passed: boolean; durationMs: number; output: string }> {
+  timeoutOrOpts: number | RunShellOptions = 180_000,
+): Promise<{
+  passed: boolean;
+  durationMs: number;
+  output: string;
+  aborted?: boolean;
+  transient?: boolean;
+}> {
+  const opts: RunShellOptions =
+    typeof timeoutOrOpts === 'number' ? { timeoutMs: timeoutOrOpts } : timeoutOrOpts;
+  const timeoutMs = opts.timeoutMs ?? 180_000;
+  const priority: BuildPriority = opts.priority ?? 'foreground';
+
+  if (opts.signal?.aborted) {
+    return {
+      passed: false,
+      durationMs: 0,
+      output: '[Aborted before start]',
+      aborted: true,
+      transient: true,
+    };
+  }
+
   const start = Date.now();
   const existingNodeOpts = process.env.NODE_OPTIONS || '';
   const nodeOptions = existingNodeOpts.includes('--max-old-space-size')
     ? existingNodeOpts
     : `${existingNodeOpts} --max-old-space-size=1024`.trim();
+
+  const spawnCmd = priority === 'speculative' ? 'nice' : 'bash';
+  const spawnArgs =
+    priority === 'speculative' ? ['-n', '10', 'bash', '-lc', command] : ['-lc', command];
+
   return new Promise((resolve) => {
-    const child = spawn('nice', ['-n', '10', 'bash', '-lc', command], {
+    const child = spawn(spawnCmd, spawnArgs, {
       cwd,
-      // Own process group so timeout kills npm/astro/esbuild/pagefind grandchildren too;
+      // Own process group so timeout/abort kills npm/astro/esbuild/pagefind grandchildren too;
       // otherwise orphaned grandchildren keep stdout/stderr pipes open and 'close' never fires.
       detached: true,
       env: {
@@ -75,6 +212,8 @@ export async function runShell(
     let totalBytes = 0;
     let settled = false;
     let timedOut = false;
+    let aborted = false;
+    let spawnErrored = false;
     let killEscalationTimer: NodeJS.Timeout | null = null;
     let forceResolveTimer: NodeJS.Timeout | null = null;
 
@@ -101,18 +240,50 @@ export async function runShell(
       }
     };
 
+    const terminateWithEscalation = () => {
+      killProcessGroup('SIGTERM');
+      if (!killEscalationTimer) {
+        killEscalationTimer = setTimeout(() => {
+          killProcessGroup('SIGKILL');
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }, 1_000);
+        killEscalationTimer.unref?.();
+      }
+      if (!forceResolveTimer) {
+        forceResolveTimer = setTimeout(() => {
+          finish(false);
+        }, 2_500);
+        forceResolveTimer.unref?.();
+      }
+    };
+
+    const onAbort = () => {
+      if (settled) return;
+      aborted = true;
+      chunks.push('\n[Aborted]');
+      terminateWithEscalation();
+    };
+
     const finish = (passed: boolean) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
       if (killEscalationTimer) clearTimeout(killEscalationTimer);
       if (forceResolveTimer) clearTimeout(forceResolveTimer);
       resolve({
-        passed: passed && !timedOut,
+        passed: passed && !timedOut && !aborted && !spawnErrored,
         durationMs: Date.now() - start,
         output: stripAnsi(chunks.join('')).trim(),
+        ...(aborted ? { aborted: true } : {}),
+        ...(aborted || timedOut || spawnErrored ? { transient: true } : {}),
       });
     };
+
+    if (opts.signal) {
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
@@ -120,21 +291,12 @@ export async function runShell(
     const timer = setTimeout(() => {
       timedOut = true;
       chunks.push(`\n[Timed out after ${Math.round(timeoutMs / 1000)}s]`);
-      killProcessGroup('SIGTERM');
-      killEscalationTimer = setTimeout(() => {
-        killProcessGroup('SIGKILL');
-        child.stdout?.destroy();
-        child.stderr?.destroy();
-      }, 1_500);
-      killEscalationTimer.unref?.();
-      forceResolveTimer = setTimeout(() => {
-        finish(false);
-      }, 3_000);
-      forceResolveTimer.unref?.();
+      terminateWithEscalation();
     }, timeoutMs);
     timer.unref?.();
 
     child.on('error', (err) => {
+      spawnErrored = true;
       chunks.push(`\n[Spawn error: ${err.message}]`);
       finish(false);
     });
@@ -401,20 +563,45 @@ export async function runUnlistedIntegrityCheck(
   };
 }
 
-let verifyQueue: Promise<unknown> = Promise.resolve();
-
 export interface BuildLockClientOptions {
   supervisorUrl?: string;
   hostSecret?: string;
   sessionId?: string;
+  priority?: BuildPriority;
+  signal?: AbortSignal;
+  bypassCache?: boolean;
   onQueued?: (position: number, message: string) => void;
   onAcquired?: () => void;
+  onLeaseAcquired?: (leaseId: string) => void;
+  onPreempted?: () => void;
+}
+
+export async function promoteSupervisorBuildLock(
+  supervisorUrl: string,
+  hostSecret: string | undefined,
+  leaseId: string,
+): Promise<boolean> {
+  const base = supervisorUrl.replace(/\/+$/, '');
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (hostSecret) headers['Authorization'] = `Bearer ${hostSecret}`;
+  try {
+    const res = await fetch(`${base}/internal/build-lock/promote`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ leaseId }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json().catch(() => ({}))) as { promoted?: boolean };
+    return Boolean(data.promoted);
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Acquires the container-wide FIFO build lock from the workspaces supervisor when
- * `supervisorUrl` is configured, streaming queue position updates via NDJSON.
- * Falls back to in-process execution if running standalone without a supervisor.
+ * Acquires the container-wide priority FIFO build lock from the workspaces supervisor when
+ * `supervisorUrl` is configured, streaming queue position (and speculative preemption) updates
+ * via NDJSON. Falls back to in-process execution if running standalone without a supervisor.
  */
 export async function withSupervisorBuildLock<T>(
   opts: BuildLockClientOptions | undefined,
@@ -425,6 +612,7 @@ export async function withSupervisorBuildLock<T>(
     return fn();
   }
 
+  const priority: BuildPriority = opts?.priority ?? 'foreground';
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts?.hostSecret) {
     headers['Authorization'] = `Bearer ${opts.hostSecret}`;
@@ -433,7 +621,8 @@ export async function withSupervisorBuildLock<T>(
   const res = await fetch(`${supervisorUrl}/internal/build-lock/acquire`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ sessionId: opts?.sessionId || 'unknown' }),
+    body: JSON.stringify({ sessionId: opts?.sessionId || 'unknown', priority }),
+    signal: opts?.signal,
   });
 
   if (!res.ok || !res.body) {
@@ -445,6 +634,54 @@ export async function withSupervisorBuildLock<T>(
   const decoder = new TextDecoder();
   let buffer = '';
   let leaseId = '';
+  let preempted = false;
+
+  const parseLine = (line: string): 'acquired' | 'preempted' | 'other' => {
+    const evt = JSON.parse(line) as {
+      event: 'queued' | 'acquired' | 'preempted' | 'timeout' | 'error';
+      position?: number;
+      leaseId?: string;
+      message?: string;
+    };
+    if (evt.event === 'queued' && typeof evt.position === 'number') {
+      const msg =
+        evt.message ||
+        `Waiting for another editor's checks to finish (position ${evt.position})…`;
+      opts?.onQueued?.(evt.position, msg);
+      return 'other';
+    }
+    if (evt.event === 'acquired' && evt.leaseId) {
+      leaseId = evt.leaseId;
+      opts?.onAcquired?.();
+      opts?.onLeaseAcquired?.(evt.leaseId);
+      return 'acquired';
+    }
+    if (evt.event === 'preempted') {
+      preempted = true;
+      opts?.onPreempted?.();
+      return 'preempted';
+    }
+    if (evt.event === 'timeout' || evt.event === 'error') {
+      throw new Error(evt.message || 'Timed out waiting for build queue');
+    }
+    return 'other';
+  };
+
+  let readerClosed = false;
+  const closeReader = async () => {
+    if (readerClosed) return;
+    readerClosed = true;
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  };
 
   try {
     while (true) {
@@ -456,42 +693,66 @@ export async function withSupervisorBuildLock<T>(
           const line = buffer.slice(0, nl).trim();
           buffer = buffer.slice(nl + 1);
           if (line) {
-            const evt = JSON.parse(line) as {
-              event: 'queued' | 'acquired' | 'timeout' | 'error';
-              position?: number;
-              leaseId?: string;
-              message?: string;
-            };
-            if (evt.event === 'queued' && typeof evt.position === 'number') {
-              const msg =
-                evt.message ||
-                `Waiting for another editor's checks to finish (position ${evt.position})…`;
-              opts?.onQueued?.(evt.position, msg);
-            } else if (evt.event === 'acquired' && evt.leaseId) {
-              leaseId = evt.leaseId;
-              opts?.onAcquired?.();
-              break;
-            } else if (evt.event === 'timeout' || evt.event === 'error') {
-              throw new Error(evt.message || 'Timed out waiting for build queue');
-            }
+            const kind = parseLine(line);
+            if (kind === 'acquired' || kind === 'preempted') break;
           }
           nl = buffer.indexOf('\n');
         }
-        if (leaseId) break;
+        if (leaseId || preempted) break;
       }
       if (done) break;
     }
-  } finally {
-    reader.releaseLock();
+  } catch (err) {
+    await closeReader();
+    throw err;
+  }
+
+  if (preempted) {
+    await closeReader();
+    throw new Error('Speculative build lock preempted');
   }
 
   if (!leaseId) {
+    await closeReader();
     throw new Error('Build lock stream closed before lock was acquired');
+  }
+
+  // For speculative leases, keep reading the open NDJSON stream so preemption events fire immediately
+  if (priority === 'speculative') {
+    void (async () => {
+      try {
+        while (!readerClosed) {
+          const { value, done } = await reader.read();
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            let nl = buffer.indexOf('\n');
+            while (nl !== -1) {
+              const line = buffer.slice(0, nl).trim();
+              buffer = buffer.slice(nl + 1);
+              if (line) {
+                try {
+                  if (parseLine(line) === 'preempted') return;
+                } catch {
+                  // ignore malformed trailing line
+                }
+              }
+              nl = buffer.indexOf('\n');
+            }
+          }
+          if (done) break;
+        }
+      } catch {
+        // stream aborted on release/promote
+      }
+    })();
+  } else {
+    await closeReader();
   }
 
   try {
     return await fn();
   } finally {
+    await closeReader();
     await fetch(`${supervisorUrl}/internal/build-lock/release`, {
       method: 'POST',
       headers,
@@ -500,24 +761,260 @@ export async function withSupervisorBuildLock<T>(
   }
 }
 
-export function runAllVerificationChecks(
+export interface VerificationRunResult {
+  allPassed: boolean;
+  results: VerificationCheckResult[];
+  fromCache?: boolean;
+  aborted?: boolean;
+}
+
+interface InternalVerifyRunResult extends VerificationRunResult {
+  transient?: boolean;
+}
+
+interface InFlightVerify {
+  treeSha: string | null;
+  priority: BuildPriority;
+  abortController: AbortController;
+  leaseId: string | null;
+  supervisorUrl?: string;
+  hostSecret?: string;
+  promise: Promise<InternalVerifyRunResult>;
+}
+
+interface RepoVerifyState {
+  cache: Map<string, { allPassed: boolean; results: VerificationCheckResult[] }>;
+  inFlight: InFlightVerify | null;
+}
+
+const MAX_CACHE_ENTRIES = 8;
+const repoStates = new Map<string, RepoVerifyState>();
+
+function getRepoState(repoRoot: string): RepoVerifyState {
+  const key = path.resolve(repoRoot);
+  let state = repoStates.get(key);
+  if (!state) {
+    state = { cache: new Map(), inFlight: null };
+    repoStates.set(key, state);
+  }
+  return state;
+}
+
+function setCachedResult(
+  state: RepoVerifyState,
+  treeSha: string,
+  entry: { allPassed: boolean; results: VerificationCheckResult[] },
+): void {
+  state.cache.delete(treeSha);
+  state.cache.set(treeSha, entry);
+  while (state.cache.size > MAX_CACHE_ENTRIES) {
+    const oldest = state.cache.keys().next().value;
+    if (oldest !== undefined) state.cache.delete(oldest);
+    else break;
+  }
+}
+
+/**
+ * Immediately cancels any in-flight speculative verification for `repoRoot`
+ * (e.g. when the user starts typing, submits an AI prompt, or syncs/reverts).
+ */
+export function invalidateSpeculativeVerification(repoRoot: string): void {
+  const state = repoStates.get(path.resolve(repoRoot));
+  if (state?.inFlight && state.inFlight.priority === 'speculative') {
+    state.inFlight.abortController.abort();
+  }
+}
+
+/** Clears cached verification results for `repoRoot` (primarily for tests). */
+export function clearVerificationCache(repoRoot: string): void {
+  const state = repoStates.get(path.resolve(repoRoot));
+  if (state) {
+    state.cache.clear();
+  }
+}
+
+/**
+ * Runs a low-priority speculative verification in the background, populating the
+ * tree-SHA cache silently. Swallows abort/preemption errors cleanly.
+ */
+export async function runSpeculativeVerification(
+  repoRoot: string,
+  lockOpts?: Omit<BuildLockClientOptions, 'priority'>,
+): Promise<VerificationRunResult | null> {
+  try {
+    const res = await runAllVerificationChecks(repoRoot, {
+      ...lockOpts,
+      priority: 'speculative',
+    });
+    return res.aborted ? null : res;
+  } catch {
+    return null;
+  }
+}
+
+export async function runAllVerificationChecks(
   repoRoot: string,
   lockOpts?: BuildLockClientOptions,
-): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
-  const run = () => withSupervisorBuildLock(lockOpts, () => runAllVerificationChecksUnlocked(repoRoot));
-  const result = verifyQueue.then(run, run);
-  verifyQueue = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
+): Promise<VerificationRunResult> {
+  const priority: BuildPriority = lockOpts?.priority ?? 'foreground';
+  const state = getRepoState(repoRoot);
+
+  // Retry loop handles the rare race where a coalesced speculative run gets
+  // preempted right before promotion completes.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const treeSha = await computeWorkingTreeKey(repoRoot);
+
+    if (treeSha && !lockOpts?.bypassCache) {
+      const cached = state.cache.get(treeSha);
+      if (cached) {
+        // Refresh LRU order
+        setCachedResult(state, treeSha, cached);
+        return {
+          allPassed: cached.allPassed,
+          results: cached.results,
+          fromCache: true,
+        };
+      }
+    }
+
+    const existing = state.inFlight;
+    if (existing) {
+      // Same-tree coalescing
+      if (treeSha && existing.treeSha === treeSha && !existing.abortController.signal.aborted) {
+        if (existing.priority === 'speculative' && priority === 'foreground') {
+          existing.priority = 'foreground';
+          if (existing.leaseId && existing.supervisorUrl) {
+            void promoteSupervisorBuildLock(
+              existing.supervisorUrl,
+              existing.hostSecret,
+              existing.leaseId,
+            );
+          }
+        }
+        const joined = await existing.promise;
+        if (joined.aborted && priority === 'foreground') {
+          continue;
+        }
+        return {
+          allPassed: joined.allPassed,
+          results: joined.results,
+          ...(joined.aborted ? { aborted: true } : {}),
+        };
+      }
+
+      if (existing.priority === 'speculative') {
+        // Abort stale speculative run (different tree or already aborting)
+        existing.abortController.abort();
+        await existing.promise.catch(() => {});
+        continue;
+      }
+
+      // Existing run is foreground for a different tree
+      if (priority === 'speculative') {
+        return { allPassed: false, results: [], aborted: true };
+      }
+      await existing.promise.catch(() => {});
+      continue;
+    }
+
+    const ac = new AbortController();
+    if (lockOpts?.signal) {
+      if (lockOpts.signal.aborted) {
+        return { allPassed: false, results: [], aborted: true };
+      }
+      lockOpts.signal.addEventListener('abort', () => ac.abort(), { once: true });
+    }
+
+    const runEntry: InFlightVerify = {
+      treeSha,
+      priority,
+      abortController: ac,
+      leaseId: null,
+      supervisorUrl: lockOpts?.supervisorUrl,
+      hostSecret: lockOpts?.hostSecret,
+      promise: Promise.resolve({ allPassed: false, results: [] }),
+    };
+
+    const execPromise = (async (): Promise<InternalVerifyRunResult> => {
+      try {
+        const outcome = await withSupervisorBuildLock(
+          {
+            ...lockOpts,
+            priority,
+            signal: ac.signal,
+            onLeaseAcquired: (leaseId) => {
+              runEntry.leaseId = leaseId;
+              lockOpts?.onLeaseAcquired?.(leaseId);
+              // If coalesced into foreground while waiting in queue, promote immediately
+              if (
+                priority === 'speculative' &&
+                runEntry.priority === 'foreground' &&
+                runEntry.supervisorUrl
+              ) {
+                void promoteSupervisorBuildLock(
+                  runEntry.supervisorUrl,
+                  runEntry.hostSecret,
+                  leaseId,
+                );
+              }
+            },
+            onPreempted: () => {
+              if (runEntry.priority === 'speculative') {
+                ac.abort();
+                lockOpts?.onPreempted?.();
+              }
+            },
+          },
+          () =>
+            runAllVerificationChecksUnlocked(repoRoot, {
+              signal: ac.signal,
+              getPriority: () => runEntry.priority,
+            }),
+        );
+
+        if (!outcome.aborted && !outcome.transient && treeSha) {
+          const afterTreeSha = await computeWorkingTreeKey(repoRoot);
+          if (afterTreeSha === treeSha) {
+            setCachedResult(state, treeSha, {
+              allPassed: outcome.allPassed,
+              results: outcome.results,
+            });
+          }
+        }
+        return outcome;
+      } catch (err) {
+        if (ac.signal.aborted || priority === 'speculative') {
+          return { allPassed: false, results: [], aborted: true, transient: true };
+        }
+        throw err;
+      } finally {
+        if (state.inFlight === runEntry) {
+          state.inFlight = null;
+        }
+      }
+    })();
+
+    runEntry.promise = execPromise;
+    state.inFlight = runEntry;
+
+    const finalRes = await execPromise;
+    return {
+      allPassed: finalRes.allPassed,
+      results: finalRes.results,
+      ...(finalRes.aborted ? { aborted: true } : {}),
+    };
+  }
+
+  return { allPassed: false, results: [], aborted: true };
 }
 
 async function runAllVerificationChecksUnlocked(
   repoRoot: string,
-): Promise<{ allPassed: boolean; results: VerificationCheckResult[] }> {
+  opts?: { signal?: AbortSignal; getPriority?: () => BuildPriority },
+): Promise<InternalVerifyRunResult> {
   const results: VerificationCheckResult[] = [];
   const originalBase = await detectAstroBase(repoRoot);
+  await ensureBuildArtifactsExcluded(repoRoot);
 
   let halleyConfig: HalleyRepoConfig | undefined;
   try {
@@ -527,7 +1024,13 @@ async function runAllVerificationChecksUnlocked(
     halleyConfig = undefined;
   }
 
+  let aborted = false;
+  let transient = false;
+
   try {
+    if (opts?.signal?.aborted) {
+      return { allPassed: false, results, aborted: true, transient: true };
+    }
     results.push(await runAstroHygieneGuard(repoRoot, originalBase, halleyConfig));
     results.push(await runUnfinishedPagesCheck(repoRoot));
 
@@ -535,9 +1038,26 @@ async function runAllVerificationChecksUnlocked(
 
     if (halleyConfig?.checks && halleyConfig.checks.length > 0) {
       for (const c of halleyConfig.checks) {
-        const res = await runShell(repoRoot, c.command);
-        results.push({ name: c.name, command: c.command, ...res });
+        if (opts?.signal?.aborted) {
+          aborted = true;
+          transient = true;
+          break;
+        }
+        const res = await runShell(repoRoot, c.command, {
+          signal: opts?.signal,
+          priority: opts?.getPriority?.() ?? 'foreground',
+        });
+        if (res.aborted) aborted = true;
+        if (res.transient) transient = true;
+        results.push({
+          name: c.name,
+          command: c.command,
+          passed: res.passed,
+          durationMs: res.durationMs,
+          output: res.output,
+        });
         if (!res.passed) buildSucceeded = false;
+        if (aborted) break;
       }
     } else {
       let scripts: Record<string, string> = {};
@@ -560,8 +1080,28 @@ async function runAllVerificationChecksUnlocked(
       }
 
       for (const item of ordered) {
-        const res = await runShell(repoRoot, item.script);
-        results.push({ name: item.name, command: item.script, ...res });
+        if (opts?.signal?.aborted) {
+          aborted = true;
+          transient = true;
+          break;
+        }
+        const res = await runShell(repoRoot, item.script, {
+          signal: opts?.signal,
+          priority: opts?.getPriority?.() ?? 'foreground',
+        });
+        if (res.aborted) aborted = true;
+        if (res.transient) transient = true;
+        results.push({
+          name: item.name,
+          command: item.script,
+          passed: res.passed,
+          durationMs: res.durationMs,
+          output: res.output,
+        });
+        if (aborted) {
+          buildSucceeded = false;
+          break;
+        }
         if (!res.passed && item.script === 'npm run build') {
           buildSucceeded = false;
           // Skip verify:* if build itself failed
@@ -570,18 +1110,19 @@ async function runAllVerificationChecksUnlocked(
       }
     }
 
-    if (buildSucceeded) {
+    if (!aborted && buildSucceeded) {
       results.push(await runUnlistedIntegrityCheck(repoRoot, originalBase));
     }
 
     return {
-      allPassed: results.every((r) => r.passed),
+      allPassed: !aborted && results.every((r) => r.passed),
       results,
+      ...(aborted ? { aborted: true } : {}),
+      ...(transient ? { transient: true } : {}),
     };
   } finally {
-    // Reclaim disk space on the shared /workspaces volume after checks complete
+    // Reclaim large dist/ output while keeping .astro/ warm across verification runs
     await fs.rm(path.join(repoRoot, 'dist'), { recursive: true, force: true }).catch(() => {});
-    await fs.rm(path.join(repoRoot, '.astro'), { recursive: true, force: true }).catch(() => {});
   }
 }
 

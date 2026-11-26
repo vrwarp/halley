@@ -34,14 +34,14 @@ interface Props {
 
 const STEPS: Array<{ key: string; label: string; detail: string }> = [
   {
-    key: 'verifying',
-    label: 'Checking links, SEO & page build',
-    detail: 'Building every page and checking links, images, and SEO.',
-  },
-  {
     key: 'rebasing',
     label: 'Syncing with current live website',
     detail: 'Making sure your draft stays in sync with any recent live updates.',
+  },
+  {
+    key: 'verifying',
+    label: 'Checking links, SEO & page build',
+    detail: 'Building every page and checking links, images, and SEO.',
   },
   {
     key: 'waiting_ci',
@@ -332,12 +332,17 @@ export function PublishModal({
     }
   };
 
+  const isDeployingPages = state === 'deploying_pages';
   const isInFlight =
     submitting ||
     retryingDeploy ||
     ['verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci', 'deploying_pages'].includes(
       state,
     );
+  const isBlockingInFlight =
+    submitting ||
+    retryingDeploy ||
+    ['verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci'].includes(state);
   const isDeployFailed =
     state === 'failed_deploy' ||
     (state === 'failed_ci' && (session.status === 'merged' || Boolean(session.mergedSha)));
@@ -358,8 +363,8 @@ export function PublishModal({
   }, [isInFlight]);
 
   const activeStepIdx = (() => {
-    if (state === 'verifying') return 0;
-    if (state === 'rebasing' || state === 'resolving_conflicts') return 1;
+    if (state === 'rebasing' || state === 'resolving_conflicts') return 0;
+    if (state === 'verifying') return 1;
     if (state === 'pushing_pr' || state === 'waiting_ci') return 2;
     if (state === 'deploying_pages') return 3;
     if (state === 'published') return 4;
@@ -395,7 +400,7 @@ export function PublishModal({
                   ? 'Review & Undo Publication'
                   : 'Review & Publish Changes'}
           </h2>
-          {!isInFlight && (
+          {!isBlockingInFlight && (
             <button
               type="button"
               onClick={onClose}
@@ -704,6 +709,23 @@ export function PublishModal({
             >
               Start new edit
             </button>
+          ) : isDeployingPages ? (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                className="min-h-[42px] rounded-xl px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={onStartNewEdit}
+                className="min-h-[42px] rounded-xl bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+              >
+                Start new edit
+              </button>
+            </>
           ) : isDeployFailed ? (
             <>
               <button
