@@ -313,11 +313,13 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     const sessions = this.db.listSessions();
     let reconciled = 0;
     for (const s of sessions) {
+      if (this.booting.has(s.id)) continue;
       const hasLiveUrls = Boolean(s.runner_url || s.astro_url);
-      const isMarkedRunning =
+      const isMarkedActive =
         s.status === 'running' ||
+        s.status === 'starting' ||
         ((s.status === 'published' || s.status === 'merged') && hasLiveUrls);
-      if (isMarkedRunning && !activeSet.has(s.id)) {
+      if (isMarkedActive && !activeSet.has(s.id)) {
         const isFrozen = s.status === 'published' || s.status === 'merged';
         this.db.updateSession(s.id, {
           status: isFrozen ? s.status : 'sleeping',
@@ -447,7 +449,22 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     const isFrozen = session.status === 'published' || session.status === 'merged';
     try {
       const hostUrl = await this.getHostUrl();
-      const health = await this.fetchSupervisorHealth(hostUrl);
+      let health: SupervisorHealthResponse;
+      const healthDeadline = Date.now() + 15_000;
+      for (;;) {
+        try {
+          health = await this.fetchSupervisorHealth(hostUrl);
+          break;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const isPermanent =
+            msg.includes('Unauthorized') || msg.includes('protocol version mismatch');
+          if (isPermanent || Date.now() >= healthDeadline) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, 1_000));
+        }
+      }
       if (
         this.lastSupervisorInstanceId === null ||
         this.lastSupervisorInstanceId !== health.instanceId

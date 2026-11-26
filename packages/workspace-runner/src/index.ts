@@ -167,6 +167,17 @@ const astroManager = new AstroDevManager({
 
 let piRuntime: HalleyPiRuntime | null = null;
 
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await piRuntime?.stop().catch(() => {});
+  await astroManager.stop().catch(() => {});
+  process.exit(0);
+};
+process.on('SIGINT', () => void shutdown());
+process.on('SIGTERM', () => void shutdown());
+
 async function main() {
   await loadPersistedSessionMeta();
   console.log('[halley-boot] starting_preview');
@@ -246,6 +257,7 @@ async function main() {
       astroCrashCount: astro.crashCount,
       astroLastExitCode: astro.lastExitCode,
       astroPort: astro.port,
+      astroLogs: astro.logs.slice(-10),
       piBusy: piRuntime?.isBusy() ?? false,
       originalBase,
       previewBase,
@@ -1318,14 +1330,6 @@ async function main() {
     });
     ws.on('close', () => wsClients.delete(ws));
   });
-
-  const shutdown = async () => {
-    await piRuntime?.stop();
-    await astroManager.stop();
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
 
   console.log(
     `[halley-workspace-runner] session=${SESSION_ID} runner=:${RUNNER_PORT} astro=:${ASTRO_PORT}${previewBase}`,

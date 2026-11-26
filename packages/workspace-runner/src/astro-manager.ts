@@ -223,11 +223,14 @@ export default {
 
     this.proc = child;
 
-    const pushLog = (chunk: Buffer) => {
+    const pushLog = (chunk: Buffer, isErr: boolean) => {
       const lines = chunk.toString('utf8').split(/\r?\n/).filter(Boolean);
       for (const l of lines) {
         this.recentLogs.push(l);
         if (this.recentLogs.length > 200) this.recentLogs.shift();
+        if (isErr) {
+          console.error(`[halley-astro] ${l}`);
+        }
         if (l.includes('Local') || l.includes(`:${this.opts.astroPort}`) || l.includes('watching for file changes')) {
           this.ready = true;
           this.state = 'ready';
@@ -235,13 +238,14 @@ export default {
       }
     };
 
-    child.stdout?.on('data', pushLog);
-    child.stderr?.on('data', pushLog);
+    child.stdout?.on('data', (chunk: Buffer) => pushLog(chunk, false));
+    child.stderr?.on('data', (chunk: Buffer) => pushLog(chunk, true));
     child.on('exit', (code, signal) => {
       if (this.proc !== child) return;
       this.ready = false;
       this.lastExitCode = code;
-      this.recentLogs.push(`[astro dev exited with code ${code}${signal ? ` (${signal})` : ''}]`);
+      const exitMsg = `[astro dev exited with code ${code}${signal ? ` (${signal})` : ''}]`;
+      this.recentLogs.push(exitMsg);
 
       if (this.paused) {
         this.state = 'paused';
@@ -251,6 +255,7 @@ export default {
         return;
       }
 
+      console.error(`[halley-astro] ${exitMsg}`);
       this.crashCount += 1;
       const now = Date.now();
       this.crashTimestamps = this.crashTimestamps.filter((ts) => now - ts < this.crashWindowMs);
@@ -279,16 +284,18 @@ export default {
       }
     });
 
-    // Poll local HTTP until ready (up to 30s)
+    // Poll local HTTP until ready (up to 30s), breaking immediately if stdout already reported ready
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
-      if (this.proc !== child || child.exitCode !== null || this.paused || this.intentionalStop) break;
+      if (this.ready || this.proc !== child || child.exitCode !== null || this.paused || this.intentionalStop) {
+        break;
+      }
       try {
         const ok = this.opts.probeReady
           ? await this.opts.probeReady()
-          : await fetch(`http://127.0.0.1:${this.opts.astroPort}${this.previewBase}/`).then(
-              (res) => res.status < 500,
-            );
+          : await fetch(`http://127.0.0.1:${this.opts.astroPort}${this.previewBase}/`, {
+              signal: AbortSignal.timeout(3_000),
+            }).then((res) => res.status < 500);
         if (ok) {
           this.ready = true;
           this.state = 'ready';
@@ -297,6 +304,7 @@ export default {
       } catch {
         // still booting
       }
+      if (this.ready) break;
       await new Promise((r) => setTimeout(r, 400));
     }
   }

@@ -634,6 +634,118 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('AstroDevManager.start resolves immediately once stdout reports Local ready without waiting on slow HTTP probe', async () => {
+    let probeCalls = 0;
+    const mgr = new AstroDevManager({
+      repoRoot: '/tmp',
+      sessionId: 'test-astro-stdout-ready',
+      astroPort: 4329,
+      runnerPort: 4109,
+      isReadOnly: () => false,
+      onPatched: () => {},
+      spawnAstro: () => {
+        const fake = Object.assign(new EventEmitter(), {
+          exitCode: null as number | null,
+          stdout: new EventEmitter(),
+          stderr: new EventEmitter(),
+          kill: () => {
+            if (fake.exitCode === null) {
+              fake.exitCode = 0;
+              fake.emit('exit', 0, 'SIGTERM');
+            }
+            return true;
+          },
+        });
+        setTimeout(() => {
+          fake.stdout.emit('data', Buffer.from('  ┃ Local    http://localhost:4329/\n'));
+        }, 10);
+        return fake as unknown as ChildProcess;
+      },
+      probeReady: async () => {
+        probeCalls += 1;
+        await new Promise((r) => setTimeout(r, 50));
+        return false;
+      },
+    });
+
+    const t0 = Date.now();
+    await mgr.start();
+    const elapsed = Date.now() - t0;
+    expect(mgr.getStatus().ready).toBe(true);
+    expect(mgr.getStatus().state).toBe('ready');
+    expect(elapsed).toBeLessThan(2_000);
+    expect(probeCalls).toBeLessThanOrEqual(1);
+    await mgr.stop();
+  });
+
+  it('supervisor fails fast with Astro logs when runner /health reports astroState=crashed', async () => {
+    const { createWorkspaceSupervisor } = await import('../src/supervisor.js');
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-sup-astro-crash-'));
+    try {
+      const sessionId = 'astro-crash-session';
+      const wsDir = path.join(tmp, 'sessions', sessionId, 'workspace');
+      await fs.mkdir(path.join(wsDir, '.git'), { recursive: true });
+      await fs.writeFile(path.join(wsDir, 'package.json'), JSON.stringify({ name: 't' }));
+
+      const fakeRunner = path.join(tmp, 'fake-runner.mjs');
+      await fs.writeFile(
+        fakeRunner,
+        `import http from 'node:http';
+const port = Number(process.env.RUNNER_PORT);
+const srv = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    astroReady: false,
+    astroState: 'crashed',
+    astroLogs: ['Error: simulated Astro config failure'],
+    originalBase: '/',
+  }));
+});
+srv.listen(port, '127.0.0.1');
+process.on('SIGTERM', () => srv.close(() => process.exit(0)));
+`,
+        'utf8',
+      );
+
+      const sup = createWorkspaceSupervisor({
+        workspacesDir: tmp,
+        controlPlaneInternalUrl: 'http://127.0.0.1:1',
+        repo: 'test/site',
+        baseBranch: 'main',
+        modelId: 'haiku-latest',
+        thinkingLevel: 'off',
+        gitBotName: 'Bot',
+        gitBotEmail: 'bot@example.com',
+        warmPoolSize: 0,
+        maxActiveWorkspaces: 5,
+        runnerEntry: fakeRunner,
+        bindHost: '127.0.0.1',
+      });
+
+      const t0 = Date.now();
+      const startRes = await sup.app.request(`/api/sessions/${sessionId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baseBranch: 'main',
+          workingBranch: 'halley/test',
+          baseSha: 'abc1234',
+          workspaceToken: 'tok',
+        }),
+      });
+      const elapsed = Date.now() - t0;
+      expect(startRes.status).toBe(500);
+      const body = (await startRes.json()) as { error?: string };
+      expect(body.error).toContain('Workspace preview server crashed during startup');
+      expect(body.error).toContain('simulated Astro config failure');
+      expect(elapsed).toBeLessThan(10_000);
+      await sup.stopAll();
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 

@@ -1597,13 +1597,27 @@ if (isMain) {
 
   console.log(`[halley-control-plane] listening on http://0.0.0.0:${config.port} (repo=${config.repo})`);
   if (cp.driver.runDoctorChecks) {
-    void cp.driver
-      .runDoctorChecks()
-      .then((report) => {
+    void (async () => {
+      try {
+        const report = await cp.driver.runDoctorChecks!();
         for (const w of report.warnings) console.warn(`[halley-doctor] WARN: ${w}`);
         for (const e of report.errors) console.error(`[halley-doctor] ERROR: ${e}`);
-      })
-      .catch(() => {});
+        if (!report.ok && cp.driver.reconcileSessions) {
+          // Workspaces container may still be finishing entrypoint/startup; retry reconciliation briefly
+          for (let attempt = 0; attempt < 15 && !shuttingDown; attempt++) {
+            await new Promise((r) => setTimeout(r, 2_000));
+            try {
+              await cp.driver.reconcileSessions();
+              break;
+            } catch {
+              // still starting
+            }
+          }
+        }
+      } catch {
+        // ignore startup check error
+      }
+    })();
   }
   cp.driver.startWarmPool?.();
 }
