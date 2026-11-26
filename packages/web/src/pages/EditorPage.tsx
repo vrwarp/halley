@@ -277,7 +277,7 @@ export function EditorPage({
     setSpend(res.spend);
     setChangedCount(res.session.changedFilesCount);
     if (!res.session.canEdit) setMode('browse');
-    if (res.session.status === 'running' || res.session.status === 'published') {
+    if (res.session.status === 'running') {
       try {
         const [ch, rt] = await Promise.all([api.getChanges(sessionId), api.getRoutes(sessionId)]);
         setChangesFromServer(ch.changes.length, ch.checkpoints);

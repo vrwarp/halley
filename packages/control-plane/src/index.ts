@@ -752,8 +752,13 @@ export function createControlPlane(
   app.get('/api/sessions/:id/routes', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
+    if ((s.status === 'published' || s.status === 'merged') && !s.runner_url) {
+      return c.json({ routes: [] });
+    }
     const ep = await driver.ensureRunning(s);
-    const res = await fetch(`${ep.runnerUrl}/internal/routes`);
+    const res = await fetch(`${ep.runnerUrl}/internal/routes`, {
+      signal: AbortSignal.timeout(15_000),
+    });
     return c.json(await res.json(), res.status as 200);
   });
 
@@ -855,9 +860,13 @@ export function createControlPlane(
   app.get('/api/sessions/:id/changes', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
+    if ((s.status === 'published' || s.status === 'merged') && !s.runner_url) {
+      return c.json({ changes: [], checkpoints: [] });
+    }
     const ep = await driver.ensureRunning(s);
     const res = await fetch(
       `${ep.runnerUrl}/internal/git/changes?baseRef=${encodeURIComponent(`origin/${s.base_branch}`)}`,
+      { signal: AbortSignal.timeout(15_000) },
     );
     const data = (await res.json()) as { changes?: unknown[]; checkpoints?: unknown[] };
     db.updateSession(s.id, { changed_files_count: data.changes?.length ?? 0 });
