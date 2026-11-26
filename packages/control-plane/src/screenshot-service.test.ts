@@ -254,10 +254,12 @@ describe('ScreenshotService', () => {
     }
   });
 
-  it('captures mobile and desktop Live vs Draft review screenshots up to 10000px and caches Live captures per baseSha', async () => {
+  it('captures mobile and desktop Live vs Draft review screenshots up to 10000px via CDP WebP (with JPEG fallback) and caches Live captures per baseSha', async () => {
     const visitedUrls: string[] = [];
     const contextViewports: Array<{ width: number; height: number }> = [];
+    const cdpCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
     const screenshotCalls: Array<Record<string, unknown>> = [];
+    let enableCdp = true;
 
     const svc = new ScreenshotService({
       idleTimeoutMs: 60_000,
@@ -268,6 +270,17 @@ describe('ScreenshotService', () => {
           newContext: async (opts: { viewport: { width: number; height: number } }) => {
             contextViewports.push(opts.viewport);
             return {
+              ...(enableCdp
+                ? {
+                    newCDPSession: async () => ({
+                      send: async (method: string, params: Record<string, unknown>) => {
+                        cdpCalls.push({ method, params });
+                        return { data: Buffer.from('fake-webp').toString('base64') };
+                      },
+                      detach: async () => {},
+                    }),
+                  }
+                : {}),
               newPage: async () => ({
                 goto: async (url: string) => {
                   visitedUrls.push(url);
@@ -290,7 +303,7 @@ describe('ScreenshotService', () => {
                 },
                 screenshot: async (opts: Record<string, unknown>) => {
                   screenshotCalls.push(opts);
-                  return Buffer.from('review-mock-bytes');
+                  return Buffer.from('review-jpg-fallback');
                 },
               }),
               close: async () => {},
@@ -316,14 +329,20 @@ describe('ScreenshotService', () => {
       expect(contextViewports[0]).toEqual({ width: 390, height: 844 });
       expect(visitedUrls).toContain('http://ws-1:4321/p/s1/events');
       expect(visitedUrls).toContain('https://example.org/events');
-      expect(screenshotCalls[0]).toEqual({
-        type: 'png',
-        fullPage: true,
-        clip: { x: 0, y: 0, width: 390, height: 10_000 },
+      expect(cdpCalls[0]).toEqual({
+        method: 'Page.captureScreenshot',
+        params: {
+          format: 'webp',
+          quality: 88,
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width: 390, height: 10_000, scale: 1 },
+        },
       });
       expect(mobilePages[0]!.viewport).toBe('mobile');
       expect(mobilePages[0]!.shots?.mobile?.width).toBe(390);
       expect(mobilePages[0]!.shots?.mobile?.height).toBe(10_000);
+      expect(mobilePages[0]!.shots?.mobile?.draftScreenshotDataUrl).toContain('data:image/webp;base64,');
+      expect(mobilePages[0]!.shots?.mobile?.liveScreenshotDataUrl).toContain('data:image/webp;base64,');
       expect(mobilePages[0]!.shots?.mobile?.highlights).toHaveLength(1);
 
       // Second review with same baseSha should hit the Live LRU cache (no second visit to example.org)
@@ -340,6 +359,8 @@ describe('ScreenshotService', () => {
       });
       expect(visitedUrls).toEqual(['http://ws-1:4321/p/s1/events']);
 
+      // When CDP is unavailable, falls back to JPEG (q=88)
+      enableCdp = false;
       const desktopPages = await svc.captureLiveVsDraftPages({
         routes: ['/events'],
         draftFiles: ['src/pages/events.astro'],
@@ -351,7 +372,14 @@ describe('ScreenshotService', () => {
       });
 
       expect(desktopPages).toHaveLength(1);
+      expect(desktopPages[0]!.shots?.desktop?.draftScreenshotDataUrl).toContain('data:image/jpeg;base64,');
       expect(desktopPages[0]!.shots?.desktop?.liveScreenshotDataUrl).toBeUndefined();
+      expect(screenshotCalls[0]).toEqual({
+        type: 'jpeg',
+        quality: 88,
+        fullPage: true,
+        clip: { x: 0, y: 0, width: 1280, height: 10_000 },
+      });
     } finally {
       await svc.close();
     }

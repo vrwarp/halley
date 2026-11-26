@@ -1,9 +1,7 @@
 import type { VisualDiffHighlightDto, VisualDiffPageDto } from '@halley/shared';
-import { chromium, type Browser, type Page } from 'playwright';
-import { buildVisualDiffShot } from './visual-diff-crop.js';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 
 export type ScreenshotViewport = 'desktop' | 'mobile';
-export type ReviewScreenshotMode = 'cropped' | 'full';
 
 export const VIEWPORT_SIZES: Record<ScreenshotViewport, { width: number; height: number }> = {
   desktop: { width: 1280, height: 800 },
@@ -18,13 +16,12 @@ export interface ScreenshotRequest {
 
 const MAX_FULL_PAGE_HEIGHT = 3600;
 const MAX_REVIEW_CAPTURE_HEIGHT = 10_000;
+const REVIEW_IMAGE_QUALITY = 88;
 const DEFAULT_IDLE_TIMEOUT_MS = 60 * 60_000; // 1 hour
 const DEFAULT_MAX_CONCURRENCY = 3;
 const DEFAULT_SETTLE_WAIT_MS = 40;
-const DEFAULT_LIVE_CACHE_MAX_BYTES = 40 * 1024 * 1024;
+const DEFAULT_LIVE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const DEFAULT_LIVE_CACHE_TTL_MS = 10 * 60_000;
-const FULL_PAIR_CACHE_MAX_BYTES = 25 * 1024 * 1024;
-const FULL_PAIR_CACHE_TTL_MS = 90_000;
 
 const DETERMINISTIC_CAPTURE_CSS = `
   astro-dev-toolbar { display: none !important; }
@@ -53,9 +50,9 @@ export interface ScreenshotServiceOptions {
   settleWaitMs?: number;
   /** Maximum concurrent browser pages across all captures (default: 3). */
   maxConcurrency?: number;
-  /** Byte budget for LRU-cached Live site PNG captures (default: 40 MB). */
+  /** Byte budget for LRU-cached Live site compressed captures (default: 24 MB). */
   liveCacheMaxBytes?: number;
-  /** TTL for cached Live site PNG captures (default: 10 minutes). */
+  /** TTL for cached Live site captures (default: 10 minutes). */
   liveCacheTtlMs?: number;
 }
 
@@ -82,7 +79,6 @@ class ByteLruCache<T> {
       this.delete(key);
       return undefined;
     }
-    // Refresh LRU order
     this.map.delete(key);
     this.map.set(key, entry);
     return entry.value;
@@ -118,17 +114,10 @@ class ByteLruCache<T> {
   }
 }
 
-interface RawLiveCapture {
-  buf: Buffer;
+interface CompressedCapture {
+  dataUrl: string;
+  byteLength: number;
   height: number;
-}
-
-interface RawReviewPair {
-  title: string;
-  draftBuf: Buffer;
-  draftHeight: number;
-  liveBuf?: Buffer;
-  highlights: VisualDiffHighlightDto[];
 }
 
 export interface CaptureRouteReviewOptions {
@@ -140,7 +129,6 @@ export interface CaptureRouteReviewOptions {
   baseSha?: string | null;
   liveTimestamp: string;
   viewport?: ScreenshotViewport;
-  mode?: ReviewScreenshotMode;
 }
 
 export class ScreenshotService {
@@ -156,22 +144,16 @@ export class ScreenshotService {
   private readonly waitQueue: Array<() => void> = [];
   private closed = false;
 
-  private readonly liveCache: ByteLruCache<RawLiveCapture>;
-  private readonly reviewPairCache: ByteLruCache<RawReviewPair>;
+  private readonly liveCache: ByteLruCache<CompressedCapture>;
 
   constructor(opts: ScreenshotServiceOptions = {}) {
     this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.settleWaitMs = opts.settleWaitMs ?? DEFAULT_SETTLE_WAIT_MS;
     this.maxConcurrency = Math.max(1, opts.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
-    this.liveCache = new ByteLruCache<RawLiveCapture>(
+    this.liveCache = new ByteLruCache<CompressedCapture>(
       opts.liveCacheMaxBytes ?? DEFAULT_LIVE_CACHE_MAX_BYTES,
-      24,
+      32,
       opts.liveCacheTtlMs ?? DEFAULT_LIVE_CACHE_TTL_MS,
-    );
-    this.reviewPairCache = new ByteLruCache<RawReviewPair>(
-      FULL_PAIR_CACHE_MAX_BYTES,
-      16,
-      FULL_PAIR_CACHE_TTL_MS,
     );
     this.launchBrowser =
       opts.launchBrowser ??
@@ -289,7 +271,6 @@ export class ScreenshotService {
   ): Promise<{ status: () => number } | null> {
     const res = await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
 
-    // Real Playwright pages expose addStyleTag; guard so minimal fake Page mocks in unit tests stay clean
     if (typeof (page as { addStyleTag?: unknown }).addStyleTag === 'function') {
       await page.addStyleTag({ content: DETERMINISTIC_CAPTURE_CSS }).catch(() => {});
       await page
@@ -304,7 +285,6 @@ export class ScreenshotService {
                   decode?: () => Promise<void>;
                 }>;
               };
-              requestAnimationFrame?: (cb: () => void) => number;
             }
           ).document;
           const fontWait = doc?.fonts?.ready
@@ -348,8 +328,56 @@ export class ScreenshotService {
   }
 
   /**
+   * Captures a compressed full-page screenshot directly via Chromium CDP WebP (q=88),
+   * avoiding any Node.js image-encoding CPU/RAM overhead. Falls back to JPEG (q=88)
+   * when CDP is unavailable (e.g., mocked unit tests).
+   */
+  private async captureFullPageCompressed(
+    context: BrowserContext,
+    page: Page,
+    width: number,
+    captureHeight: number,
+  ): Promise<CompressedCapture> {
+    if (typeof (context as { newCDPSession?: unknown }).newCDPSession === 'function') {
+      try {
+        const cdp = await context.newCDPSession(page);
+        try {
+          const result = (await cdp.send('Page.captureScreenshot', {
+            format: 'webp',
+            quality: REVIEW_IMAGE_QUALITY,
+            captureBeyondViewport: true,
+            clip: { x: 0, y: 0, width, height: captureHeight, scale: 1 },
+          })) as { data?: string };
+          if (result?.data) {
+            return {
+              dataUrl: `data:image/webp;base64,${result.data}`,
+              byteLength: Math.ceil((result.data.length * 3) / 4),
+              height: captureHeight,
+            };
+          }
+        } finally {
+          await cdp.detach().catch(() => {});
+        }
+      } catch {
+        // Fall back to Playwright JPEG screenshot below
+      }
+    }
+
+    const jpg = await page.screenshot({
+      type: 'jpeg',
+      quality: REVIEW_IMAGE_QUALITY,
+      fullPage: true,
+      clip: { x: 0, y: 0, width, height: captureHeight },
+    });
+    return {
+      dataUrl: `data:image/jpeg;base64,${jpg.toString('base64')}`,
+      byteLength: jpg.length,
+      height: captureHeight,
+    };
+  }
+
+  /**
    * Capture a screenshot using the shared warm Chromium browser (used by Pi's screenshot_page tool).
-   * Bounded concurrency allows parallel desktop + mobile captures while keeping RAM bounded.
    */
   capture(req: ScreenshotRequest): Promise<ScreenshotResult> {
     if (this.closed) {
@@ -393,13 +421,13 @@ export class ScreenshotService {
     });
   }
 
-  private async captureDraftRaw(
+  private async captureDraftFull(
     draftUrl: string,
     size: { width: number; height: number },
     draftFiles: string[],
     mergedFromLiveFiles: string[],
     fallbackTitle: string,
-  ): Promise<{ title: string; buf: Buffer; height: number; highlights: VisualDiffHighlightDto[] } | null> {
+  ): Promise<{ title: string; capture: CompressedCapture; highlights: VisualDiffHighlightDto[] } | null> {
     return this.withSlot(async () => {
       const browser = await this.ensureBrowser();
       const context = await browser.newContext({
@@ -492,12 +520,8 @@ export class ScreenshotService {
             .catch(() => []);
         }
 
-        const png = await page.screenshot({
-          type: 'png',
-          fullPage: true,
-          clip: { x: 0, y: 0, width: size.width, height: captureHeight },
-        });
-        return { title, buf: png, height: captureHeight, highlights };
+        const capture = await this.captureFullPageCompressed(context, page, size.width, captureHeight);
+        return { title, capture, highlights };
       } catch {
         return null;
       } finally {
@@ -506,18 +530,17 @@ export class ScreenshotService {
     });
   }
 
-  private async captureLiveRaw(
+  private async captureLiveFull(
     liveUrl: string,
     viewport: ScreenshotViewport,
     size: { width: number; height: number },
     baseSha?: string | null,
-  ): Promise<RawLiveCapture | null> {
+  ): Promise<CompressedCapture | null> {
     const cacheKey = `${liveUrl}|${viewport}|${baseSha || 'live'}`;
     const cached = this.liveCache.get(cacheKey);
     if (cached) return cached;
 
     return this.withSlot(async () => {
-      // Re-check cache after acquiring slot
       const afterWait = this.liveCache.get(cacheKey);
       if (afterWait) return afterWait;
 
@@ -545,13 +568,8 @@ export class ScreenshotService {
             MAX_REVIEW_CAPTURE_HEIGHT,
           );
         }
-        const livePng = await livePage.screenshot({
-          type: 'png',
-          fullPage: true,
-          clip: { x: 0, y: 0, width: size.width, height: liveHeight },
-        });
-        const captured: RawLiveCapture = { buf: livePng, height: liveHeight };
-        this.liveCache.set(cacheKey, captured, livePng.length);
+        const captured = await this.captureFullPageCompressed(context, livePage, size.width, liveHeight);
+        this.liveCache.set(cacheKey, captured, captured.byteLength);
         return captured;
       } catch {
         return null;
@@ -562,8 +580,8 @@ export class ScreenshotService {
   }
 
   /**
-   * Captures a single route's Live vs Draft review screenshot in either 'cropped' (default)
-   * or 'full' mode. Draft and Live capture concurrently; Live PNGs are LRU-cached by baseSha.
+   * Captures a single route's full-page compressed Live & Draft screenshots in parallel.
+   * Perceptual diffing, hunk cropping, and height-alignment padding run client-side in a Web Worker.
    */
   async captureRouteReview(opts: CaptureRouteReviewOptions): Promise<VisualDiffPageDto> {
     if (this.closed) {
@@ -571,7 +589,6 @@ export class ScreenshotService {
     }
 
     const viewport: ScreenshotViewport = opts.viewport === 'mobile' ? 'mobile' : 'desktop';
-    const mode: ReviewScreenshotMode = opts.mode === 'full' ? 'full' : 'cropped';
     const size = VIEWPORT_SIZES[viewport];
     const route = opts.route.startsWith('/') ? opts.route : `/${opts.route}`;
     const draftUrl = `${opts.draftBaseUrl.replace(/\/$/, '')}${route === '/' ? '/' : route}`;
@@ -579,42 +596,19 @@ export class ScreenshotService {
       ? `${opts.liveBaseUrl.replace(/\/$/, '')}${route === '/' ? '/' : route}`
       : null;
     const fallbackTitle = route === '/' ? 'Homepage' : route;
-    const pairCacheKey = `${draftUrl}|${liveUrl || ''}|${viewport}|${opts.baseSha || ''}`;
 
-    let rawPair: RawReviewPair | undefined;
-    if (mode === 'full') {
-      rawPair = this.reviewPairCache.get(pairCacheKey);
-    }
+    const [draftRes, liveCap] = await Promise.all([
+      this.captureDraftFull(
+        draftUrl,
+        size,
+        [...new Set(opts.draftFiles)],
+        [...new Set(opts.mergedFromLiveFiles)],
+        fallbackTitle,
+      ),
+      liveUrl ? this.captureLiveFull(liveUrl, viewport, size, opts.baseSha) : Promise.resolve(null),
+    ]);
 
-    if (!rawPair) {
-      const [draftCap, liveCap] = await Promise.all([
-        this.captureDraftRaw(
-          draftUrl,
-          size,
-          [...new Set(opts.draftFiles)],
-          [...new Set(opts.mergedFromLiveFiles)],
-          fallbackTitle,
-        ),
-        liveUrl ? this.captureLiveRaw(liveUrl, viewport, size, opts.baseSha) : Promise.resolve(null),
-      ]);
-
-      if (draftCap) {
-        rawPair = {
-          title: draftCap.title,
-          draftBuf: draftCap.buf,
-          draftHeight: draftCap.height,
-          liveBuf: liveCap?.buf,
-          highlights: draftCap.highlights,
-        };
-        this.reviewPairCache.set(
-          pairCacheKey,
-          rawPair,
-          draftCap.buf.length + (liveCap?.buf.length ?? 0),
-        );
-      }
-    }
-
-    if (!rawPair) {
+    if (!draftRes) {
       const emptyShot = {
         highlights: [],
         width: size.width,
@@ -630,18 +624,20 @@ export class ScreenshotService {
       };
     }
 
-    const shot = await buildVisualDiffShot({
-      draftBuf: rawPair.draftBuf,
-      liveBuf: rawPair.liveBuf,
-      highlights: rawPair.highlights,
-      fallbackWidth: size.width,
-      fallbackHeight: rawPair.draftHeight,
-      mode,
-    });
+    const shot = {
+      draftScreenshotDataUrl: draftRes.capture.dataUrl,
+      liveScreenshotDataUrl: liveCap?.dataUrl,
+      highlights: draftRes.highlights,
+      width: size.width,
+      height: draftRes.capture.height,
+      fullWidth: size.width,
+      fullHeight: draftRes.capture.height,
+      hasFullPage: true,
+    };
 
     return {
       route,
-      title: rawPair.title,
+      title: draftRes.title,
       liveScreenshotDataUrl: viewport === 'desktop' ? shot.liveScreenshotDataUrl : undefined,
       draftScreenshotDataUrl: viewport === 'desktop' ? shot.draftScreenshotDataUrl : undefined,
       mobileLiveScreenshotDataUrl: viewport === 'mobile' ? shot.liveScreenshotDataUrl : undefined,
@@ -668,7 +664,6 @@ export class ScreenshotService {
     baseSha?: string | null;
     liveTimestamp: string;
     viewport?: ScreenshotViewport;
-    mode?: ReviewScreenshotMode;
   }): Promise<VisualDiffPageDto[]> {
     if (this.closed) {
       throw new Error('ScreenshotService has been closed');
@@ -690,7 +685,6 @@ export class ScreenshotService {
           baseSha: opts.baseSha,
           liveTimestamp: opts.liveTimestamp,
           viewport: opts.viewport,
-          mode: opts.mode,
         }),
       ),
     );
@@ -704,7 +698,6 @@ export class ScreenshotService {
     this.closed = true;
     this.clearIdleTimer();
     this.liveCache.clear();
-    this.reviewPairCache.clear();
     while (this.waitQueue.length > 0) {
       this.waitQueue.shift()?.();
     }

@@ -570,6 +570,7 @@ export interface VisualDiffHunkDto {
   id: string;
   liveScreenshotDataUrl?: string;
   draftScreenshotDataUrl: string;
+  diffScreenshotDataUrl?: string;
   highlights: VisualDiffHighlightDto[];
   /** Cropped pixel dimensions (after any bottom height-alignment padding). */
   width: number;
@@ -590,6 +591,7 @@ export interface VisualDiffHunkDto {
 export interface VisualDiffViewportShotDto {
   liveScreenshotDataUrl?: string;
   draftScreenshotDataUrl?: string;
+  diffScreenshotDataUrl?: string;
   highlights: VisualDiffHighlightDto[];
   width?: number;
   height?: number;

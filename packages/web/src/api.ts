@@ -179,14 +179,12 @@ export const api = {
     opts: {
       route: string;
       viewport: 'desktop' | 'mobile';
-      mode?: 'cropped' | 'full';
       signal?: AbortSignal;
     },
   ) => {
     const qs = new URLSearchParams({
       route: opts.route,
       viewport: opts.viewport,
-      mode: opts.mode === 'full' ? 'full' : 'cropped',
     });
     return apiFetch<{ page: VisualDiffPageDto }>(
       `/api/sessions/${id}/review/screenshot?${qs.toString()}`,
