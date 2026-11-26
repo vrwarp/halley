@@ -31,6 +31,7 @@ interface Props {
   fullPagesByRoute?: Record<string, VisualDiffPageDto>;
   loadingFullByRoute?: Record<string, boolean>;
   onRequestFullPage?: (route: string) => void;
+  onRequestFullDiff?: (route: string) => void;
   isUndoMode: boolean;
   defaultShowTechnical?: boolean;
   excludedPaths: Record<string, boolean>;
@@ -64,6 +65,7 @@ export function VisualReview({
   fullPagesByRoute = {},
   loadingFullByRoute = {},
   onRequestFullPage,
+  onRequestFullDiff,
   isUndoMode,
   defaultShowTechnical = false,
   excludedPaths,
@@ -213,6 +215,7 @@ export function VisualReview({
                 (screenshotViewport === 'mobile'
                   ? activePage.mobileDraftScreenshotDataUrl
                   : activePage.draftScreenshotDataUrl);
+              const fullDiffUrl = shot?.diffScreenshotDataUrl;
               const highlights = shot?.highlights ?? activePage.highlights ?? [];
               const hunks: VisualDiffHunkDto[] | undefined =
                 !wantFull && croppedShot?.hunks ? croppedShot.hunks : undefined;
@@ -220,7 +223,9 @@ export function VisualReview({
               const hasLive = Boolean(
                 liveUrl || (hunks && hunks.some((h) => Boolean(h.liveScreenshotDataUrl))),
               );
-              const canToggleFull = Boolean(croppedShot?.hasFullPage && onRequestFullPage);
+              const canToggleFull = Boolean(
+                croppedShot?.hasFullPage && (fullPage || onRequestFullPage),
+              );
 
               return (
                 <div
@@ -307,23 +312,30 @@ export function VisualReview({
                               <BeforeAfterWipe
                                 liveUrl={hunk.liveScreenshotDataUrl}
                                 draftUrl={hunk.draftScreenshotDataUrl}
+                                diffUrl={hunk.diffScreenshotDataUrl}
                                 route={activePage.route}
                                 viewport={screenshotViewport}
                                 highlights={hunk.highlights}
                                 onZoom={(side) =>
                                   setLightbox(
-                                    side === 'live'
+                                    side === 'diff' && hunk.diffScreenshotDataUrl
                                       ? {
-                                          src: hunk.liveScreenshotDataUrl!,
-                                          alt: `Live ${activePage.route}`,
-                                          title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                          src: hunk.diffScreenshotDataUrl,
+                                          alt: `Diff ${activePage.route}`,
+                                          title: `Diff · ${activePage.route} (${screenshotViewport})`,
                                         }
-                                      : {
-                                          src: hunk.draftScreenshotDataUrl,
-                                          alt: `Draft ${activePage.route}`,
-                                          title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                                          highlights: hunk.highlights,
-                                        },
+                                      : side === 'live'
+                                        ? {
+                                            src: hunk.liveScreenshotDataUrl!,
+                                            alt: `Live ${activePage.route}`,
+                                            title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                          }
+                                        : {
+                                            src: hunk.draftScreenshotDataUrl,
+                                            alt: `Draft ${activePage.route}`,
+                                            title: `Draft · ${activePage.route} (${screenshotViewport})`,
+                                            highlights: hunk.highlights,
+                                          },
                                   )
                                 }
                               />
@@ -389,23 +401,33 @@ export function VisualReview({
                       <BeforeAfterWipe
                         liveUrl={liveUrl}
                         draftUrl={draftUrl}
+                        diffUrl={fullDiffUrl}
+                        onRequestDiff={
+                          wantFull && onRequestFullDiff ? () => onRequestFullDiff(route) : undefined
+                        }
                         route={activePage.route}
                         viewport={screenshotViewport}
                         highlights={highlights}
                         onZoom={(side) =>
                           setLightbox(
-                            side === 'live'
+                            side === 'diff' && fullDiffUrl
                               ? {
-                                  src: liveUrl,
-                                  alt: `Live ${activePage.route}`,
-                                  title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                  src: fullDiffUrl,
+                                  alt: `Diff ${activePage.route}`,
+                                  title: `Diff · ${activePage.route} (${screenshotViewport})`,
                                 }
-                              : {
-                                  src: draftUrl,
-                                  alt: `Draft ${activePage.route}`,
-                                  title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                                  highlights,
-                                },
+                              : side === 'live'
+                                ? {
+                                    src: liveUrl,
+                                    alt: `Live ${activePage.route}`,
+                                    title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                  }
+                                : {
+                                    src: draftUrl,
+                                    alt: `Draft ${activePage.route}`,
+                                    title: `Draft · ${activePage.route} (${screenshotViewport})`,
+                                    highlights,
+                                  },
                           )
                         }
                       />
@@ -655,22 +677,29 @@ export function VisualReview({
 interface BeforeAfterWipeProps {
   liveUrl: string;
   draftUrl: string;
+  diffUrl?: string;
+  onRequestDiff?: () => void;
   route: string;
   viewport: 'mobile' | 'desktop';
   highlights: VisualDiffHighlightDto[];
-  onZoom: (side: 'live' | 'draft') => void;
+  onZoom: (side: 'live' | 'draft' | 'diff') => void;
 }
 
 function BeforeAfterWipe({
   liveUrl,
   draftUrl,
+  diffUrl,
+  onRequestDiff,
   route,
   highlights,
   onZoom,
 }: BeforeAfterWipeProps) {
   const [splitPct, setSplitPct] = useState(50);
+  const [showDiff, setShowDiff] = useState(false);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
+
+  const canShowDiff = Boolean(diffUrl || onRequestDiff);
 
   const updateFromClientX = (clientX: number) => {
     const rect = stageRef.current?.getBoundingClientRect();
@@ -685,9 +714,12 @@ function BeforeAfterWipe({
         <div className="inline-flex items-center gap-1 text-[11px]">
           <button
             type="button"
-            onClick={() => setSplitPct(100)}
+            onClick={() => {
+              setShowDiff(false);
+              setSplitPct(100);
+            }}
             className={`rounded px-1.5 py-0.5 font-medium transition ${
-              splitPct >= 85
+              !showDiff && splitPct >= 85
                 ? 'bg-stone-900 text-white'
                 : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
             }`}
@@ -696,9 +728,12 @@ function BeforeAfterWipe({
           </button>
           <button
             type="button"
-            onClick={() => setSplitPct(50)}
+            onClick={() => {
+              setShowDiff(false);
+              setSplitPct(50);
+            }}
             className={`rounded px-1.5 py-0.5 font-medium transition ${
-              splitPct > 15 && splitPct < 85
+              !showDiff && splitPct > 15 && splitPct < 85
                 ? 'bg-stone-200 text-stone-800'
                 : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
             }`}
@@ -707,152 +742,200 @@ function BeforeAfterWipe({
           </button>
           <button
             type="button"
-            onClick={() => setSplitPct(0)}
+            onClick={() => {
+              setShowDiff(false);
+              setSplitPct(0);
+            }}
             className={`rounded px-1.5 py-0.5 font-medium transition ${
-              splitPct <= 15
+              !showDiff && splitPct <= 15
                 ? 'bg-amber-600 text-white'
                 : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
             }`}
           >
             Draft
           </button>
-          <span className="hidden sm:inline text-[10px] text-stone-400 ml-1">
-            Drag to wipe
-          </span>
+          {canShowDiff && (
+            <button
+              type="button"
+              onClick={() => {
+                setShowDiff(true);
+                if (!diffUrl) onRequestDiff?.();
+              }}
+              className={`rounded px-1.5 py-0.5 font-medium transition ${
+                showDiff
+                  ? 'bg-rose-600 text-white'
+                  : 'text-stone-500 hover:bg-stone-200/70 hover:text-stone-900'
+              }`}
+            >
+              Diff
+            </button>
+          )}
+          {!showDiff && (
+            <span className="hidden sm:inline text-[10px] text-stone-400 ml-1">
+              Drag to wipe
+            </span>
+          )}
         </div>
 
         <button
           type="button"
-          onClick={() => onZoom(splitPct > 50 ? 'live' : 'draft')}
+          onClick={() =>
+            onZoom(showDiff && diffUrl ? 'diff' : splitPct > 50 ? 'live' : 'draft')
+          }
           className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-stone-500 hover:bg-stone-200/70 hover:text-stone-900"
         >
           <ZoomIn className="h-3 w-3" />
-          Zoom {splitPct > 50 ? 'Live' : 'Draft'}
+          Zoom {showDiff && diffUrl ? 'Diff' : splitPct > 50 ? 'Live' : 'Draft'}
         </button>
       </div>
 
-      <div
-        ref={stageRef}
-        role="slider"
-        tabIndex={0}
-        aria-label={`Compare Live and Draft screenshots for ${route}`}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={Math.round(splitPct)}
-        aria-valuetext={`${Math.round(splitPct)}% Live, ${Math.round(100 - splitPct)}% Draft`}
-        onPointerDown={(e) => {
-          draggingRef.current = true;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          updateFromClientX(e.clientX);
-        }}
-        onPointerMove={(e) => {
-          if (!draggingRef.current) return;
-          updateFromClientX(e.clientX);
-        }}
-        onPointerUp={(e) => {
-          draggingRef.current = false;
-          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-            e.currentTarget.releasePointerCapture(e.pointerId);
-          }
-        }}
-        onPointerCancel={() => {
-          draggingRef.current = false;
-        }}
-        onKeyDown={(e) => {
-          const step = e.shiftKey ? 1 : 5;
-          if (e.key === 'ArrowLeft') {
-            e.preventDefault();
-            setSplitPct((v) => Math.max(0, v - step));
-          } else if (e.key === 'ArrowRight') {
-            e.preventDefault();
-            setSplitPct((v) => Math.min(100, v + step));
-          } else if (e.key === 'Home') {
-            e.preventDefault();
-            setSplitPct(0);
-          } else if (e.key === 'End') {
-            e.preventDefault();
-            setSplitPct(100);
-          }
-        }}
-        className="relative select-none rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
-      >
-        {/* Inner clipped frame for images, highlights, and vertical divider line */}
-        <div className="relative overflow-hidden rounded-[7px]">
-          {/* Base layer: Draft screenshot + dual-color diff highlights */}
-          <img
-            src={draftUrl}
-            alt={`Draft ${route}`}
-            draggable={false}
-            className="block w-full pointer-events-none"
-          />
-          {highlights.map((h, idx) => (
-            <div
-              key={idx}
-              title={h.warning || h.file}
-              style={{
-                left: `${h.x}%`,
-                top: `${h.y}%`,
-                width: `${h.width}%`,
-                height: `${h.height}%`,
-              }}
-              className={`pointer-events-none absolute rounded border-2 ${
-                h.kind === 'merged_from_live'
-                  ? 'border-teal-500 bg-teal-500/15'
-                  : 'border-amber-500 bg-amber-500/15'
-              }`}
-            />
-          ))}
-
-          {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
-          <div
-            className="pointer-events-none absolute inset-0"
-            style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
-          >
-            <img
-              src={liveUrl}
-              alt={`Live ${route}`}
-              draggable={false}
-              className="block w-full"
-            />
-          </div>
-
-          {/* Vertical wipe divider line */}
-          <div
-            className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.35),0_2px_8px_rgba(0,0,0,0.4)]"
-            style={{ left: `${splitPct}%` }}
-          />
+      {showDiff ? (
+        <div className="relative overflow-hidden rounded-lg border border-stone-200 bg-white">
+          {diffUrl ? (
+            <>
+              <img
+                src={diffUrl}
+                alt={`Diff ${route}`}
+                draggable={false}
+                className="block w-full select-none"
+              />
+              <div className="pointer-events-none absolute top-2 left-2">
+                <span className="inline-flex items-center gap-1 rounded-full bg-rose-600/90 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm">
+                  Changed pixels
+                </span>
+              </div>
+            </>
+          ) : (
+            <div className="flex h-36 items-center justify-center gap-2 text-xs text-stone-500">
+              <Loader2 className="h-4 w-4 animate-spin text-rose-600" />
+              <span>Computing perceptual diff…</span>
+            </div>
+          )}
         </div>
-
-        {/* Sticky Live / Draft chips (stay visible while scrolling long screenshots) */}
-        <div className="pointer-events-none absolute inset-0 z-10 py-2">
-          <div className="sticky top-2 flex items-center justify-between px-2">
-            <span
-              className={`rounded-full bg-stone-900/80 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
-                splitPct < 14 ? 'opacity-0' : 'opacity-100'
-              }`}
-            >
-              Live
-            </span>
-            <span
-              className={`rounded-full bg-amber-600/90 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
-                splitPct > 86 ? 'opacity-0' : 'opacity-100'
-              }`}
-            >
-              Draft
-            </span>
-          </div>
-        </div>
-
-        {/* Sticky wipe drag handle (stays vertically reachable while scrolling long screenshots) */}
+      ) : (
         <div
-          className="pointer-events-none absolute inset-y-0 z-10 -translate-x-1/2 py-12"
-          style={{ left: `${splitPct}%` }}
+          ref={stageRef}
+          role="slider"
+          tabIndex={0}
+          aria-label={`Compare Live and Draft screenshots for ${route}`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(splitPct)}
+          aria-valuetext={`${Math.round(splitPct)}% Live, ${Math.round(100 - splitPct)}% Draft`}
+          onPointerDown={(e) => {
+            draggingRef.current = true;
+            e.currentTarget.setPointerCapture(e.pointerId);
+            updateFromClientX(e.clientX);
+          }}
+          onPointerMove={(e) => {
+            if (!draggingRef.current) return;
+            updateFromClientX(e.clientX);
+          }}
+          onPointerUp={(e) => {
+            draggingRef.current = false;
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+          }}
+          onPointerCancel={() => {
+            draggingRef.current = false;
+          }}
+          onKeyDown={(e) => {
+            const step = e.shiftKey ? 1 : 5;
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault();
+              setSplitPct((v) => Math.max(0, v - step));
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault();
+              setSplitPct((v) => Math.min(100, v + step));
+            } else if (e.key === 'Home') {
+              e.preventDefault();
+              setSplitPct(0);
+            } else if (e.key === 'End') {
+              e.preventDefault();
+              setSplitPct(100);
+            }
+          }}
+          className="relative select-none rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
         >
-          <div className="sticky top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-full border border-stone-300 bg-white text-stone-800 shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
-            <ChevronsLeftRight className="h-4 w-4" />
+          {/* Inner clipped frame for images, highlights, and vertical divider line */}
+          <div className="relative overflow-hidden rounded-[7px]">
+            {/* Base layer: Draft screenshot + dual-color diff highlights */}
+            <img
+              src={draftUrl}
+              alt={`Draft ${route}`}
+              draggable={false}
+              className="block w-full pointer-events-none"
+            />
+            {highlights.map((h, idx) => (
+              <div
+                key={idx}
+                title={h.warning || h.file}
+                style={{
+                  left: `${h.x}%`,
+                  top: `${h.y}%`,
+                  width: `${h.width}%`,
+                  height: `${h.height}%`,
+                }}
+                className={`pointer-events-none absolute rounded border-2 ${
+                  h.kind === 'merged_from_live'
+                    ? 'border-teal-500 bg-teal-500/15'
+                    : 'border-amber-500 bg-amber-500/15'
+                }`}
+              />
+            ))}
+
+            {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
+            <div
+              className="pointer-events-none absolute inset-0"
+              style={{ clipPath: `inset(0 ${100 - splitPct}% 0 0)` }}
+            >
+              <img
+                src={liveUrl}
+                alt={`Live ${route}`}
+                draggable={false}
+                className="block w-full"
+              />
+            </div>
+
+            {/* Vertical wipe divider line */}
+            <div
+              className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.35),0_2px_8px_rgba(0,0,0,0.4)]"
+              style={{ left: `${splitPct}%` }}
+            />
+          </div>
+
+          {/* Sticky Live / Draft chips (stay visible while scrolling long screenshots) */}
+          <div className="pointer-events-none absolute inset-0 z-10 py-2">
+            <div className="sticky top-2 flex items-center justify-between px-2">
+              <span
+                className={`rounded-full bg-stone-900/80 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
+                  splitPct < 14 ? 'opacity-0' : 'opacity-100'
+                }`}
+              >
+                Live
+              </span>
+              <span
+                className={`rounded-full bg-amber-600/90 px-2 py-0.5 text-[10px] font-semibold text-white shadow-sm backdrop-blur-sm transition-opacity ${
+                  splitPct > 86 ? 'opacity-0' : 'opacity-100'
+                }`}
+              >
+                Draft
+              </span>
+            </div>
+          </div>
+
+          {/* Sticky wipe drag handle (stays vertically reachable while scrolling long screenshots) */}
+          <div
+            className="pointer-events-none absolute inset-y-0 z-10 -translate-x-1/2 py-12"
+            style={{ left: `${splitPct}%` }}
+          >
+            <div className="sticky top-1/2 -translate-y-1/2 flex h-9 w-9 items-center justify-center rounded-full border border-stone-300 bg-white text-stone-800 shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
+              <ChevronsLeftRight className="h-4 w-4" />
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

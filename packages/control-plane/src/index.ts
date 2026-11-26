@@ -1193,8 +1193,6 @@ export function createControlPlane(
     }
     const rawViewport = c.req.query('viewport');
     const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
-    const rawMode = c.req.query('mode');
-    const mode = rawMode === 'full' ? 'full' : 'cropped';
 
     const qs = new URLSearchParams({ baseRef: `origin/${s.base_branch}` });
     const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
@@ -1230,7 +1228,6 @@ export function createControlPlane(
       liveBaseUrl,
       baseSha: data.baseSha ?? s.base_sha,
       viewport: screenshotViewport,
-      mode,
       liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
     });
 

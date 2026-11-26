@@ -1,7 +1,8 @@
-import type { VisualDiffHighlightDto, VisualDiffHunkDto, VisualDiffViewportShotDto } from '@halley/shared';
-import sharp from 'sharp';
+import type { VisualDiffHighlightDto } from '@halley/shared';
 
-export const CHANNEL_TOLERANCE = 12;
+export const PERCEPTUAL_THRESHOLD = 0.12;
+export const MAX_YIQ_DELTA = 35215 * PERCEPTUAL_THRESHOLD * PERCEPTUAL_THRESHOLD;
+export const FAST_EQUAL_CHANNEL_TOLERANCE = 6;
 export const MAX_NOISE_PIXELS_PER_ROW = 2;
 export const PADDING_Y = 96;
 export const PADDING_X = 96;
@@ -13,10 +14,34 @@ export const MAX_HUNKS_PER_PAGE = 4;
 export const MAX_HUNK_HEIGHT = 1800;
 export const DRAFT_ONLY_PREVIEW_HEIGHT = 1400;
 
-interface DecodedImage {
-  data: Buffer;
+export interface RgbaImage {
+  data: Uint8ClampedArray | Uint8Array;
   width: number;
   height: number;
+}
+
+export interface PlannedHunk {
+  id: string;
+  draftCropY: number;
+  draftCropHeight: number;
+  liveCropY?: number;
+  liveCropHeight?: number;
+  cropX: number;
+  cropWidth: number;
+  alignedHeight: number;
+  unchangedBeforePx: number;
+  highlights: VisualDiffHighlightDto[];
+}
+
+export interface PerceptualDiffPlan {
+  identical: boolean;
+  hunks: PlannedHunk[];
+  unchangedAfterPx: number;
+  fullWidth: number;
+  fullHeight: number;
+  alignedFullHeight: number;
+  hasFullPage: boolean;
+  fullHighlights: VisualDiffHighlightDto[];
 }
 
 interface UnchangedBand {
@@ -32,40 +57,200 @@ interface HunkSpan {
   draftEnd: number;
 }
 
-async function decodeRgba(buf: Buffer): Promise<DecodedImage | null> {
-  try {
-    const { data, info } = await sharp(buf)
-      .ensureAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    if (!info.width || !info.height || data.length < info.width * info.height * 4) {
-      return null;
-    }
-    return { data, width: info.width, height: info.height };
-  } catch {
-    return null;
-  }
+function blendOverWhite(c: number, a: number): number {
+  return 255 + ((c - 255) * a) / 255;
 }
 
-function rowsMatch(
-  a: Buffer,
-  b: Buffer,
+/**
+ * Kotsarenko & Ramos (2010) YIQ NTSC perceptual color difference.
+ * Returns signed squared delta (sign matches brightness delta dy so AA
+ * checks can distinguish darker vs brighter neighbors).
+ */
+export function perceptualColorDelta(
+  img1: Uint8ClampedArray | Uint8Array,
+  img2: Uint8ClampedArray | Uint8Array,
+  k1: number,
+  k2: number,
+  yOnly = false,
+): number {
+  let r1 = img1[k1]!;
+  let g1 = img1[k1 + 1]!;
+  let b1 = img1[k1 + 2]!;
+  const a1 = img1[k1 + 3]!;
+
+  let r2 = img2[k2]!;
+  let g2 = img2[k2 + 1]!;
+  let b2 = img2[k2 + 2]!;
+  const a2 = img2[k2 + 3]!;
+
+  if (a1 === a2 && r1 === r2 && g1 === g2 && b1 === b2) return 0;
+
+  if (a1 < 255) {
+    r1 = blendOverWhite(r1, a1);
+    g1 = blendOverWhite(g1, a1);
+    b1 = blendOverWhite(b1, a1);
+  }
+  if (a2 < 255) {
+    r2 = blendOverWhite(r2, a2);
+    g2 = blendOverWhite(g2, a2);
+    b2 = blendOverWhite(b2, a2);
+  }
+
+  const y1 = r1 * 0.29889531 + g1 * 0.58662247 + b1 * 0.11448223;
+  const y2 = r2 * 0.29889531 + g2 * 0.58662247 + b2 * 0.11448223;
+  const dy = y1 - y2;
+  if (yOnly) return dy;
+
+  const i1 = r1 * 0.59597799 - g1 * 0.2741761 - b1 * 0.32180189;
+  const i2 = r2 * 0.59597799 - g2 * 0.2741761 - b2 * 0.32180189;
+  const q1 = r1 * 0.21147017 - g1 * 0.52261711 + b1 * 0.31114694;
+  const q2 = r2 * 0.21147017 - g2 * 0.52261711 + b2 * 0.31114694;
+
+  const di = i1 - i2;
+  const dq = q1 - q2;
+  const delta = 0.5053 * dy * dy + 0.299 * di * di + 0.1957 * dq * dq;
+  return dy > 0 ? -delta : delta;
+}
+
+function hasManySiblings(
+  img: Uint8ClampedArray | Uint8Array,
+  x1: number,
+  y1: number,
   width: number,
+  height: number,
+): boolean {
+  const x0 = Math.max(x1 - 1, 0);
+  const y0 = Math.max(y1 - 1, 0);
+  const x2 = Math.min(x1 + 1, width - 1);
+  const y2 = Math.min(y1 + 1, height - 1);
+  const pos = (y1 * width + x1) * 4;
+  let zeroes = x1 === x0 || x1 === x2 || y1 === y0 || y1 === y2 ? 1 : 0;
+
+  for (let x = x0; x <= x2; x++) {
+    for (let y = y0; y <= y2; y++) {
+      if (x === x1 && y === y1) continue;
+      const pos2 = (y * width + x) * 4;
+      if (
+        img[pos] === img[pos2] &&
+        img[pos + 1] === img[pos2 + 1] &&
+        img[pos + 2] === img[pos2 + 2] &&
+        img[pos + 3] === img[pos2 + 3]
+      ) {
+        zeroes += 1;
+        if (zeroes > 2) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Vysniauskas (2009) 3x3 anti-aliasing detector adapted for arbitrary vertical alignment
+ * (y1 in img1 paired with y2 in img2).
+ */
+export function isAntiAliased(
+  img: RgbaImage,
+  x1: number,
+  y1: number,
+  img2: RgbaImage,
+  y2: number,
+): boolean {
+  const { width, height, data } = img;
+  const x0 = Math.max(x1 - 1, 0);
+  const y0 = Math.max(y1 - 1, 0);
+  const x2 = Math.min(x1 + 1, width - 1);
+  const y2Bound = Math.min(y1 + 1, height - 1);
+  const pos = (y1 * width + x1) * 4;
+  let zeroes = x1 === x0 || x1 === x2 || y1 === y0 || y1 === y2Bound ? 1 : 0;
+  let min = 0;
+  let max = 0;
+  let minX = 0;
+  let minY = 0;
+  let maxX = 0;
+  let maxY = 0;
+
+  for (let x = x0; x <= x2; x++) {
+    for (let y = y0; y <= y2Bound; y++) {
+      if (x === x1 && y === y1) continue;
+      const delta = perceptualColorDelta(data, data, pos, (y * width + x) * 4, true);
+      if (delta === 0) {
+        zeroes += 1;
+        if (zeroes > 2) return false;
+      } else if (delta < min) {
+        min = delta;
+        minX = x;
+        minY = y;
+      } else if (delta > max) {
+        max = delta;
+        maxX = x;
+        maxY = y;
+      }
+    }
+  }
+
+  if (min === 0 || max === 0) return false;
+
+  const minY2 = Math.max(0, Math.min(img2.height - 1, y2 + (minY - y1)));
+  const maxY2 = Math.max(0, Math.min(img2.height - 1, y2 + (maxY - y1)));
+
+  return (
+    (hasManySiblings(data, minX, minY, width, height) &&
+      hasManySiblings(img2.data, minX, minY2, img2.width, img2.height)) ||
+    (hasManySiblings(data, maxX, maxY, width, height) &&
+      hasManySiblings(img2.data, maxX, maxY2, img2.width, img2.height))
+  );
+}
+
+/**
+ * Returns true if pixel (x, yA) in imgA and (x, yB) in imgB differ perceptually
+ * (exceeding YIQ threshold and not an anti-aliased edge pixel).
+ */
+export function isPerceptualPixelDiff(
+  imgA: RgbaImage,
+  imgB: RgbaImage,
+  x: number,
   yA: number,
   yB: number,
-  tolerance = CHANNEL_TOLERANCE,
+  maxDelta = MAX_YIQ_DELTA,
+): boolean {
+  const kA = (yA * imgA.width + x) * 4;
+  const kB = (yB * imgB.width + x) * 4;
+  const dA = imgA.data;
+  const dB = imgB.data;
+
+  // Fast path: skip near-identical RGB/A pixels without floating-point YIQ math
+  if (
+    Math.abs(dA[kA]! - dB[kB]!) <= FAST_EQUAL_CHANNEL_TOLERANCE &&
+    Math.abs(dA[kA + 1]! - dB[kB + 1]!) <= FAST_EQUAL_CHANNEL_TOLERANCE &&
+    Math.abs(dA[kA + 2]! - dB[kB + 2]!) <= FAST_EQUAL_CHANNEL_TOLERANCE &&
+    Math.abs(dA[kA + 3]! - dB[kB + 3]!) <= FAST_EQUAL_CHANNEL_TOLERANCE
+  ) {
+    return false;
+  }
+
+  const delta = perceptualColorDelta(dA, dB, kA, kB, false);
+  if (Math.abs(delta) <= maxDelta) {
+    return false;
+  }
+
+  if (isAntiAliased(imgA, x, yA, imgB, yB) || isAntiAliased(imgB, x, yB, imgA, yA)) {
+    return false;
+  }
+
+  return true;
+}
+
+function rowsMatchPerceptual(
+  live: RgbaImage,
+  draft: RgbaImage,
+  yL: number,
+  yD: number,
   maxNoisePixels = MAX_NOISE_PIXELS_PER_ROW,
 ): boolean {
-  const rowBytes = width * 4;
-  const offA = yA * rowBytes;
-  const offB = yB * rowBytes;
+  const width = live.width;
   let bad = 0;
-  for (let i = 0; i < rowBytes; i += 4) {
-    const dr = Math.abs(a[offA + i]! - b[offB + i]!);
-    const dg = Math.abs(a[offA + i + 1]! - b[offB + i + 1]!);
-    const db = Math.abs(a[offA + i + 2]! - b[offB + i + 2]!);
-    const da = Math.abs(a[offA + i + 3]! - b[offB + i + 3]!);
-    if (dr > tolerance || dg > tolerance || db > tolerance || da > tolerance) {
+  for (let x = 0; x < width; x++) {
+    if (isPerceptualPixelDiff(live, draft, x, yL, yD)) {
       bad += 1;
       if (bad > maxNoisePixels) return false;
     }
@@ -73,12 +258,7 @@ function rowsMatch(
   return true;
 }
 
-/**
- * Computes a quantized 32-bit FNV-1a row signature (robust to minor anti-aliasing jitter)
- * plus a flag indicating whether the row has meaningful horizontal structure
- * (preventing flat solid-color whitespace rows from becoming false anchors).
- */
-function computeRowSignatures(img: DecodedImage, startY: number, endY: number): {
+function computeRowSignatures(img: RgbaImage, startY: number, endY: number): {
   hashes: Uint32Array;
   structured: Uint8Array;
 } {
@@ -122,7 +302,7 @@ function computeRowSignatures(img: DecodedImage, startY: number, endY: number): 
       prevG = mg;
       prevB = mb;
 
-      // Quantize to 4 bits per channel so +/- 7 anti-aliasing jitter hashes identically
+      // Quantize to 4 bits per channel so minor WebP/AA jitter hashes identically
       const q = ((mr >> 4) << 8) | ((mg >> 4) << 4) | (mb >> 4);
       hash ^= q;
       hash = Math.imul(hash, 16777619) >>> 0;
@@ -139,7 +319,6 @@ function longestIncreasingAnchorPairs(
   pairs: Array<{ liveY: number; draftY: number }>,
 ): Array<{ liveY: number; draftY: number }> {
   if (pairs.length <= 1) return pairs;
-  // Pairs are already sorted by liveY ascending; find LIS on draftY
   const n = pairs.length;
   const tails: number[] = [];
   const prev = new Int32Array(n).fill(-1);
@@ -167,14 +346,9 @@ function longestIncreasingAnchorPairs(
   return out;
 }
 
-/**
- * Finds unchanged horizontal bands of at least MIN_UNCHANGED_BAND_PX rows between
- * Live [liveStart..liveEnd) and Draft [draftStart..draftEnd), even when height shifts
- * above cause liveY !== draftY.
- */
 function findMiddleUnchangedBands(
-  live: DecodedImage,
-  draft: DecodedImage,
+  live: RgbaImage,
+  draft: RgbaImage,
   liveStart: number,
   liveEnd: number,
   draftStart: number,
@@ -186,11 +360,9 @@ function findMiddleUnchangedBands(
     return [];
   }
 
-  const width = live.width;
   const liveSig = computeRowSignatures(live, liveStart, liveEnd);
   const draftSig = computeRowSignatures(draft, draftStart, draftEnd);
 
-  // 1. Patience-style unique structured row anchors
   const liveUnique = new Map<number, number>();
   const liveDup = new Set<number>();
   for (let i = 0; i < liveSig.hashes.length; i++) {
@@ -235,18 +407,18 @@ function findMiddleUnchangedBands(
 
   for (const anchor of anchors) {
     if (anchor.liveY < curLiveMin || anchor.draftY < curDraftMin) continue;
-    if (!rowsMatch(live.data, draft.data, width, anchor.liveY, anchor.draftY)) continue;
+    if (!rowsMatchPerceptual(live, draft, anchor.liveY, anchor.draftY)) continue;
 
     let lTop = anchor.liveY;
     let dTop = anchor.draftY;
-    while (lTop > curLiveMin && dTop > curDraftMin && rowsMatch(live.data, draft.data, width, lTop - 1, dTop - 1)) {
+    while (lTop > curLiveMin && dTop > curDraftMin && rowsMatchPerceptual(live, draft, lTop - 1, dTop - 1)) {
       lTop -= 1;
       dTop -= 1;
     }
 
     let lBot = anchor.liveY + 1;
     let dBot = anchor.draftY + 1;
-    while (lBot < liveEnd && dBot < draftEnd && rowsMatch(live.data, draft.data, width, lBot, dBot)) {
+    while (lBot < liveEnd && dBot < draftEnd && rowsMatchPerceptual(live, draft, lBot, dBot)) {
       lBot += 1;
       dBot += 1;
     }
@@ -259,8 +431,7 @@ function findMiddleUnchangedBands(
     }
   }
 
-  // 2. Fallback scan for equal-offset unchanged bands in any remaining large gap
-  //    (covers pages where unchanged sections consist of repeated/non-unique rows)
+  // Fallback scan for equal-offset unchanged bands in remaining large gaps
   const gapBounds: Array<{ l0: number; l1: number; d0: number; d1: number }> = [];
   let prevL = liveStart;
   let prevD = draftStart;
@@ -277,7 +448,6 @@ function findMiddleUnchangedBands(
     const gD = g.d1 - g.d0;
     if (gL < MIN_UNCHANGED_BAND_PX || gD < MIN_UNCHANGED_BAND_PX) continue;
 
-    // Try candidate vertical shifts: 0 (same Y) and (gD - gL) (aligned to bottom of gap)
     const shifts = gD === gL ? [0] : [gD - gL, 0];
     let bestBand: UnchangedBand | null = null;
     for (const shift of shifts) {
@@ -293,7 +463,7 @@ function findMiddleUnchangedBands(
           runLen = 0;
           continue;
         }
-        if (rowsMatch(live.data, draft.data, width, lY, dY)) {
+        if (rowsMatchPerceptual(live, draft, lY, dY)) {
           if (runStartL < 0) runStartL = lY;
           runLen += 1;
         } else {
@@ -320,8 +490,8 @@ function findMiddleUnchangedBands(
 }
 
 function computeHorizontalCrop(
-  live: DecodedImage,
-  draft: DecodedImage,
+  live: RgbaImage,
+  draft: RgbaImage,
   span: HunkSpan,
 ): { cropX: number; cropWidth: number } {
   const width = draft.width;
@@ -332,32 +502,26 @@ function computeHorizontalCrop(
   const liveH = Math.max(0, span.liveEnd - span.liveStart);
   const draftH = Math.max(0, span.draftEnd - span.draftStart);
   const overlapH = Math.min(liveH, draftH);
-  const rowBytes = width * 4;
 
   let minX = width;
   let maxX = -1;
 
   for (let r = 0; r < overlapH; r++) {
-    const offL = (span.liveStart + r) * rowBytes;
-    const offD = (span.draftStart + r) * rowBytes;
+    const yL = span.liveStart + r;
+    const yD = span.draftStart + r;
     for (let x = 0; x < width; x++) {
-      const i = x * 4;
-      const dr = Math.abs(live.data[offL + i]! - draft.data[offD + i]!);
-      const dg = Math.abs(live.data[offL + i + 1]! - draft.data[offD + i + 1]!);
-      const db = Math.abs(live.data[offL + i + 2]! - draft.data[offD + i + 2]!);
-      const da = Math.abs(live.data[offL + i + 3]! - draft.data[offD + i + 3]!);
-      if (dr > CHANNEL_TOLERANCE || dg > CHANNEL_TOLERANCE || db > CHANNEL_TOLERANCE || da > CHANNEL_TOLERANCE) {
+      if (isPerceptualPixelDiff(live, draft, x, yL, yD)) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
       }
     }
   }
 
-  // Also inspect any extra added/removed rows beyond overlapH relative to their edge background
   if (liveH !== draftH) {
     const taller = draftH > liveH ? draft : live;
     const extraStart = (draftH > liveH ? span.draftStart : span.liveStart) + overlapH;
     const extraEnd = draftH > liveH ? span.draftEnd : span.liveEnd;
+    const rowBytes = width * 4;
     for (let y = extraStart; y < extraEnd; y++) {
       const off = y * rowBytes;
       const bgR = taller.data[off]!;
@@ -366,9 +530,9 @@ function computeHorizontalCrop(
       for (let x = 0; x < width; x++) {
         const i = off + x * 4;
         if (
-          Math.abs(taller.data[i]! - bgR) > CHANNEL_TOLERANCE ||
-          Math.abs(taller.data[i + 1]! - bgG) > CHANNEL_TOLERANCE ||
-          Math.abs(taller.data[i + 2]! - bgB) > CHANNEL_TOLERANCE
+          Math.abs(taller.data[i]! - bgR) > 14 ||
+          Math.abs(taller.data[i + 1]! - bgG) > 14 ||
+          Math.abs(taller.data[i + 2]! - bgB) > 14
         ) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
@@ -396,7 +560,7 @@ function computeHorizontalCrop(
   return { cropX: left, cropWidth: cropW };
 }
 
-function remapHighlights(
+export function remapHighlights(
   highlights: VisualDiffHighlightDto[],
   fullWidth: number,
   fullHeight: number,
@@ -438,200 +602,73 @@ function remapHighlights(
   return out;
 }
 
-async function cropAndPadWebp(
-  srcBuf: Buffer,
-  cropX: number,
-  cropY: number,
-  cropWidth: number,
-  cropHeight: number,
-  alignedHeight: number,
-): Promise<string> {
-  const safeH = Math.max(1, cropHeight);
-  const safeW = Math.max(1, cropWidth);
-  const extracted = await sharp(srcBuf)
-    .extract({ left: cropX, top: cropY, width: safeW, height: safeH })
-    .png()
-    .toBuffer();
-
-  if (alignedHeight <= safeH) {
-    const webp = await sharp(extracted).webp({ quality: 82 }).toBuffer();
-    return `data:image/webp;base64,${webp.toString('base64')}`;
-  }
-
-  const padBottom = alignedHeight - safeH;
-  // Subtle neutral footer (#F5F5F4 stone-100) with a 1px #D6D3D1 hairline at the cut boundary
-  const hairline = await sharp({
-    create: {
-      width: safeW,
-      height: 1,
-      channels: 4,
-      background: { r: 214, g: 211, b: 209, alpha: 1 },
-    },
-  })
-    .png()
-    .toBuffer();
-
-  const webp = await sharp(extracted)
-    .extend({
-      top: 0,
-      bottom: padBottom,
-      left: 0,
-      right: 0,
-      background: { r: 245, g: 245, b: 244, alpha: 1 },
-    })
-    .composite([{ input: hairline, left: 0, top: safeH }])
-    .webp({ quality: 82 })
-    .toBuffer();
-
-  return `data:image/webp;base64,${webp.toString('base64')}`;
-}
-
-export async function encodeFullWebpDataUrl(buf: Buffer): Promise<string> {
-  try {
-    const webp = await sharp(buf).webp({ quality: 80 }).toBuffer();
-    return `data:image/webp;base64,${webp.toString('base64')}`;
-  } catch {
-    return `data:image/jpeg;base64,${buf.toString('base64')}`;
-  }
-}
-
-export interface BuildReviewShotInput {
-  draftBuf: Buffer;
-  liveBuf?: Buffer;
-  highlights: VisualDiffHighlightDto[];
-  fallbackWidth: number;
-  fallbackHeight: number;
-  mode: 'cropped' | 'full';
-}
-
 /**
- * Builds a VisualDiffViewportShotDto from raw PNG (or fallback) Draft & Live captures.
- * - mode='full': encodes full page WebP (padded at bottom if Live & Draft heights differ)
- * - mode='cropped' with no Live: returns a top-of-page preview (0..1400px) + hasFullPage flag
- * - mode='cropped' with Live: runs top-down + bottom-up + anchored middle-band alignment,
- *   splits unchanged gaps >= 240px into up to 4 padded hunks, trims desktop X with 640px min width,
- *   pads height-mismatched hunks at the bottom, and remaps highlights per hunk.
+ * Plans cropped hunks and full-page alignment using YIQ perceptual diffing + 3x3 AA detection.
  */
-export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<VisualDiffViewportShotDto> {
-  const { draftBuf, liveBuf, highlights, fallbackWidth, fallbackHeight, mode } = input;
+export function computePerceptualDiffPlan(
+  draft: RgbaImage,
+  live: RgbaImage | null,
+  highlights: VisualDiffHighlightDto[],
+): PerceptualDiffPlan {
+  const width = draft.width;
+  const hDraft = draft.height;
 
-  const draftImg = await decodeRgba(draftBuf);
-  if (!draftImg) {
-    // Graceful fallback for synthetic test buffers (non-image bytes)
-    const draftUrl = `data:image/jpeg;base64,${draftBuf.toString('base64')}`;
-    const liveUrl = liveBuf ? `data:image/jpeg;base64,${liveBuf.toString('base64')}` : undefined;
-    return {
-      draftScreenshotDataUrl: draftUrl,
-      liveScreenshotDataUrl: liveUrl,
-      highlights,
-      width: fallbackWidth,
-      height: fallbackHeight,
-      fullWidth: fallbackWidth,
-      fullHeight: fallbackHeight,
-      hasFullPage: false,
-    };
-  }
-
-  const liveImg = liveBuf ? await decodeRgba(liveBuf) : null;
-
-  // Full-page mode: return full Live + Draft aligned to max height
-  if (mode === 'full') {
-    const fullW = draftImg.width;
-    const fullH = liveImg ? Math.max(draftImg.height, liveImg.height) : draftImg.height;
-    const draftUrl = await cropAndPadWebp(draftBuf, 0, 0, fullW, draftImg.height, fullH);
-    const liveUrl =
-      liveImg && liveBuf && liveImg.width === fullW
-        ? await cropAndPadWebp(liveBuf, 0, 0, fullW, liveImg.height, fullH)
-        : liveBuf
-          ? await encodeFullWebpDataUrl(liveBuf)
-          : undefined;
-
-    const remapped = remapHighlights(highlights, draftImg.width, draftImg.height, 0, 0, fullW, fullH);
-    return {
-      draftScreenshotDataUrl: draftUrl,
-      liveScreenshotDataUrl: liveUrl,
-      highlights: remapped,
-      width: fullW,
-      height: fullH,
-      fullWidth: draftImg.width,
-      fullHeight: draftImg.height,
-      hasFullPage: true,
-    };
-  }
-
-  // Cropped mode — Draft-only (no Live capture available or mismatched viewport width)
-  if (!liveImg || !liveBuf || liveImg.width !== draftImg.width) {
-    const previewH = Math.min(draftImg.height, DRAFT_ONLY_PREVIEW_HEIGHT);
-    const unchangedAfterPx = Math.max(0, draftImg.height - previewH);
-    const draftUrl = await cropAndPadWebp(draftBuf, 0, 0, draftImg.width, previewH, previewH);
-    const remapped = remapHighlights(
-      highlights,
-      draftImg.width,
-      draftImg.height,
-      0,
-      0,
-      draftImg.width,
-      previewH,
-    );
-    const hunk: VisualDiffHunkDto = {
+  // Draft-only fallback (no Live image or mismatched width): top 0..1400px preview
+  if (!live || live.width !== width) {
+    const previewH = Math.min(hDraft, DRAFT_ONLY_PREVIEW_HEIGHT);
+    const unchangedAfterPx = Math.max(0, hDraft - previewH);
+    const hunk: PlannedHunk = {
       id: 'hunk-0',
-      draftScreenshotDataUrl: draftUrl,
-      highlights: remapped,
-      width: draftImg.width,
-      height: previewH,
       draftCropY: 0,
       draftCropHeight: previewH,
       cropX: 0,
-      cropWidth: draftImg.width,
+      cropWidth: width,
+      alignedHeight: previewH,
       unchangedBeforePx: 0,
+      highlights: remapHighlights(highlights, width, hDraft, 0, 0, width, previewH),
     };
     return {
-      draftScreenshotDataUrl: draftUrl,
-      highlights: remapped,
-      width: draftImg.width,
-      height: previewH,
+      identical: false,
       hunks: [hunk],
       unchangedAfterPx,
-      identical: false,
-      fullWidth: draftImg.width,
-      fullHeight: draftImg.height,
+      fullWidth: width,
+      fullHeight: hDraft,
+      alignedFullHeight: hDraft,
       hasFullPage: unchangedAfterPx > 0,
+      fullHighlights: highlights,
     };
   }
 
-  // Cropped mode — Live vs Draft pixel diffing
-  const width = draftImg.width;
-  const hLive = liveImg.height;
-  const hDraft = draftImg.height;
+  const hLive = live.height;
+  const alignedFullHeight = Math.max(hDraft, hLive);
+  const fullHighlights = remapHighlights(highlights, width, hDraft, 0, 0, width, alignedFullHeight);
   const minH = Math.min(hLive, hDraft);
 
-  // 1. Top-down trim
+  // 1. Top-down perceptual trim
   let topTrim = 0;
-  while (topTrim < minH && rowsMatch(liveImg.data, draftImg.data, width, topTrim, topTrim)) {
+  while (topTrim < minH && rowsMatchPerceptual(live, draft, topTrim, topTrim)) {
     topTrim += 1;
   }
 
-  // Identical full page
   if (topTrim === hLive && hLive === hDraft) {
     return {
-      highlights: [],
-      width,
-      height: 0,
+      identical: true,
       hunks: [],
       unchangedAfterPx: 0,
-      identical: true,
       fullWidth: width,
       fullHeight: hDraft,
+      alignedFullHeight,
       hasFullPage: true,
+      fullHighlights,
     };
   }
 
-  // 2. Bottom-up trim (matching rows from the bottom of both images, resilient to height shifts)
+  // 2. Bottom-up perceptual trim (resilient to height shifts)
   let bottomTrim = 0;
   const maxBottom = Math.min(hLive - topTrim, hDraft - topTrim);
   while (
     bottomTrim < maxBottom &&
-    rowsMatch(liveImg.data, draftImg.data, width, hLive - 1 - bottomTrim, hDraft - 1 - bottomTrim)
+    rowsMatchPerceptual(live, draft, hLive - 1 - bottomTrim, hDraft - 1 - bottomTrim)
   ) {
     bottomTrim += 1;
   }
@@ -641,15 +678,14 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
 
   // 3. Anchored middle-band alignment for multi-hunk splitting
   const middleBands = findMiddleUnchangedBands(
-    liveImg,
-    draftImg,
+    live,
+    draft,
     topTrim,
     activeLiveEnd,
     topTrim,
     activeDraftEnd,
   );
 
-  // Convert unchanged bands into changed hunk spans
   const rawSpans: HunkSpan[] = [];
   let curL = topTrim;
   let curD = topTrim;
@@ -674,7 +710,6 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
     });
   }
 
-  // Fallback safety if spans somehow ended empty despite height diff
   if (rawSpans.length === 0) {
     rawSpans.push({
       liveStart: topTrim,
@@ -684,7 +719,7 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
     });
   }
 
-  // 4. Expand each span by PADDING_Y (clamped) and merge overlapping/tiny-gap hunks
+  // 4. Pad vertically and merge overlapping / tiny-gap intervals
   const paddedSpans: HunkSpan[] = rawSpans.map((s) => ({
     liveStart: Math.max(0, s.liveStart - PADDING_Y),
     liveEnd: Math.min(hLive, s.liveEnd + PADDING_Y),
@@ -706,7 +741,7 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
     }
   }
 
-  // 5. Enforce MAX_HUNKS_PER_PAGE by coalescing smallest unchanged gaps
+  // 5. Coalesce to MAX_HUNKS_PER_PAGE
   while (merged.length > MAX_HUNKS_PER_PAGE) {
     let bestIdx = 0;
     let bestGap = Number.POSITIVE_INFINITY;
@@ -724,17 +759,15 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
     merged.splice(bestIdx + 1, 1);
   }
 
-  // 6. Render cropped, aligned WebP hunks
-  const hunks: VisualDiffHunkDto[] = [];
+  // 6. Plan each hunk's X/Y crop, aligned height, and remapped highlights
+  const hunks: PlannedHunk[] = [];
   let prevDraftEnd = 0;
 
   for (let i = 0; i < merged.length; i++) {
     const s = merged[i]!;
-    const rawDraftH = Math.max(1, s.draftEnd - s.draftStart);
-    const rawLiveH = Math.max(1, s.liveEnd - s.liveStart);
-    const draftCropH = Math.min(rawDraftH, MAX_HUNK_HEIGHT);
-    const liveCropH = Math.min(rawLiveH, MAX_HUNK_HEIGHT);
-    const alignedH = Math.max(draftCropH, liveCropH);
+    const draftCropH = Math.min(Math.max(1, s.draftEnd - s.draftStart), MAX_HUNK_HEIGHT);
+    const liveCropH = Math.min(Math.max(1, s.liveEnd - s.liveStart), MAX_HUNK_HEIGHT);
+    const alignedHeight = Math.max(draftCropH, liveCropH);
 
     const clampedSpan: HunkSpan = {
       liveStart: s.liveStart,
@@ -743,56 +776,130 @@ export async function buildVisualDiffShot(input: BuildReviewShotInput): Promise<
       draftEnd: s.draftStart + draftCropH,
     };
 
-    const { cropX, cropWidth } = computeHorizontalCrop(liveImg, draftImg, clampedSpan);
-    const [draftUrl, liveUrl] = await Promise.all([
-      cropAndPadWebp(draftBuf, cropX, clampedSpan.draftStart, cropWidth, draftCropH, alignedH),
-      cropAndPadWebp(liveBuf, cropX, clampedSpan.liveStart, cropWidth, liveCropH, alignedH),
-    ]);
-
-    const hunkHighlights = remapHighlights(
-      highlights,
-      width,
-      hDraft,
-      cropX,
-      clampedSpan.draftStart,
-      cropWidth,
-      alignedH,
-    );
-
+    const { cropX, cropWidth } = computeHorizontalCrop(live, draft, clampedSpan);
     const unchangedBeforePx = Math.max(0, clampedSpan.draftStart - prevDraftEnd);
     prevDraftEnd = clampedSpan.draftEnd;
 
     hunks.push({
       id: `hunk-${i}`,
-      draftScreenshotDataUrl: draftUrl,
-      liveScreenshotDataUrl: liveUrl,
-      highlights: hunkHighlights,
-      width: cropWidth,
-      height: alignedH,
       draftCropY: clampedSpan.draftStart,
       draftCropHeight: draftCropH,
       liveCropY: clampedSpan.liveStart,
       liveCropHeight: liveCropH,
       cropX,
       cropWidth,
+      alignedHeight,
       unchangedBeforePx,
+      highlights: remapHighlights(
+        highlights,
+        width,
+        hDraft,
+        cropX,
+        clampedSpan.draftStart,
+        cropWidth,
+        alignedHeight,
+      ),
     });
   }
 
-  const unchangedAfterPx = Math.max(0, hDraft - prevDraftEnd);
-  const firstHunk = hunks[0]!;
-
   return {
-    draftScreenshotDataUrl: firstHunk.draftScreenshotDataUrl,
-    liveScreenshotDataUrl: firstHunk.liveScreenshotDataUrl,
-    highlights: firstHunk.highlights,
-    width: firstHunk.width,
-    height: firstHunk.height,
-    hunks,
-    unchangedAfterPx,
     identical: false,
+    hunks,
+    unchangedAfterPx: Math.max(0, hDraft - prevDraftEnd),
     fullWidth: width,
     fullHeight: hDraft,
+    alignedFullHeight,
     hasFullPage: true,
+    fullHighlights,
   };
+}
+
+/**
+ * Renders a visual perceptual diff RGBA buffer:
+ * - Unchanged / anti-aliased pixels: dimmed Draft (~25% opacity over white) for page context
+ * - Perceptually changed pixels (and added/removed height rows): crisp rose (#E11D48)
+ */
+export function renderPerceptualDiffRgba(
+  draft: RgbaImage,
+  live: RgbaImage,
+  opts: {
+    cropX: number;
+    cropWidth: number;
+    draftCropY: number;
+    draftCropHeight: number;
+    liveCropY: number;
+    liveCropHeight: number;
+    alignedHeight: number;
+  },
+): Uint8ClampedArray {
+  const { cropX, cropWidth, draftCropY, draftCropHeight, liveCropY, liveCropHeight, alignedHeight } =
+    opts;
+  const out = new Uint8ClampedArray(cropWidth * alignedHeight * 4);
+  const overlapH = Math.min(draftCropHeight, liveCropHeight);
+
+  for (let row = 0; row < alignedHeight; row++) {
+    const yD = draftCropY + row;
+    const yL = liveCropY + row;
+    const inDraft = row < draftCropHeight && yD < draft.height;
+    const inLive = row < liveCropHeight && yL < live.height;
+
+    for (let col = 0; col < cropWidth; col++) {
+      const x = cropX + col;
+      const outIdx = (row * cropWidth + col) * 4;
+
+      if (row < overlapH && inDraft && inLive) {
+        if (isPerceptualPixelDiff(live, draft, x, yL, yD)) {
+          // Crisp rose/magenta (#E11D48)
+          out[outIdx] = 225;
+          out[outIdx + 1] = 29;
+          out[outIdx + 2] = 72;
+          out[outIdx + 3] = 255;
+        } else {
+          // Dimmed (~25% opacity) softly desaturated Draft over white for calm context
+          const dIdx = (yD * draft.width + x) * 4;
+          const r = draft.data[dIdx]!;
+          const g = draft.data[dIdx + 1]!;
+          const b = draft.data[dIdx + 2]!;
+          const lum = r * 0.299 + g * 0.587 + b * 0.114;
+          const sr = r * 0.5 + lum * 0.5;
+          const sg = g * 0.5 + lum * 0.5;
+          const sb = b * 0.5 + lum * 0.5;
+          out[outIdx] = Math.round(255 * 0.75 + sr * 0.25);
+          out[outIdx + 1] = Math.round(255 * 0.75 + sg * 0.25);
+          out[outIdx + 2] = Math.round(255 * 0.75 + sb * 0.25);
+          out[outIdx + 3] = 255;
+        }
+      } else if (inDraft) {
+        // Added height in Draft: highlight non-background pixels in rose, dimmed background
+        const dIdx = (yD * draft.width + x) * 4;
+        const r = draft.data[dIdx]!;
+        const g = draft.data[dIdx + 1]!;
+        const b = draft.data[dIdx + 2]!;
+        const edgeIdx = (yD * draft.width + cropX) * 4;
+        const isContent =
+          Math.abs(r - draft.data[edgeIdx]!) > 14 ||
+          Math.abs(g - draft.data[edgeIdx + 1]!) > 14 ||
+          Math.abs(b - draft.data[edgeIdx + 2]!) > 14;
+        if (isContent) {
+          out[outIdx] = 225;
+          out[outIdx + 1] = 29;
+          out[outIdx + 2] = 72;
+          out[outIdx + 3] = 255;
+        } else {
+          out[outIdx] = 254;
+          out[outIdx + 1] = 242;
+          out[outIdx + 2] = 242;
+          out[outIdx + 3] = 255;
+        }
+      } else {
+        // Removed height (Live was taller than Draft): soft rose-tinted band
+        out[outIdx] = 254;
+        out[outIdx + 1] = 226;
+        out[outIdx + 2] = 226;
+        out[outIdx + 3] = 255;
+      }
+    }
+  }
+
+  return out;
 }

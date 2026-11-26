@@ -18,6 +18,11 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api.js';
+import {
+  processVisualDiffPageClient,
+  renderFullDiffClient,
+  revokeObjectUrls,
+} from '../lib/perceptual-diff-client.js';
 import { ConflictCards } from './ConflictCards.js';
 import { VisualReview } from './VisualReview.js';
 
@@ -87,9 +92,6 @@ export function PublishModal({
   const [loadingRoutesByViewport, setLoadingRoutesByViewport] = useState<
     Record<'mobile' | 'desktop', Record<string, boolean>>
   >({ mobile: {}, desktop: {} });
-  const [loadingFullByViewport, setLoadingFullByViewport] = useState<
-    Record<'mobile' | 'desktop', Record<string, boolean>>
-  >({ mobile: {}, desktop: {} });
   const [mergeReview, setMergeReview] = useState<MergeReviewStateDto | null>(null);
   const [excludedPaths, setExcludedPaths] = useState<Record<string, boolean>>({});
   const [loadingChanges, setLoadingChanges] = useState(true);
@@ -99,6 +101,10 @@ export function PublishModal({
   const [publishElapsedSec, setPublishElapsedSec] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const generationRef = useRef(0);
+  const objectUrlsRef = useRef<string[]>([]);
+  const rawUrlsRef = useRef<
+    Record<'mobile' | 'desktop', Record<string, { draft?: string; live?: string }>>
+  >({ mobile: {}, desktop: {} });
 
   useEffect(() => {
     if (!titleDirty) {
@@ -109,6 +115,8 @@ export function PublishModal({
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      revokeObjectUrls(objectUrlsRef.current);
+      objectUrlsRef.current = [];
     };
   }, []);
 
@@ -123,10 +131,12 @@ export function PublishModal({
     generationRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
+    revokeObjectUrls(objectUrlsRef.current);
+    objectUrlsRef.current = [];
+    rawUrlsRef.current = { mobile: {}, desktop: {} };
     setPagesByViewport({ mobile: {}, desktop: {} });
     setFullPagesByViewport({ mobile: {}, desktop: {} });
     setLoadingRoutesByViewport({ mobile: {}, desktop: {} });
-    setLoadingFullByViewport({ mobile: {}, desktop: {} });
   };
 
   const fetchRoutesForViewport = (vp: 'mobile' | 'desktop', routes: string[]) => {
@@ -145,12 +155,26 @@ export function PublishModal({
 
     for (const route of routes) {
       void api
-        .getReviewScreenshot(session.id, { route, viewport: vp, mode: 'cropped', signal })
-        .then(({ page }) => {
+        .getReviewScreenshot(session.id, { route, viewport: vp, signal })
+        .then(async ({ page }) => {
           if (generationRef.current !== gen || signal.aborted) return;
+          const processed = await processVisualDiffPageClient(page, vp);
+          if (generationRef.current !== gen || signal.aborted) {
+            revokeObjectUrls(processed.objectUrls);
+            return;
+          }
+          objectUrlsRef.current.push(...processed.objectUrls);
+          rawUrlsRef.current[vp][route] = {
+            draft: processed.rawDraftUrl,
+            live: processed.rawLiveUrl,
+          };
           setPagesByViewport((prev) => ({
             ...prev,
-            [vp]: { ...prev[vp], [route]: page },
+            [vp]: { ...prev[vp], [route]: processed.croppedPage },
+          }));
+          setFullPagesByViewport((prev) => ({
+            ...prev,
+            [vp]: { ...prev[vp], [route]: processed.fullPage },
           }));
         })
         .catch(() => {
@@ -166,39 +190,43 @@ export function PublishModal({
     }
   };
 
-  const handleRequestFullPage = (route: string) => {
+  const handleRequestFullDiff = (route: string) => {
     const vp = activeViewport;
-    if (fullPagesByViewport[vp][route] || loadingFullByViewport[vp][route]) return;
+    const existing = fullPagesByViewport[vp][route];
+    if (existing?.shots?.[vp]?.diffScreenshotDataUrl) return;
+    const raw = rawUrlsRef.current[vp][route];
+    if (!raw?.draft || !raw?.live) return;
+
     const gen = generationRef.current;
-    if (!abortRef.current || abortRef.current.signal.aborted) {
-      abortRef.current = new AbortController();
-    }
-    const signal = abortRef.current.signal;
-
-    setLoadingFullByViewport((prev) => ({
-      ...prev,
-      [vp]: { ...prev[vp], [route]: true },
-    }));
-
-    void api
-      .getReviewScreenshot(session.id, { route, viewport: vp, mode: 'full', signal })
-      .then(({ page }) => {
-        if (generationRef.current !== gen || signal.aborted) return;
-        setFullPagesByViewport((prev) => ({
+    void renderFullDiffClient(raw.draft, raw.live).then((res) => {
+      if (!res) return;
+      if (generationRef.current !== gen) {
+        URL.revokeObjectURL(res.objectUrl);
+        return;
+      }
+      objectUrlsRef.current.push(res.objectUrl);
+      setFullPagesByViewport((prev) => {
+        const cur = prev[vp][route];
+        if (!cur) return prev;
+        const curShot = cur.shots?.[vp];
+        return {
           ...prev,
-          [vp]: { ...prev[vp], [route]: page },
-        }));
-      })
-      .catch(() => {
-        // ignore
-      })
-      .finally(() => {
-        if (generationRef.current !== gen) return;
-        setLoadingFullByViewport((prev) => ({
-          ...prev,
-          [vp]: { ...prev[vp], [route]: false },
-        }));
+          [vp]: {
+            ...prev[vp],
+            [route]: {
+              ...cur,
+              shots: {
+                ...cur.shots,
+                [vp]: {
+                  ...(curShot ?? { highlights: cur.highlights }),
+                  diffScreenshotDataUrl: res.diffUrl,
+                },
+              },
+            },
+          },
+        };
       });
+    });
   };
 
   const loadReview = async (opts?: { invalidateScreenshots?: boolean }) => {
@@ -375,7 +403,6 @@ export function PublishModal({
   const activePagesMap = pagesByViewport[activeViewport];
   const activeLoadingRoutes = loadingRoutesByViewport[activeViewport];
   const activeFullPagesMap = fullPagesByViewport[activeViewport];
-  const activeLoadingFull = loadingFullByViewport[activeViewport];
   const activePages = targetRoutes
     .map((r) => activePagesMap[r])
     .filter((p): p is VisualDiffPageDto => Boolean(p));
@@ -475,8 +502,7 @@ export function PublishModal({
                   targetRoutes={targetRoutes}
                   loadingRoutes={activeLoadingRoutes}
                   fullPagesByRoute={activeFullPagesMap}
-                  loadingFullByRoute={activeLoadingFull}
-                  onRequestFullPage={handleRequestFullPage}
+                  onRequestFullDiff={handleRequestFullDiff}
                   isUndoMode={isUndoMode}
                   defaultShowTechnical={persona === 'developer'}
                   excludedPaths={excludedPaths}
