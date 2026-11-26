@@ -343,7 +343,7 @@ describe('ScreenshotService', () => {
       expect(mobilePages[0]!.shots?.mobile?.height).toBe(10_000);
       expect(mobilePages[0]!.shots?.mobile?.draftScreenshotDataUrl).toContain('data:image/webp;base64,');
       expect(mobilePages[0]!.shots?.mobile?.liveScreenshotDataUrl).toContain('data:image/webp;base64,');
-      expect(mobilePages[0]!.shots?.mobile?.highlights).toHaveLength(1);
+      expect(mobilePages[0]!.shots?.mobile?.highlights).toEqual([]);
 
       // Second review with same baseSha should hit the Live LRU cache (no second visit to example.org)
       visitedUrls.length = 0;
@@ -380,6 +380,151 @@ describe('ScreenshotService', () => {
         fullPage: true,
         clip: { x: 0, y: 0, width: 1280, height: 10_000 },
       });
+    } finally {
+      await svc.close();
+    }
+  });
+
+  it('runs scroll sweep, promotes lazy images/iframes, decodes complete async images, and awaits loading FontFaces before capture', async () => {
+    const events: string[] = [];
+    const scrollPositions: number[] = [];
+    let removedLazyAttr = false;
+
+    const fakeLazyImg = {
+      src: '/images/community/cross-gen-redwoods.webp',
+      currentSrc: '/images/community/cross-gen-redwoods.webp',
+      complete: false,
+      naturalWidth: 0,
+      loading: 'lazy',
+      decoding: 'async',
+      getAttribute(k: string) {
+        return k === 'loading' ? this.loading : null;
+      },
+      setAttribute(k: string, v: string) {
+        if (k === 'loading') this.loading = v;
+      },
+      removeAttribute(k: string) {
+        if (k === 'loading') removedLazyAttr = true;
+      },
+      getBoundingClientRect: () => ({ top: 1400 }),
+      addEventListener(ev: string, cb: () => void) {
+        if (ev === 'load') {
+          setTimeout(() => {
+            this.complete = true;
+            this.naturalWidth = 1200;
+            events.push('lazy-img-loaded');
+            cb();
+          }, 20);
+        }
+      },
+      decode: async () => {
+        events.push('lazy-img-decoded');
+      },
+    };
+
+    const fakeAlreadyCompleteAsyncImg = {
+      src: '/images/community/growth-group-home.webp',
+      currentSrc: '/images/community/growth-group-home.webp',
+      complete: true,
+      naturalWidth: 800,
+      loading: 'eager',
+      decoding: 'async',
+      getBoundingClientRect: () => ({ top: 1500 }),
+      decode: async () => {
+        events.push('complete-async-img-decoded');
+      },
+    };
+
+    const fakeLoadingFont = {
+      status: 'loading',
+      loaded: new Promise<void>((resolve) => {
+        setTimeout(() => {
+          fakeLoadingFont.status = 'loaded';
+          events.push('font-loaded');
+          resolve();
+        }, 25);
+      }),
+    };
+
+    const svc = new ScreenshotService({
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      launchBrowser: async () =>
+        Object.assign(new EventEmitter(), {
+          isConnected: () => true,
+          newContext: async () => ({
+            newPage: async () => ({
+              goto: async () => ({ status: () => 200 }),
+              addStyleTag: async () => {},
+              waitForTimeout: async () => {},
+              title: async () => 'Home',
+              evaluate: async (fnOrExpr: unknown, arg?: unknown) => {
+                if (typeof fnOrExpr === 'string') return 2400;
+                if (typeof fnOrExpr === 'function' && arg && typeof arg === 'object' && 'eagerAll' in arg) {
+                  const g = globalThis as Record<string, unknown>;
+                  const prevDoc = g.document;
+                  const prevScrollTo = g.scrollTo;
+                  const prevInnerH = g.innerHeight;
+                  g.innerHeight = 800;
+                  g.scrollTo = (_x: number, y: number) => {
+                    scrollPositions.push(y);
+                  };
+                  const fontSet = [fakeLoadingFont];
+                  g.document = {
+                    body: { scrollHeight: 2400, offsetHeight: 2400 },
+                    documentElement: { scrollHeight: 2400, offsetHeight: 2400 },
+                    fonts: {
+                      ready: Promise.resolve(),
+                      [Symbol.iterator]: () => fontSet[Symbol.iterator](),
+                    },
+                    images: [fakeLazyImg, fakeAlreadyCompleteAsyncImg],
+                    querySelectorAll: () => [],
+                  };
+                  try {
+                    return await (fnOrExpr as (a: unknown) => Promise<unknown>)(arg);
+                  } finally {
+                    g.document = prevDoc;
+                    g.scrollTo = prevScrollTo;
+                    g.innerHeight = prevInnerH;
+                  }
+                }
+                return [];
+              },
+              screenshot: async () => {
+                events.push('screenshot');
+                return Buffer.from('jpg');
+              },
+            }),
+            close: async () => {},
+          }),
+          close: async () => {},
+        }) as unknown as Browser,
+    });
+
+    try {
+      await svc.captureRouteReview({
+        route: '/',
+        draftFiles: ['src/pages/index.astro'],
+        mergedFromLiveFiles: [],
+        draftBaseUrl: 'http://ws-1:4321/p/s1',
+        liveBaseUrl: null,
+        liveTimestamp: '12:55 PM',
+        viewport: 'desktop',
+      });
+
+      expect(fakeLazyImg.loading).toBe('eager');
+      expect(fakeLazyImg.decoding).toBe('sync');
+      expect(removedLazyAttr).toBe(true);
+      // Scroll sweep visited below-the-fold offsets and returned cleanly to y=0
+      expect(scrollPositions).toContain(800);
+      expect(scrollPositions).toContain(1600);
+      expect(scrollPositions[scrollPositions.length - 1]).toBe(0);
+      // All images decoded and loading FontFace awaited BEFORE screenshot fired
+      expect(events.indexOf('lazy-img-loaded')).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf('lazy-img-decoded')).toBeGreaterThan(events.indexOf('lazy-img-loaded'));
+      expect(events).toContain('complete-async-img-decoded');
+      expect(events).toContain('font-loaded');
+      expect(events[events.length - 1]).toBe('screenshot');
     } finally {
       await svc.close();
     }

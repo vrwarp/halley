@@ -108,20 +108,12 @@ export function VisualReview({
 
   return (
     <div className="space-y-5">
-      {/* Layer 1: Live vs Draft visual page comparison with dual-color highlights (Q4, Q15) */}
+      {/* Layer 1: Live vs Draft visual page comparison */}
       <div>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-            <h4 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
-              Live vs Draft
-            </h4>
-            <span className="inline-flex items-center gap-1 text-[11px] text-amber-800">
-              <span className="h-2 w-2 rounded-full bg-amber-500" /> Your draft
-            </span>
-            <span className="inline-flex items-center gap-1 text-[11px] text-teal-800">
-              <span className="h-2 w-2 rounded-full bg-teal-500" /> Merged from Live
-            </span>
-          </div>
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
+            Live vs Draft
+          </h4>
 
           {showViewportToggle ? (
             <div className="inline-flex rounded-lg border border-stone-200 bg-white p-0.5 text-xs">
@@ -216,7 +208,6 @@ export function VisualReview({
                   ? activePage.mobileDraftScreenshotDataUrl
                   : activePage.draftScreenshotDataUrl);
               const fullDiffUrl = shot?.diffScreenshotDataUrl;
-              const highlights = shot?.highlights ?? activePage.highlights ?? [];
               const hunks: VisualDiffHunkDto[] | undefined =
                 !wantFull && croppedShot?.hunks ? croppedShot.hunks : undefined;
               const isIdentical = Boolean(!wantFull && croppedShot?.identical);
@@ -315,7 +306,6 @@ export function VisualReview({
                                 diffUrl={hunk.diffScreenshotDataUrl}
                                 route={activePage.route}
                                 viewport={screenshotViewport}
-                                highlights={hunk.highlights}
                                 onZoom={(side) =>
                                   setLightbox(
                                     side === 'diff' && hunk.diffScreenshotDataUrl
@@ -334,7 +324,6 @@ export function VisualReview({
                                             src: hunk.draftScreenshotDataUrl,
                                             alt: `Draft ${activePage.route}`,
                                             title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                                            highlights: hunk.highlights,
                                           },
                                   )
                                 }
@@ -354,7 +343,6 @@ export function VisualReview({
                                       src: hunk.draftScreenshotDataUrl,
                                       alt: `Draft ${activePage.route}`,
                                       title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                                      highlights: hunk.highlights,
                                     })
                                   }
                                   className="relative block w-full overflow-hidden rounded-lg border border-stone-200 bg-white text-left focus:outline-none focus:ring-2 focus:ring-amber-500"
@@ -364,23 +352,6 @@ export function VisualReview({
                                     alt={`Draft ${activePage.route}`}
                                     className="w-full block"
                                   />
-                                  {hunk.highlights.map((h, idx) => (
-                                    <div
-                                      key={idx}
-                                      title={h.warning || h.file}
-                                      style={{
-                                        left: `${h.x}%`,
-                                        top: `${h.y}%`,
-                                        width: `${h.width}%`,
-                                        height: `${h.height}%`,
-                                      }}
-                                      className={`pointer-events-none absolute rounded border-2 ${
-                                        h.kind === 'merged_from_live'
-                                          ? 'border-teal-500 bg-teal-500/15'
-                                          : 'border-amber-500 bg-amber-500/15'
-                                      }`}
-                                    />
-                                  ))}
                                 </button>
                               </div>
                             )}
@@ -407,7 +378,6 @@ export function VisualReview({
                         }
                         route={activePage.route}
                         viewport={screenshotViewport}
-                        highlights={highlights}
                         onZoom={(side) =>
                           setLightbox(
                             side === 'diff' && fullDiffUrl
@@ -426,7 +396,6 @@ export function VisualReview({
                                     src: draftUrl,
                                     alt: `Draft ${activePage.route}`,
                                     title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                                    highlights,
                                   },
                           )
                         }
@@ -450,7 +419,6 @@ export function VisualReview({
                               src: draftUrl,
                               alt: `Draft ${activePage.route}`,
                               title: `Draft · ${activePage.route} (${screenshotViewport})`,
-                              highlights,
                             })
                           }
                           className="relative block w-full overflow-hidden rounded-lg border border-stone-200 bg-white text-left focus:outline-none focus:ring-2 focus:ring-amber-500"
@@ -460,23 +428,6 @@ export function VisualReview({
                             alt={`Draft ${activePage.route}`}
                             className="w-full block"
                           />
-                          {highlights.map((h, idx) => (
-                            <div
-                              key={idx}
-                              title={h.warning || h.file}
-                              style={{
-                                left: `${h.x}%`,
-                                top: `${h.y}%`,
-                                width: `${h.width}%`,
-                                height: `${h.height}%`,
-                              }}
-                              className={`pointer-events-none absolute rounded border-2 ${
-                                h.kind === 'merged_from_live'
-                                  ? 'border-teal-500 bg-teal-500/15'
-                                  : 'border-amber-500 bg-amber-500/15'
-                              }`}
-                            />
-                          ))}
                         </button>
                       ) : (
                         <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-stone-300 bg-white text-[11px] text-stone-400">
@@ -681,7 +632,6 @@ interface BeforeAfterWipeProps {
   onRequestDiff?: () => void;
   route: string;
   viewport: 'mobile' | 'desktop';
-  highlights: VisualDiffHighlightDto[];
   onZoom: (side: 'live' | 'draft' | 'diff') => void;
 }
 
@@ -691,7 +641,6 @@ function BeforeAfterWipe({
   diffUrl,
   onRequestDiff,
   route,
-  highlights,
   onZoom,
 }: BeforeAfterWipeProps) {
   const [splitPct, setSplitPct] = useState(50);
@@ -858,32 +807,15 @@ function BeforeAfterWipe({
           }}
           className="relative select-none rounded-lg border border-stone-200 bg-white touch-pan-y cursor-ew-resize focus:outline-none focus:ring-2 focus:ring-amber-500"
         >
-          {/* Inner clipped frame for images, highlights, and vertical divider line */}
+          {/* Inner clipped frame for images and vertical divider line */}
           <div className="relative overflow-hidden rounded-[7px]">
-            {/* Base layer: Draft screenshot + dual-color diff highlights */}
+            {/* Base layer: Draft screenshot */}
             <img
               src={draftUrl}
               alt={`Draft ${route}`}
               draggable={false}
               className="block w-full pointer-events-none"
             />
-            {highlights.map((h, idx) => (
-              <div
-                key={idx}
-                title={h.warning || h.file}
-                style={{
-                  left: `${h.x}%`,
-                  top: `${h.y}%`,
-                  width: `${h.width}%`,
-                  height: `${h.height}%`,
-                }}
-                className={`pointer-events-none absolute rounded border-2 ${
-                  h.kind === 'merged_from_live'
-                    ? 'border-teal-500 bg-teal-500/15'
-                    : 'border-amber-500 bg-amber-500/15'
-                }`}
-              />
-            ))}
 
             {/* Clipped overlay layer: Live screenshot on the left of the wipe */}
             <div
