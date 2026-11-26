@@ -12,6 +12,7 @@ import {
   ExternalLink,
   Loader2,
   MessageSquare,
+  RefreshCw,
   Sparkles,
   X,
 } from 'lucide-react';
@@ -84,6 +85,7 @@ export function PublishModal({
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [retryingDeploy, setRetryingDeploy] = useState(false);
   const [publishElapsedSec, setPublishElapsedSec] = useState(0);
 
   useEffect(() => {
@@ -94,6 +96,7 @@ export function PublishModal({
 
   const state = publishProgress?.state ?? session.publishState;
   const prUrl = publishProgress?.prUrl ?? session.prUrl;
+  const deployUrl = publishProgress?.deployUrl ?? null;
   const errorMsg = publishProgress?.error ?? session.publishError;
   const checks: VerificationCheckResult[] = publishProgress?.checks ?? [];
   const isUndoMode = session.kind === 'revert';
@@ -220,12 +223,27 @@ export function PublishModal({
     }
   };
 
+  const handleRetryDeploy = async () => {
+    setRetryingDeploy(true);
+    try {
+      await api.retryDeploy(session.id);
+      await onChangedFilesUpdated();
+    } finally {
+      setRetryingDeploy(false);
+    }
+  };
+
   const isInFlight =
     submitting ||
+    retryingDeploy ||
     ['verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci', 'deploying_pages'].includes(
       state,
     );
-  const isFailed = ['failed_checks', 'failed_conflict', 'failed_ci'].includes(state);
+  const isDeployFailed =
+    state === 'failed_deploy' ||
+    (state === 'failed_ci' && (session.status === 'merged' || Boolean(session.mergedSha)));
+  const isFailed =
+    !isDeployFailed && ['failed_checks', 'failed_conflict', 'failed_ci'].includes(state);
   const isPublished = state === 'published';
 
   useEffect(() => {
@@ -265,9 +283,11 @@ export function PublishModal({
           <h2 className="text-base font-semibold text-stone-900">
             {isPublished
               ? 'Published to Live Site'
-              : isUndoMode
-                ? 'Review & Undo Publication'
-                : 'Review & Publish Changes'}
+              : isDeployFailed
+                ? 'Deploy Verification Needed'
+                : isUndoMode
+                  ? 'Review & Undo Publication'
+                  : 'Review & Publish Changes'}
           </h2>
           {!isInFlight && (
             <button
@@ -282,7 +302,7 @@ export function PublishModal({
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5 sm:max-h-[78vh] sm:px-6 sm:py-5">
-          {!isInFlight && !isPublished && (
+          {!isInFlight && !isPublished && !isDeployFailed && (
             <>
               <div>
                 <label className="block text-xs font-medium text-stone-500 mb-1.5">
@@ -451,6 +471,44 @@ export function PublishModal({
             </div>
           )}
 
+          {isDeployFailed && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
+              <div className="flex items-start gap-2.5 text-sm text-amber-950">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-amber-700" />
+                <div>
+                  <p className="font-semibold">Live on GitHub — couldn&apos;t confirm website deploy yet</p>
+                  <p className="mt-1 text-xs text-amber-900">
+                    {errorMsg ||
+                      'Your changes are merged on GitHub, but Halley could not confirm the live website deployment yet.'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={retryingDeploy}
+                  onClick={() => void handleRetryDeploy()}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${retryingDeploy ? 'animate-spin' : ''}`} />
+                  {retryingDeploy ? 'Checking…' : 'Retry deploy check'}
+                </button>
+                {(deployUrl || prUrl) && (
+                  <a
+                    href={deployUrl || prUrl || '#'}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3.5 py-2 text-xs font-semibold text-amber-950 hover:bg-amber-100/60"
+                  >
+                    {deployUrl ? 'View deploy run on GitHub' : 'View on GitHub'}
+                    <ExternalLink className="h-3.5 w-3.5" />
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
+
           {isFailed && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-3">
               <div className="flex items-start gap-2.5 text-sm text-amber-950">
@@ -535,6 +593,24 @@ export function PublishModal({
             >
               Start new edit
             </button>
+          ) : isDeployFailed ? (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                className="min-h-[42px] rounded-xl px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                disabled={retryingDeploy}
+                onClick={() => void handleRetryDeploy()}
+                className="min-h-[42px] rounded-xl bg-stone-900 px-5 py-2 text-sm font-semibold text-white transition hover:bg-stone-800 disabled:opacity-40"
+              >
+                {retryingDeploy ? 'Checking…' : 'Retry deploy check'}
+              </button>
+            </>
           ) : (
             <>
               {!isInFlight && isUndoMode && (

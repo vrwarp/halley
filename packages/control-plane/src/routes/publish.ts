@@ -7,9 +7,28 @@ import type {
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
-import type { GitHubService } from '../github/client.js';
+import { GitHubApiError, type GitHubService } from '../github/client.js';
+
+export interface DeployPollOptions {
+  initialDelayMs?: number;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  runRegistrationGraceMs?: number;
+  maxConsecutiveErrors?: number;
+}
+
+const DEFAULT_DEPLOY_POLL_OPTIONS: Required<DeployPollOptions> = {
+  initialDelayMs: 2500,
+  pollIntervalMs: 5000,
+  timeoutMs: 6 * 60_000,
+  runRegistrationGraceMs: 45_000,
+  maxConsecutiveErrors: 5,
+};
 
 export class PublishService {
+  private activeDeployChecks = new Set<string>();
+  private deployPollOptions: Required<DeployPollOptions>;
+
   constructor(
     private config: HalleyConfig,
     private db: ControlPlaneDb,
@@ -17,7 +36,10 @@ export class PublishService {
     private github: GitHubService,
     private broadcastPublish: (sessionId: string, payload: PublishProgressPayload) => void,
     private onSessionMetaUpdated?: (sessionId: string) => void,
-  ) {}
+    deployPollOptions?: DeployPollOptions,
+  ) {
+    this.deployPollOptions = { ...DEFAULT_DEPLOY_POLL_OPTIONS, ...deployPollOptions };
+  }
 
   private setState(
     sessionId: string,
@@ -319,11 +341,16 @@ export class PublishService {
     if (!session.merged_sha || !session.pr_number || !session.pr_url) {
       throw new Error('Session does not have a merged commit to verify');
     }
+    if (this.activeDeployChecks.has(session.id)) {
+      return;
+    }
     this.setState(session.id, 'deploying_pages', {
       prNumber: session.pr_number,
       prUrl: session.pr_url,
     });
-    await this.waitForPagesDeploy(session.id, session.merged_sha, session.pr_number, session.pr_url);
+    await this.waitForPagesDeploy(session.id, session.merged_sha, session.pr_number, session.pr_url, {
+      initialDelayMs: 0,
+    });
   }
 
   private async waitForCiAndMerge(opts: {
@@ -384,56 +411,165 @@ export class PublishService {
     return null;
   }
 
+  private async markPublished(
+    sessionId: string,
+    prNumber: number,
+    prUrl: string,
+    deployUrl?: string,
+  ): Promise<void> {
+    const session = this.db.getSession(sessionId);
+    this.db.updateSession(sessionId, {
+      status: 'published',
+      publish_state: 'published',
+      archived_at: new Date().toISOString(),
+    });
+    if (session?.runner_url) {
+      await fetch(`${session.runner_url}/internal/read-only`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ readOnly: true }),
+      }).catch(() => {});
+    }
+    const updated = this.db.getSession(sessionId);
+    if (updated) {
+      await this.driver.stop(updated).catch(() => {});
+    }
+    this.setState(sessionId, 'published', {
+      prNumber,
+      prUrl,
+      ...(deployUrl ? { deployUrl } : {}),
+    });
+  }
+
+  private failDeploy(
+    sessionId: string,
+    prNumber: number,
+    prUrl: string,
+    error: string,
+    deployUrl?: string,
+  ): void {
+    this.db.updateSession(sessionId, { status: 'merged' });
+    this.setState(sessionId, 'failed_deploy', {
+      prNumber,
+      prUrl,
+      error,
+      ...(deployUrl ? { deployUrl } : {}),
+    });
+  }
+
   private async waitForPagesDeploy(
     sessionId: string,
     mergeSha: string,
     prNumber: number,
     prUrl: string,
+    overrides?: DeployPollOptions,
   ): Promise<void> {
-    const deadline = Date.now() + 4 * 60_000;
-    while (Date.now() < deadline) {
-      const status = await this.github.checkMainDeployStatus(mergeSha).catch(() => 'deployed' as const);
-      if (status === 'deployed') {
-        const session = this.db.getSession(sessionId);
-        this.db.updateSession(sessionId, {
-          status: 'published',
-          publish_state: 'published',
-          archived_at: new Date().toISOString(),
-        });
-        if (session?.runner_url) {
-          await fetch(`${session.runner_url}/internal/read-only`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ readOnly: true }),
-          }).catch(() => {});
-        }
-        const updated = this.db.getSession(sessionId);
-        if (updated) {
-          await this.driver.stop(updated).catch(() => {});
-        }
-        this.setState(sessionId, 'published', { prNumber, prUrl });
-        return;
-      }
-      if (status === 'failed') {
-        this.db.updateSession(sessionId, { status: 'merged' });
-        this.setState(sessionId, 'failed_ci', {
-          prNumber,
-          prUrl,
-          error:
-            'Changes merged to GitHub, but the live site deploy workflow reported an error. Editing is locked; you can retry checking deploy status.',
-        });
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 5000));
+    if (this.activeDeployChecks.has(sessionId)) {
+      return;
     }
+    this.activeDeployChecks.add(sessionId);
 
-    // Polling timed out after merge: keep session frozen in 'merged' state so user can retry deploy check
-    this.db.updateSession(sessionId, { status: 'merged' });
-    this.setState(sessionId, 'failed_ci', {
-      prNumber,
-      prUrl,
-      error:
+    const opts = { ...this.deployPollOptions, ...overrides };
+    try {
+      if (opts.initialDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, opts.initialDelayMs));
+      }
+
+      const startedAt = Date.now();
+      const deadline = startedAt + opts.timeoutMs;
+      const registrationDeadline = startedAt + opts.runRegistrationGraceMs;
+      let consecutiveErrors = 0;
+      let checkedWorkflowPresence = false;
+      let hasDeployWorkflow: boolean | null = null;
+
+      while (Date.now() < deadline) {
+        let result;
+        try {
+          result = await this.github.checkMainDeployStatus(mergeSha);
+          consecutiveErrors = 0;
+        } catch (err) {
+          if (err instanceof GitHubApiError && (err.status === 401 || err.status === 403 || err.status === 404)) {
+            const detail =
+              err.status === 401 || err.status === 403
+                ? 'Changes merged to GitHub, but Halley lacks permission to read GitHub Actions deploy status (check Actions: Read permission).'
+                : 'Changes merged to GitHub, but Halley could not find GitHub Actions runs for this repository.';
+            this.failDeploy(sessionId, prNumber, prUrl, detail);
+            return;
+          }
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= opts.maxConsecutiveErrors) {
+            const detail = err instanceof Error ? err.message : 'network error';
+            this.failDeploy(
+              sessionId,
+              prNumber,
+              prUrl,
+              `Changes merged to GitHub, but checking the live site deploy failed repeatedly (${detail}). Click Retry deploy check in a moment.`,
+            );
+            return;
+          }
+          await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+          continue;
+        }
+
+        if (result.state === 'deployed') {
+          await this.markPublished(sessionId, prNumber, prUrl, result.runUrl);
+          return;
+        }
+
+        if (result.state === 'failed') {
+          const wf = result.workflowName ? ` (${result.workflowName})` : '';
+          const conc = result.conclusion ? `: ${result.conclusion}` : '';
+          this.failDeploy(
+            sessionId,
+            prNumber,
+            prUrl,
+            `Changes merged to GitHub, but the live site deploy workflow${wf} did not succeed${conc}. Editing is locked; you can retry checking deploy status once fixed.`,
+            result.runUrl,
+          );
+          return;
+        }
+
+        if (result.state === 'waiting_for_run') {
+          if (!checkedWorkflowPresence) {
+            checkedWorkflowPresence = true;
+            hasDeployWorkflow = await this.github.hasActiveDeployWorkflow().catch(() => null);
+            if (hasDeployWorkflow === false) {
+              await this.markPublished(sessionId, prNumber, prUrl);
+              return;
+            }
+          }
+          if (Date.now() >= registrationDeadline) {
+            this.failDeploy(
+              sessionId,
+              prNumber,
+              prUrl,
+              'Changes merged to GitHub, but no live site deploy workflow run appeared for this commit. Click Retry deploy check or inspect GitHub Actions.',
+            );
+            return;
+          }
+        }
+
+        await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+      }
+
+      // Polling timed out after merge: keep session frozen in 'merged' state so user can retry deploy check
+      this.failDeploy(
+        sessionId,
+        prNumber,
+        prUrl,
         'Changes merged to GitHub, but the live site deploy is still taking longer than expected. Click Retry deploy check in a moment.',
-    });
+      );
+    } catch (err) {
+      // Never allow post-merge polling errors to escape into failed_checks
+      const detail = err instanceof Error ? err.message : 'unexpected error';
+      this.failDeploy(
+        sessionId,
+        prNumber,
+        prUrl,
+        `Changes merged to GitHub, but verifying the live site deploy encountered an error (${detail}). Click Retry deploy check in a moment.`,
+      );
+    } finally {
+      this.activeDeployChecks.delete(sessionId);
+    }
   }
 }

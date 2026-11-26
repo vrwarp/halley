@@ -133,6 +133,7 @@ export const PublishStateSchema = z.enum([
   'failed_checks',
   'failed_conflict',
   'failed_ci',
+  'failed_deploy',
 ]);
 export type PublishState = z.infer<typeof PublishStateSchema>;
 

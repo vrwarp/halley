@@ -6,6 +6,8 @@ export interface HalleyConfig {
   dataDir: string;
   repo: string; // owner/name
   baseBranch: string;
+  /** Optional GitHub Actions workflow filename or name used to confirm live site deployment. */
+  deployWorkflow: string;
   /** Optional override for live site URL used in Live vs Draft screenshots ("none" disables auto-detected URL). */
   liveSiteUrl: string;
   githubAppId: string;
@@ -68,6 +70,7 @@ export function loadConfig(): HalleyConfig {
     dataDir: path.resolve(process.env.DATA_DIR || './data'),
     repo: process.env.HALLEY_REPO || 'vrwarp/thecrossing.website',
     baseBranch: process.env.HALLEY_BASE_BRANCH || 'main',
+    deployWorkflow: (process.env.HALLEY_DEPLOY_WORKFLOW || '').trim(),
     liveSiteUrl: (process.env.HALLEY_LIVE_SITE_URL || '').trim().replace(/\/+$/, ''),
     githubAppId: process.env.GITHUB_APP_ID || '',
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
