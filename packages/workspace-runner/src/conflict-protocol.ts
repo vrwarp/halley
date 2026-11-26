@@ -45,6 +45,7 @@ export interface ConflictEvidencePack {
   isBinary: boolean;
   upstreamCommits: UpstreamCommitInfoDto[];
   localCheckpoints: string[];
+  kind?: 'sync' | 'publish' | 'revert';
 }
 
 export function inferRouteFromFilePath(relPath: string): string {
@@ -125,6 +126,7 @@ export async function buildConflictEvidencePack(
   relPath: string,
   prevBaseSha: string,
   baseBranch: string,
+  kind?: 'sync' | 'publish' | 'revert',
 ): Promise<ConflictEvidencePack> {
   const [baseContent, oursContent, theirsContent] = await Promise.all([
     readGitStage(repoRoot, 1, relPath),
@@ -174,6 +176,7 @@ export async function buildConflictEvidencePack(
     isBinary,
     upstreamCommits,
     localCheckpoints,
+    ...(kind ? { kind } : {}),
   };
 }
 
@@ -592,24 +595,44 @@ export function buildContradictionRecord(
     ...pack.localCheckpoints.slice(0, 3).map((s) => `Your edit: ${s}`),
   ];
 
-  const options: ConflictOptionDto[] = [
-    {
-      id: 'theirs',
-      label: `Keep ${theirAuthor}'s version (${theirDate})`,
-      description: pack.upstreamCommits[0]?.subject || 'Matches the latest live site',
-      recommended: (opts?.recommended ?? 'theirs') === 'theirs',
-      previewText: previewSnippet(pack.theirsContent),
-      source: 'theirs',
-    },
-    {
-      id: 'ours',
-      label: 'Keep your version',
-      description: pack.localCheckpoints[0] || 'Keep your draft wording',
-      recommended: opts?.recommended === 'ours',
-      previewText: previewSnippet(pack.oursContent),
-      source: 'ours',
-    },
-  ];
+  const isRevert = pack.kind === 'revert';
+  const options: ConflictOptionDto[] = isRevert
+    ? [
+        {
+          id: 'ours',
+          label: 'Keep current live site (skip undoing this file)',
+          description: 'Preserves the newer live-site edits on this file',
+          recommended: (opts?.recommended ?? 'ours') === 'ours',
+          previewText: previewSnippet(pack.oursContent),
+          source: 'ours',
+        },
+        {
+          id: 'theirs',
+          label: 'Restore earlier version (force undo)',
+          description: 'Reverts this file to before the publication (overwrites newer edits)',
+          recommended: opts?.recommended === 'theirs',
+          previewText: previewSnippet(pack.theirsContent),
+          source: 'theirs',
+        },
+      ]
+    : [
+        {
+          id: 'theirs',
+          label: `Keep ${theirAuthor}'s version (${theirDate})`,
+          description: pack.upstreamCommits[0]?.subject || 'Matches the latest live site',
+          recommended: (opts?.recommended ?? 'theirs') === 'theirs',
+          previewText: previewSnippet(pack.theirsContent),
+          source: 'theirs',
+        },
+        {
+          id: 'ours',
+          label: 'Keep your version',
+          description: pack.localCheckpoints[0] || 'Keep your draft wording',
+          recommended: opts?.recommended === 'ours',
+          previewText: previewSnippet(pack.oursContent),
+          source: 'ours',
+        },
+      ];
 
   if (opts?.combinedContent) {
     options.push({
@@ -633,7 +656,9 @@ export function buildContradictionRecord(
     status: 'needs_choice',
     explanation:
       opts?.explanation ||
-      `Both you and ${theirAuthor} changed the same section in ${pack.path}. Choose which version to keep.`,
+      (isRevert
+        ? `Someone updated ${pack.path} after this publication. Choose whether to keep the newer live version or restore the earlier state.`
+        : `Both you and ${theirAuthor} changed the same section in ${pack.path}. Choose which version to keep.`),
     evidenceUsed,
     affectedRoute: pack.affectedRoute,
     oursPreview: previewSnippet(pack.oursContent),

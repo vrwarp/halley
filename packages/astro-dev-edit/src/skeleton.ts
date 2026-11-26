@@ -105,10 +105,21 @@ async function inspectLayoutCapabilities(
   refFileAbs: string,
   layoutSpecifier: string,
 ): Promise<{ supportsIndexable: boolean; supportsDescription: boolean; hasHeadSlot: boolean }> {
-  if (!layoutSpecifier.startsWith('.')) {
+  let layoutAbs: string | null = null;
+  if (layoutSpecifier.startsWith('.')) {
+    layoutAbs = path.resolve(path.dirname(refFileAbs), layoutSpecifier);
+  } else if (layoutSpecifier.startsWith('@/') || layoutSpecifier.startsWith('~/')) {
+    // Walk up to locate the nearest `src/` ancestor for aliased imports like `@/layouts/BaseLayout.astro`
+    const normalized = refFileAbs.split(path.sep).join('/');
+    const srcIdx = normalized.lastIndexOf('/src/');
+    if (srcIdx !== -1) {
+      const srcRoot = normalized.slice(0, srcIdx + '/src'.length);
+      layoutAbs = path.resolve(srcRoot, layoutSpecifier.slice(2));
+    }
+  }
+  if (!layoutAbs) {
     return { supportsIndexable: false, supportsDescription: true, hasHeadSlot: false };
   }
-  const layoutAbs = path.resolve(path.dirname(refFileAbs), layoutSpecifier);
   try {
     const src = await fs.readFile(layoutAbs, 'utf8');
     const fm = src.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? '';
@@ -398,6 +409,53 @@ export function rewriteRelativeImportsInAstroSource(
   return `${open}${updatedBody}${close}${source.slice(full.length)}`;
 }
 
+function findOpeningTagEndIndex(source: string, tagStart: number): number | null {
+  let i = tagStart;
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  let braceDepth = 0;
+  while (i < source.length) {
+    const ch = source[i]!;
+    const prev = i > 0 ? source[i - 1]! : '';
+    if (inSingle) {
+      if (ch === "'" && prev !== '\\') inSingle = false;
+    } else if (inDouble) {
+      if (ch === '"' && prev !== '\\') inDouble = false;
+    } else if (inBacktick) {
+      if (ch === '`' && prev !== '\\') inBacktick = false;
+    } else {
+      if (ch === "'") inSingle = true;
+      else if (ch === '"') inDouble = true;
+      else if (ch === '`') inBacktick = true;
+      else if (ch === '{') braceDepth++;
+      else if (ch === '}' && braceDepth > 0) braceDepth--;
+      else if (ch === '>' && braceDepth === 0) return i;
+    }
+    i++;
+  }
+  return null;
+}
+
+function findComponentOpeningTagSpan(
+  source: string,
+  componentName: string,
+): { start: number; end: number } | null {
+  // Skip Astro frontmatter `--- ... ---` if present
+  let searchFrom = 0;
+  const fmMatch = source.match(/^---\r?\n[\s\S]*?\r?\n---/);
+  if (fmMatch) {
+    searchFrom = fmMatch[0].length;
+  }
+  const re = new RegExp(`<${componentName}(?=[\\s/>])`, 'g');
+  re.lastIndex = searchFrom;
+  const m = re.exec(source);
+  if (!m) return null;
+  const end = findOpeningTagEndIndex(source, m.index);
+  if (end === null) return null;
+  return { start: m.index, end };
+}
+
 /**
  * Toggles a page's unlisted/noindex state in its Astro source file.
  * Uses the outer layout's `indexable` prop when supported; otherwise manages
@@ -409,7 +467,7 @@ export async function togglePageUnlistedInSource(
   unlisted: boolean,
 ): Promise<string> {
   if (!unlisted) {
-    let next = source
+    const next = source
       .replace(/\s+indexable\s*=\s*(?:\{\s*false\s*\}|["']false["'])/g, '')
       .replace(/[ \t]*<meta\b[^>]*name=["']robots["'][^>]*noindex[^>]*\/?>[ \t]*\r?\n?/gi, '')
       .replace(/[ \t]*<meta\b[^>]*noindex[^>]*name=["']robots["'][^>]*\/?>[ \t]*\r?\n?/gi, '');
@@ -425,6 +483,7 @@ export async function togglePageUnlistedInSource(
     return source;
   }
 
+  let layoutSpan: { start: number; end: number } | null = null;
   try {
     const parsed = await parse(source, { position: false });
     const ast = parsed.ast as AstNode;
@@ -437,19 +496,23 @@ export async function togglePageUnlistedInSource(
       const layoutName = outer.name;
       const layoutSpec = imports.get(layoutName)!;
       const caps = await inspectLayoutCapabilities(fileAbs, layoutSpec);
+      layoutSpan = findComponentOpeningTagSpan(source, layoutName);
 
-      if (caps.supportsIndexable) {
-        // Replace existing indexable={true} if present, else add indexable={false} to opening tag
-        const openTagRe = new RegExp(`(<${layoutName}\\b[^>]*?)(>)`);
-        if (/\bindexable\s*=\s*\{\s*true\s*\}/.test(source)) {
-          return source.replace(/\bindexable\s*=\s*\{\s*true\s*\}/, 'indexable={false}');
+      if (layoutSpan) {
+        const openTag = source.slice(layoutSpan.start, layoutSpan.end + 1);
+        if (caps.supportsIndexable) {
+          if (/\bindexable\s*=\s*\{\s*true\s*\}/.test(openTag)) {
+            const replacedTag = openTag.replace(/\bindexable\s*=\s*\{\s*true\s*\}/, 'indexable={false}');
+            return source.slice(0, layoutSpan.start) + replacedTag + source.slice(layoutSpan.end + 1);
+          }
+          const isSelfClosing = openTag.endsWith('/>');
+          const insertPos = isSelfClosing ? layoutSpan.end - 1 : layoutSpan.end;
+          return `${source.slice(0, insertPos)} indexable={false}${source.slice(insertPos)}`;
         }
-        return source.replace(openTagRe, '$1 indexable={false}$2');
-      }
 
-      if (caps.hasHeadSlot) {
-        const openTagRe = new RegExp(`(<${layoutName}\\b[^>]*>)`);
-        return source.replace(openTagRe, '$1\n  <meta slot="head" name="robots" content="noindex" />');
+        if (caps.hasHeadSlot) {
+          return `${source.slice(0, layoutSpan.end + 1)}\n  <meta slot="head" name="robots" content="noindex" />${source.slice(layoutSpan.end + 1)}`;
+        }
       }
     }
   } catch {
@@ -460,6 +523,38 @@ export async function togglePageUnlistedInSource(
     return source.replace(/<\/head>/i, '  <meta name="robots" content="noindex" />\n  </head>');
   }
 
+  if (layoutSpan) {
+    return `${source.slice(0, layoutSpan.end + 1)}\n  <meta name="robots" content="noindex" />${source.slice(layoutSpan.end + 1)}`;
+  }
+
   return `${source}\n<meta name="robots" content="noindex" />\n`;
+}
+
+/**
+ * Toggles `indexable: false` / `noindex: true` in Markdown/MDX YAML frontmatter.
+ */
+export function toggleMarkdownUnlistedInSource(source: string, unlisted: boolean): string {
+  const fmMatch = source.match(/^(---\r?\n)([\s\S]*?)(\r?\n---)/);
+  if (!unlisted) {
+    if (!fmMatch) return source;
+    const [, open, body, close] = fmMatch;
+    const cleaned = body!
+      .replace(/^[ \t]*(?:indexable\s*:\s*false|noindex\s*:\s*true)[ \t]*\r?\n?/gim, '')
+      .replace(/\r?\n$/, '');
+    return `${open}${cleaned}${close}${source.slice(fmMatch[0].length)}`;
+  }
+
+  if (fmMatch) {
+    const [, open, body, close] = fmMatch;
+    if (/\bindexable\s*:\s*false\b|\bnoindex\s*:\s*true\b/i.test(body!)) {
+      return source;
+    }
+    const updatedBody = /\bindexable\s*:\s*true\b/i.test(body!)
+      ? body!.replace(/\bindexable\s*:\s*true\b/i, 'indexable: false')
+      : `${body!.replace(/\r?\n$/, '')}\nindexable: false`;
+    return `${open}${updatedBody}${close}${source.slice(fmMatch[0].length)}`;
+  }
+
+  return `---\nindexable: false\n---\n\n${source}`;
 }
 

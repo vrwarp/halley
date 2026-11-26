@@ -84,7 +84,7 @@ interface Props {
   onOpenSession: (id: string, opts?: { openPublish?: boolean }) => void;
 }
 
-const MUTATING_TOOLS = new Set(['edit', 'write', 'bash', 'process_image', 'undo_last_change']);
+const MUTATING_TOOLS = new Set(['edit', 'write', 'bash', 'process_image', 'create_page']);
 
 type TranscriptDisplayBlock =
   | { kind: 'entry'; entry: TranscriptEntryDto }
@@ -99,7 +99,9 @@ function groupTranscriptEntries(
   }
   const blocks: TranscriptDisplayBlock[] = [];
   for (const entry of entries) {
-    const isStep = entry.role === 'tool' || (entry.role === 'assistant' && entry.isIntermediate);
+    const isStep =
+      (entry.role === 'tool' && !entry.pageRequest) ||
+      (entry.role === 'assistant' && entry.isIntermediate);
     if (isStep) {
       const prev = blocks.at(-1);
       if (prev && prev.kind === 'steps') {
@@ -224,6 +226,13 @@ export function EditorPage({
   const lastPreviewReloadAtRef = useRef(0);
   const lastNavigationAtRef = useRef(0);
   const pendingRouteRef = useRef<string | null>(null);
+  const pendingRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionStatusRef = useRef<string | null>(null);
+  sessionStatusRef.current = session?.status ?? null;
+  const sessionKindRef = useRef<string | null>(null);
+  sessionKindRef.current = session?.kind ?? null;
+  const currentRouteRef = useRef(currentRoute);
+  currentRouteRef.current = currentRoute;
   const prevBusyRef = useRef(false);
   const hadMutatingToolRef = useRef(false);
   const runStartEntryCountRef = useRef(0);
@@ -446,7 +455,10 @@ export function EditorPage({
           if (msg.progress.crashLoop) {
             crashLoopHaltedRef.current = true;
           }
-          if (msg.progress.stage === 'ready' || msg.progress.stage === 'error') {
+          if (
+            (msg.progress.stage === 'ready' && sessionStatusRef.current !== 'running') ||
+            (msg.progress.stage === 'error' && sessionStatusRef.current !== 'error')
+          ) {
             void loadSessionMeta();
           }
         } else if (msg.type === 'preview_paused') {
@@ -462,10 +474,10 @@ export function EditorPage({
         } else if (msg.type === 'checkpoint_created') {
           setChangedCount(msg.changedFilesCount);
           setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
-          if (!msg.checkpoint.message.startsWith('Inline edit in ')) {
+          if (!msg.checkpoint.summary.startsWith('Inline edit in ')) {
             reloadPreview();
           }
-          if (session?.kind === 'revert') {
+          if (sessionKindRef.current === 'revert') {
             void loadSessionMeta();
           }
         } else if (msg.type === 'session_meta_updated') {
@@ -500,6 +512,14 @@ export function EditorPage({
               .getRoutes(sessionId)
               .then((rt) => setSiteRoutes(rt.routes))
               .catch(() => {});
+          } else if (pr.status === 'done') {
+            void api
+              .getRoutes(sessionId)
+              .then((rt) => setSiteRoutes(rt.routes))
+              .catch(() => {});
+            if (pr.route === currentRouteRef.current) {
+              reloadPreview(true);
+            }
           }
         } else if (msg.type === 'page_requests_sync') {
           const next: Record<string, PageRequestMetadata> = {};
@@ -597,7 +617,7 @@ export function EditorPage({
           }
         }
         if (shouldReload) {
-          reloadPreview();
+          reloadPreview(true);
         }
       });
 
@@ -728,8 +748,10 @@ export function EditorPage({
       const data = e.data as PostMessageFromPreview;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'halley:ready') {
-        if (pendingRouteRef.current === data.route) {
-          pendingRouteRef.current = null;
+        pendingRouteRef.current = null;
+        if (pendingRouteTimerRef.current) {
+          clearTimeout(pendingRouteTimerRef.current);
+          pendingRouteTimerRef.current = null;
         }
         setCurrentRoute(data.route);
         setPreviewSelectionActive(false);
@@ -755,9 +777,12 @@ export function EditorPage({
           }, 1400);
         }
       } else if (data.type === 'halley:route-changed') {
-        if (pendingRouteRef.current === data.route) {
-          pendingRouteRef.current = null;
+        pendingRouteRef.current = null;
+        if (pendingRouteTimerRef.current) {
+          clearTimeout(pendingRouteTimerRef.current);
+          pendingRouteTimerRef.current = null;
         }
+        lastNavigationAtRef.current = Date.now();
         setCurrentRoute(data.route);
       } else if (data.type === 'halley:selection-changed') {
         setPreviewSelectionActive(Boolean(data.active));
@@ -809,6 +834,11 @@ export function EditorPage({
     const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
     lastNavigationAtRef.current = Date.now();
     pendingRouteRef.current = clean;
+    if (pendingRouteTimerRef.current) clearTimeout(pendingRouteTimerRef.current);
+    pendingRouteTimerRef.current = setTimeout(() => {
+      pendingRouteRef.current = null;
+      pendingRouteTimerRef.current = null;
+    }, 5_000);
     if (iframeRef.current) {
       iframeRef.current.src = `/p/${session.id}${baseSuffixVal}${clean}`;
     }
@@ -943,16 +973,23 @@ export function EditorPage({
   const baseSuffix = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
   const previewSrc = `/p/${session.id}${baseSuffix}/`;
   const spendPct = Math.min(100, (spend.spentTodayUsd / Math.max(0.01, spend.dailyCapUsd + spend.extraGrantedUsd)) * 100);
+  const liveUnlistedByRoute = new Map(siteRoutes.map((r) => [r.route, Boolean(r.unlisted)]));
   const failedPageRequest = Object.values(pageRequestsMap).find(
     (pr) => pr.status === 'failed' || pr.status === 'capped',
   );
   const needsMobileAttention = Boolean(
     syncReview?.status === 'needs_choices' ||
+      syncReview?.status === 'ready_for_review' ||
       upstreamNotice?.heldOverlap ||
       failedPageRequest,
   );
   const mobileNotice: MobileNotice | null = (() => {
-    if (syncReview && (syncReview.status === 'needs_choices' || syncReview.records.length > 0)) {
+    if (
+      syncReview &&
+      (syncReview.status === 'needs_choices' ||
+        syncReview.status === 'ready_for_review' ||
+        syncReview.records.length > 0)
+    ) {
       return {
         text:
           syncReview.status === 'needs_choices'
@@ -990,6 +1027,16 @@ export function EditorPage({
           setMobileChatOpen(false);
           setMobileSheet('review');
         },
+        tone: 'amber',
+      };
+    }
+    if (upstreamNotice && upstreamNotice.coEditors.length > 0) {
+      const other = upstreamNotice.coEditors[0]!;
+      return {
+        text: `${other.ownerName} also has an unpublished draft (“${other.title}”)`,
+        actionLabel: 'Dismiss',
+        onAction: () =>
+          setUpstreamNotice((prev) => (prev ? { ...prev, coEditors: [] } : prev)),
         tone: 'amber',
       };
     }
@@ -1618,6 +1665,7 @@ export function EditorPage({
                     <NewPageCard
                       key={entry.id}
                       pageRequest={livePr}
+                      liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
                       persona={persona}
                       canEdit={session.canEdit}
                       spendCapped={spend.capped}
@@ -1649,6 +1697,22 @@ export function EditorPage({
                 );
               }
               if (entry.role === 'tool') {
+                if (entry.pageRequest) {
+                  const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
+                  return (
+                    <NewPageCard
+                      key={entry.id}
+                      pageRequest={livePr}
+                      liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
+                      persona={persona}
+                      canEdit={session.canEdit}
+                      spendCapped={spend.capped}
+                      onNavigateRoute={navigatePreview}
+                      onRetry={handleRetryPageRequest}
+                      onDelete={handleDeletePage}
+                    />
+                  );
+                }
                 const isOpen = expandedTool === entry.id;
                 return (
                   <div key={entry.id} className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-1.5 text-xs">
@@ -1691,6 +1755,7 @@ export function EditorPage({
                 <NewPageCard
                   key={`standalone-${pr.pageRequestId}`}
                   pageRequest={pr}
+                  liveUnlisted={liveUnlistedByRoute.get(pr.route)}
                   persona={persona}
                   canEdit={session.canEdit}
                   spendCapped={spend.capped}
@@ -1956,7 +2021,7 @@ export function EditorPage({
                       <>
                         <button
                           type="button"
-                          onClick={() => wsRef.current?.send(JSON.stringify({ type: 'abort' }))}
+                          onClick={() => dispatchClientMessage({ type: 'abort' })}
                           className="inline-flex items-center gap-1 rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
                         >
                           <Square className="h-3 w-3 fill-current" /> Stop
@@ -2254,7 +2319,7 @@ export function EditorPage({
           uploading={uploading}
           onTriggerPhotoUpload={() => fileInputRef.current?.click()}
           onSend={(whenBusy, overrideText) => sendPrompt(whenBusy, overrideText)}
-          onAbort={() => wsRef.current?.send(JSON.stringify({ type: 'abort' }))}
+          onAbort={() => dispatchClientMessage({ type: 'abort' })}
           onOpenNewPage={() => {
             setMobileChatOpen(false);
             openNewPageWizard();
@@ -2263,6 +2328,10 @@ export function EditorPage({
             setMobileChatOpen(false);
             navigatePreview(route);
           }}
+          onRetryPageRequest={handleRetryPageRequest}
+          onDeletePageRequest={handleDeletePage}
+          liveUnlistedByRoute={liveUnlistedByRoute}
+          pageRequestsMap={pageRequestsMap}
           onShowHistory={() => {
             setMobileChatOpen(false);
             setMobileSheet('history');
@@ -2310,6 +2379,8 @@ export function EditorPage({
                             setMobileSheet(null);
                             navigatePreview(r);
                           }}
+                          knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                          astroBase={session.astroBase}
                         />
                       </div>
                     );
@@ -2387,6 +2458,7 @@ export function EditorPage({
                       <NewPageCard
                         key={`m-${entry.id}`}
                         pageRequest={livePr}
+                        liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
                         persona={persona}
                         canEdit={session.canEdit}
                         spendCapped={spend.capped}
@@ -2421,6 +2493,25 @@ export function EditorPage({
                   );
                 }
                 if (entry.role === 'tool') {
+                  if (entry.pageRequest) {
+                    const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
+                    return (
+                      <NewPageCard
+                        key={`m-${entry.id}`}
+                        pageRequest={livePr}
+                        liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
+                        persona={persona}
+                        canEdit={session.canEdit}
+                        spendCapped={spend.capped}
+                        onNavigateRoute={(r) => {
+                          setMobileSheet(null);
+                          navigatePreview(r);
+                        }}
+                        onRetry={handleRetryPageRequest}
+                        onDelete={handleDeletePage}
+                      />
+                    );
+                  }
                   return (
                     <div
                       key={`m-${entry.id}`}
@@ -2480,6 +2571,7 @@ export function EditorPage({
                 <NewPageCard
                   key={`review-${pr.pageRequestId}`}
                   pageRequest={pr}
+                  liveUnlisted={liveUnlistedByRoute.get(pr.route)}
                   persona={persona}
                   canEdit={session.canEdit}
                   spendCapped={spend.capped}
@@ -2885,9 +2977,11 @@ export function EditorPage({
           onClose={() => setShowPublish(false)}
           onAskHalleyToFix={async (summary, logs) => {
             await api.fixWithPi(session.id, summary, logs);
+            setPublishProgress(null);
           }}
           onStartNewEdit={onBack}
           onChangedFilesUpdated={async () => {
+            reloadPreview(true);
             await loadSessionMeta();
           }}
         />

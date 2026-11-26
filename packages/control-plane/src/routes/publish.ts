@@ -30,6 +30,7 @@ const DEFAULT_DEPLOY_POLL_OPTIONS: Required<DeployPollOptions> = {
 };
 
 export class PublishService {
+  private activePublishes = new Set<string>();
   private activeDeployChecks = new Set<string>();
   private deployPollOptions: Required<DeployPollOptions>;
 
@@ -64,16 +65,22 @@ export class PublishService {
     actor: UserDto,
     input: { title?: string; summary?: string },
   ): Promise<void> {
-    let session = this.db.getSession(sessionInput.id) ?? sessionInput;
-    const endpoint = await this.driver.ensureRunning(session);
-    const runnerUrl = endpoint.runnerUrl;
+    if (this.activePublishes.has(sessionInput.id)) {
+      return;
+    }
+    this.activePublishes.add(sessionInput.id);
 
     try {
+      let session = this.db.getSession(sessionInput.id) ?? sessionInput;
+      const endpoint = await this.driver.ensureRunning(session);
+      const runnerUrl = endpoint.runnerUrl;
+
       // 0. Commit any pending inline/working-tree edits so HEAD has the exact draft state
       const ckptRes = await fetch(`${runnerUrl}/internal/git/checkpoint`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ summary: 'Ready to publish' }),
+        signal: AbortSignal.timeout(20_000),
       }).catch(() => null);
       if (ckptRes?.ok && session.kind === 'revert') {
         const ckptData = (await ckptRes.json().catch(() => null)) as { checkpoint?: unknown } | null;
@@ -107,6 +114,7 @@ export class PublishService {
           autoSyncOnly: true,
           skipFetch: fetchedByDriver,
         }),
+        signal: AbortSignal.timeout(55_000),
       });
       const syncData = (await syncRes.json()) as {
         heldForUser?: boolean;
@@ -122,7 +130,7 @@ export class PublishService {
 
       if (syncData.heldForUser) {
         // Prepare full conflict resolution / decision cards for the Publish modal
-        await fetch(`${runnerUrl}/internal/sync/start`, {
+        const fullSyncRes = await fetch(`${runnerUrl}/internal/sync/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -131,7 +139,26 @@ export class PublishService {
             autoSyncOnly: false,
             skipFetch: true,
           }),
-        }).catch(() => {});
+          signal: AbortSignal.timeout(55_000),
+        }).catch(() => null);
+        if (fullSyncRes?.ok) {
+          const fullSyncData = (await fullSyncRes.json().catch(() => null)) as {
+            review?: {
+              status?: string;
+              newBaseSha?: string;
+              prevBaseSha?: string;
+            };
+          } | null;
+          if (
+            fullSyncData?.review?.newBaseSha &&
+            fullSyncData.review.status !== 'needs_choices'
+          ) {
+            this.db.updateSession(session.id, {
+              prev_base_sha: fullSyncData.review.prevBaseSha ?? (session.base_sha || null),
+              base_sha: fullSyncData.review.newBaseSha,
+            });
+          }
+        }
         this.setState(session.id, 'failed_conflict', {
           error:
             'Someone else updated the same page while you were publishing. Please review the combined changes before publishing.',
@@ -165,6 +192,7 @@ export class PublishService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pausePreview: false }),
+        signal: AbortSignal.timeout(180_000),
       });
       const verifyData = (await verifyRes.json()) as {
         allPassed: boolean;
@@ -182,6 +210,7 @@ export class PublishService {
       // 3. Layer-3 .github/** hard gate before pushing
       const protRes = await fetch(
         `${runnerUrl}/internal/git/protected-diff?baseRef=${encodeURIComponent(`origin/${session.base_branch}`)}`,
+        { signal: AbortSignal.timeout(15_000) },
       );
       const protData = (await protRes.json()) as { clean: boolean; protectedFiles: string[] };
       if (!protData.clean) {
@@ -247,6 +276,7 @@ export class PublishService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ readOnly: true }),
+        signal: AbortSignal.timeout(10_000),
       }).catch(() => {});
       await this.archiveSessionDeterministically(session.id, runnerUrl, session.base_branch, mergedSha, pr.url);
 
@@ -258,7 +288,7 @@ export class PublishService {
       await this.waitForPagesDeploy(session.id, mergedSha, pr.number, pr.url);
     } catch (err) {
       const rawMsg = err instanceof Error ? err.message : 'Publish failed unexpectedly';
-      const crashInfo = this.driver.getCrashInfo?.(session.id);
+      const crashInfo = this.driver.getCrashInfo?.(sessionInput.id);
       const isRunnerDisconnect =
         /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg);
       const friendlyError =
@@ -267,9 +297,11 @@ export class PublishService {
           : isRunnerDisconnect
             ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
             : rawMsg;
-      this.setState(session.id, 'failed_checks', {
+      this.setState(sessionInput.id, 'failed_checks', {
         error: friendlyError,
       });
+    } finally {
+      this.activePublishes.delete(sessionInput.id);
     }
   }
 
@@ -280,13 +312,18 @@ export class PublishService {
     mergedSha: string | null,
     prUrl: string | null,
   ): Promise<void> {
-    let transcriptJson = JSON.stringify({ entries: [], usageUsd: 0 });
-    let diffSummary = '[]';
+    const existingArchive = this.db.getSessionArchive(sessionId);
+    let transcriptJson = existingArchive?.transcriptJson ?? JSON.stringify({ entries: [], usageUsd: 0 });
+    let diffSummary = existingArchive?.diffSummary ?? '[]';
+    let fetchedAny = false;
     if (runnerUrl) {
       try {
-        const tRes = await fetch(`${runnerUrl}/internal/transcript`);
+        const tRes = await fetch(`${runnerUrl}/internal/transcript`, {
+          signal: AbortSignal.timeout(15_000),
+        });
         if (tRes.ok) {
           transcriptJson = await tRes.text();
+          fetchedAny = true;
         }
       } catch {
         // best-effort
@@ -294,6 +331,7 @@ export class PublishService {
       try {
         const cRes = await fetch(
           `${runnerUrl}/internal/git/changes?baseRef=${encodeURIComponent(`origin/${baseBranch}`)}`,
+          { signal: AbortSignal.timeout(15_000) },
         );
         if (cRes.ok) {
           const data = (await cRes.json()) as {
@@ -307,10 +345,15 @@ export class PublishService {
               deletions: ch.deletions,
             })),
           );
+          fetchedAny = true;
         }
       } catch {
         // best-effort
       }
+    }
+    if (runnerUrl && !fetchedAny && (existingArchive || !mergedSha)) {
+      // Do not clobber an existing archive or insert an empty draft archive when the runner was unreachable
+      return;
     }
     this.db.upsertSessionArchive({
       sessionId,

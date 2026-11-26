@@ -195,6 +195,9 @@ export function createLlmProxyHandler(
         method: c.req.method,
         headers,
         body: bodyText || undefined,
+        signal: c.req.raw.signal
+          ? AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(20_000)])
+          : AbortSignal.timeout(20_000),
       });
       const txt = await upstream.text();
       return new Response(txt, {
@@ -244,12 +247,21 @@ export function createLlmProxyHandler(
     }
 
     const abortController = new AbortController();
-    const upstream = await fetch(upstreamUrl, {
-      method: c.req.method,
-      headers,
-      body: bodyText || undefined,
-      signal: abortController.signal,
-    });
+    const onClientAbort = () => abortController.abort();
+    c.req.raw.signal?.addEventListener('abort', onClientAbort, { once: true });
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(upstreamUrl, {
+        method: c.req.method,
+        headers,
+        body: bodyText || undefined,
+        signal: abortController.signal,
+      });
+    } catch (err) {
+      c.req.raw.signal?.removeEventListener('abort', onClientAbort);
+      throw err;
+    }
 
     const recordRunCost = (cost: number) => {
       if (!effectiveRunKey || cost <= 0) return priorRunSpent;
@@ -261,6 +273,7 @@ export function createLlmProxyHandler(
 
     const contentType = upstream.headers.get('content-type') || 'application/json';
     if (!contentType.includes('text/event-stream') || !upstream.body) {
+      c.req.raw.signal?.removeEventListener('abort', onClientAbort);
       const txt = await upstream.text();
       try {
         const json = JSON.parse(txt) as {
@@ -300,32 +313,40 @@ export function createLlmProxyHandler(
     let outputTokens = 0;
     let cacheWrite = 0;
     let cacheRead = 0;
+    let spendRecorded = false;
     let lineBuf = '';
     const decoder = new TextDecoder();
+
+    const flushSpendOnce = () => {
+      if (spendRecorded) return;
+      spendRecorded = true;
+      c.req.raw.signal?.removeEventListener('abort', onClientAbort);
+      const cost = computeCostUsd(requestedModel, {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_creation_input_tokens: cacheWrite,
+        cache_read_input_tokens: cacheRead,
+      });
+      if (cost > 0 || inputTokens > 0 || outputTokens > 0) {
+        recordRunCost(cost);
+        db.recordSpend(
+          session.owner_user_id,
+          cost,
+          inputTokens + cacheWrite + cacheRead,
+          outputTokens,
+          undefined,
+          { sessionId: session.id, purpose, model: requestedModel },
+        );
+        onSpendUpdated?.(session.owner_user_id, session.id);
+      }
+    };
 
     const reader = upstream.body.getReader();
     const stream = new ReadableStream({
       async pull(controller) {
         const { done, value } = await reader.read();
         if (done) {
-          const cost = computeCostUsd(requestedModel, {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
-            cache_creation_input_tokens: cacheWrite,
-            cache_read_input_tokens: cacheRead,
-          });
-          if (cost > 0 || inputTokens > 0 || outputTokens > 0) {
-            recordRunCost(cost);
-            db.recordSpend(
-              session.owner_user_id,
-              cost,
-              inputTokens + cacheWrite + cacheRead,
-              outputTokens,
-              undefined,
-              { sessionId: session.id, purpose, model: requestedModel },
-            );
-            onSpendUpdated?.(session.owner_user_id, session.id);
-          }
+          flushSpendOnce();
           controller.close();
           return;
         }
@@ -373,16 +394,7 @@ export function createLlmProxyHandler(
                 cache_read_input_tokens: cacheRead,
               });
               if (priorRunSpent + currentCost > runCeilingUsd) {
-                recordRunCost(currentCost);
-                db.recordSpend(
-                  session.owner_user_id,
-                  currentCost,
-                  inputTokens + cacheWrite + cacheRead,
-                  outputTokens,
-                  undefined,
-                  { sessionId: session.id, purpose, model: requestedModel },
-                );
-                onSpendUpdated?.(session.owner_user_id, session.id);
+                flushSpendOnce();
                 abortController.abort();
                 reader.cancel().catch(() => {});
                 controller.close();
@@ -395,6 +407,8 @@ export function createLlmProxyHandler(
         }
       },
       cancel() {
+        flushSpendOnce();
+        abortController.abort();
         reader.cancel().catch(() => {});
       },
     });

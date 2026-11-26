@@ -13,6 +13,7 @@ export {
   extractNavGroupsFromHtml,
   generatePageSkeleton,
   rewriteRelativeImportsInAstroSource,
+  toggleMarkdownUnlistedInSource,
   togglePageUnlistedInSource,
   type GeneratePageSkeletonOptions,
   type GeneratePageSkeletonResult,

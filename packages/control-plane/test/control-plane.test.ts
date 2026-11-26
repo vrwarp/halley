@@ -1,16 +1,20 @@
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
+import { ControlPlaneDb } from '../src/db.js';
 import {
   CrashLoopTracker,
   WorkspaceCrashLoopError,
   type WorkspaceDriver,
 } from '../src/drivers/workspace-driver.js';
 import { WorkspaceHostDriver } from '../src/drivers/workspace-host-driver.js';
+import { GitHubService } from '../src/github/client.js';
 import { createControlPlane } from '../src/index.js';
 import { hashWorkspaceToken } from '../src/proxy/llm-proxy.js';
 import { ScreenshotService } from '../src/screenshot-service.js';
@@ -1011,6 +1015,106 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       expect(rawUpdated.title).toBe('Adjusted: Footer fix');
     } finally {
       mockRunner.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('uses fast path in WorkspaceHostDriver.ensureRunning without mirror sync or boot_progress, and reconciles on LRU eviction', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-fastpath-test-'));
+    let activeIds: string[] = [];
+    let startCalls = 0;
+    const mockSupervisor = http.createServer((req, res) => {
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            protocolVersion: 1,
+            instanceId: 'sup-same-instance',
+            activeSessionIds: activeIds,
+            activeCount: activeIds.length,
+            maxActiveWorkspaces: 5,
+            warmPool: { enabled: false, target: 0, ready: 0, warming: 0 },
+            buildQueue: { activeSessionId: null, queueLength: 0, queuedSessionIds: [] },
+            diskUsage: null,
+          }),
+        );
+        return;
+      }
+      if (req.url?.endsWith('/start')) {
+        startCalls += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            runnerPort: 4510,
+            astroPort: 4511,
+            astroBase: '/',
+            baseSha: 'abc123',
+            instanceId: 'sup-same-instance',
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ progress: null }));
+    });
+    await new Promise<void>((r) => mockSupervisor.listen(0, '127.0.0.1', () => r()));
+    const supPort = (mockSupervisor.address() as AddressInfo).port;
+
+    try {
+      const cfg = {
+        ...loadConfig(),
+        dataDir: tmp,
+        workspaceHostUrl: `http://127.0.0.1:${supPort}`,
+        devLocalRepo: '',
+      };
+      const db = new ControlPlaneDb(path.join(tmp, 'cp.sqlite'), cfg);
+      const user = db.upsertUser({ email: 'sarah@thecrossing.website', name: 'Sarah', picture: null });
+      const sess = db.createSession({
+        id: 'sess-fast-path-1',
+        title: 'Fast path test',
+        slug: 'fast-path',
+        ownerUserId: user.id,
+        repo: cfg.repo,
+        workingBranch: 'halley/fast-path',
+        baseBranch: 'main',
+        baseSha: 'abc123',
+        volumeName: 'vol-fast',
+        workspaceTokenHash: hashWorkspaceToken('tok-fast'),
+      });
+      db.updateSession(sess.id, {
+        status: 'running',
+        runner_url: 'http://127.0.0.1:4510',
+        astro_url: 'http://127.0.0.1:4511',
+      });
+      activeIds = [sess.id];
+
+      const gh = new GitHubService(cfg);
+      const driver = new WorkspaceHostDriver(cfg, db, gh);
+      driver.setRawWorkspaceToken(sess.id, 'tok-fast');
+
+      const progressEvents: string[] = [];
+      driver.setBootProgressListener((_id, p) => progressEvents.push(p.stage));
+
+      // Fast path: returns immediately without calling /start or emitting boot_progress
+      const fresh = db.getSession(sess.id)!;
+      const ep1 = await driver.ensureRunning(fresh);
+      const ep2 = await driver.ensureRunning(fresh);
+      expect(ep1.runnerUrl).toBe('http://127.0.0.1:4510');
+      expect(ep2.astroUrl).toBe('http://127.0.0.1:4511');
+      expect(startCalls).toBe(0);
+      expect(progressEvents).toHaveLength(0);
+
+      // Simulate LRU eviction (same supervisor instanceId, session removed from activeSessionIds)
+      activeIds = [];
+      // Wait for health cache TTL? Call reconcileSessions directly to verify LRU reconciliation on same instanceId
+      await driver.reconcileSessions();
+      const afterEvict = db.getSession(sess.id)!;
+      expect(afterEvict.status).toBe('sleeping');
+      expect(afterEvict.runner_url).toBeNull();
+      expect(afterEvict.astro_url).toBeNull();
+    } finally {
+      mockSupervisor.close();
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });

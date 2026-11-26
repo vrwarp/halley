@@ -66,45 +66,88 @@ export async function hasProtectedPathChanges(
   return [...files];
 }
 
+const repoGitQueues = new Map<string, Promise<unknown>>();
+
+export function withRepoGitLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(repoRoot);
+  const prev = repoGitQueues.get(key) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  const tail = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  repoGitQueues.set(key, tail);
+  void tail.finally(() => {
+    if (repoGitQueues.get(key) === tail) {
+      repoGitQueues.delete(key);
+    }
+  });
+  return next;
+}
+
+export async function hasUnmergedGitState(
+  repoRoot: string,
+  opts?: { allowActiveRevert?: boolean },
+): Promise<boolean> {
+  const gitDir = path.join(repoRoot, '.git');
+  const markers = opts?.allowActiveRevert ? ['MERGE_HEAD'] : ['MERGE_HEAD', 'REVERT_HEAD'];
+  for (const marker of markers) {
+    const exists = await fs
+      .access(path.join(gitDir, marker))
+      .then(() => true)
+      .catch(() => false);
+    if (exists) return true;
+  }
+  const unmerged = await git(repoRoot, ['diff', '--name-only', '--diff-filter=U']);
+  return Boolean(unmerged.stdout.trim());
+}
+
 export async function createCheckpoint(
   repoRoot: string,
   summary: string,
   identity: GitIdentity,
+  opts?: { allowActiveRevert?: boolean },
 ): Promise<CheckpointInfo | null> {
-  await sanitizeProtectedPaths(repoRoot);
-  const status = await git(repoRoot, ['status', '--porcelain']);
-  if (!status.stdout.trim()) return null;
+  return withRepoGitLock(repoRoot, async () => {
+    // Never stage/commit while a merge or revert has unresolved conflicts (would commit raw <<<<<<< markers)
+    if (await hasUnmergedGitState(repoRoot, opts)) {
+      return null;
+    }
+    await sanitizeProtectedPaths(repoRoot);
+    const status = await git(repoRoot, ['status', '--porcelain']);
+    if (!status.stdout.trim()) return null;
 
-  await git(repoRoot, ['add', '-A']);
-  const cleanMsg = summary.replace(/\r?\n/g, ' ').trim() || 'Update website';
-  const fullMsg = `halley-checkpoint: ${cleanMsg}\n\nCo-authored-by: ${identity.editorName} <${identity.editorEmail}>`;
+    await git(repoRoot, ['add', '-A']);
+    const cleanMsg = summary.replace(/\r?\n/g, ' ').trim() || 'Update website';
+    const fullMsg = `halley-checkpoint: ${cleanMsg}\n\nCo-authored-by: ${identity.editorName} <${identity.editorEmail}>`;
 
-  const commit = await git(
-    repoRoot,
-    [
-      '-c',
-      `user.name=${identity.botName}`,
-      '-c',
-      `user.email=${identity.botEmail}`,
-      'commit',
-      '-m',
-      fullMsg,
-    ],
-  );
-  if (commit.code !== 0) return null;
+    const commit = await git(
+      repoRoot,
+      [
+        '-c',
+        `user.name=${identity.botName}`,
+        '-c',
+        `user.email=${identity.botEmail}`,
+        'commit',
+        '-m',
+        fullMsg,
+      ],
+    );
+    if (commit.code !== 0) return null;
 
-  const head = await git(repoRoot, ['log', '-1', '--format=%H|%h|%s|%aI|%an']);
-  const [sha, shortSha, message, timestamp, author] = head.stdout.trim().split('|');
-  if (!sha) return null;
+    const head = await git(repoRoot, ['log', '-1', '--format=%H|%h|%s|%aI|%an']);
+    const [sha, shortSha, message, timestamp, author] = head.stdout.trim().split('|');
+    if (!sha) return null;
 
-  return {
-    sha,
-    shortSha: shortSha ?? sha.slice(0, 7),
-    message: message ?? cleanMsg,
-    summary: cleanMsg,
-    timestamp: timestamp ?? new Date().toISOString(),
-    author: author ?? identity.botName,
-  };
+    return {
+      sha,
+      shortSha: shortSha ?? sha.slice(0, 7),
+      message: message ?? cleanMsg,
+      summary: cleanMsg,
+      timestamp: timestamp ?? new Date().toISOString(),
+      author: author ?? identity.botName,
+    };
+  });
 }
 
 export async function ensureGitRerere(repoRoot: string): Promise<void> {
@@ -581,6 +624,7 @@ export async function startRevertCommits(
       repoRoot,
       `Undo published edit (${shas.map((s) => s.slice(0, 7)).join(', ')})`,
       identity,
+      { allowActiveRevert: true },
     );
     return {
       status: 'clean',

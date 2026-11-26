@@ -5,7 +5,9 @@ import {
   discoverSiteStructure,
   extractNavGroupsFromHtml,
   generatePageSkeleton,
+  isPageSourceUnlisted,
   rewriteRelativeImportsInAstroSource,
+  toggleMarkdownUnlistedInSource,
   togglePageUnlistedInSource,
   type AsyncFileLock,
 } from '@halley/astro-dev-edit';
@@ -21,6 +23,7 @@ import {
   type PageRequestMetadata,
   type PageRequestStatus,
 } from '@halley/shared';
+import { detectAstroBase } from './astro-manager.js';
 import {
   createCheckpoint,
   getGitChanges,
@@ -96,6 +99,11 @@ export class PageCreationService {
     return this.pageRequests.get(id);
   }
 
+  findLatestByRoute(route: string): PageRequestMetadata | undefined {
+    const list = this.listPageRequests().reverse();
+    return list.find((p) => p.route === route);
+  }
+
   findActiveByRoute(route: string): PageRequestMetadata | undefined {
     const list = this.listPageRequests().reverse();
     return list.find(
@@ -109,6 +117,75 @@ export class PageCreationService {
     );
   }
 
+  /**
+   * Reconciles stored PageRequestMetadata against the actual files on disk:
+   * - Removes entries whose page file was deleted (e.g. via Undo or Revert-file).
+   * - Re-computes `unlisted` from the actual file source so cards never disagree with the toolbar.
+   * - When `reconcileInterrupted` is true (e.g. after runner restart/sleep), resolves any stuck
+   *   in-progress spinner (`created`/`queued`/`writing`/`photo`/`menu`) to `done` or `failed`.
+   */
+  async syncPageRequestsFromDisk(opts?: {
+    reconcileInterrupted?: boolean;
+    broadcast?: boolean;
+  }): Promise<boolean> {
+    let changed = false;
+    const activeStatuses = new Set<PageRequestStatus>([
+      'created',
+      'queued',
+      'writing',
+      'photo',
+      'menu',
+    ]);
+
+    for (const [id, pr] of Array.from(this.pageRequests.entries())) {
+      const abs = path.join(this.opts.repoRoot, pr.file);
+      let src: string;
+      try {
+        src = await fs.readFile(abs, 'utf8');
+      } catch {
+        this.pageRequests.delete(id);
+        changed = true;
+        continue;
+      }
+
+      const ext = path.extname(pr.file);
+      const actualUnlisted = await isPageSourceUnlisted(src, ext).catch(() => pr.unlisted);
+      let nextStatus = pr.status;
+      let nextError = pr.error;
+
+      if (opts?.reconcileInterrupted && activeStatuses.has(pr.status)) {
+        if (src.includes(HALLEY_PLACEHOLDER_ATTR)) {
+          nextStatus = 'failed';
+          nextError = 'Workspace restarted before finishing this page.';
+        } else {
+          nextStatus = 'done';
+          nextError = undefined;
+        }
+      }
+
+      if (actualUnlisted !== pr.unlisted || nextStatus !== pr.status || nextError !== pr.error) {
+        this.pageRequests.set(id, {
+          ...pr,
+          unlisted: actualUnlisted,
+          status: nextStatus,
+          error: nextError,
+        });
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.save();
+      if (opts?.broadcast !== false) {
+        this.opts.onBroadcast({
+          type: 'page_requests_sync',
+          pageRequests: this.listPageRequests(),
+        });
+      }
+    }
+    return changed;
+  }
+
   async updateStatus(
     pageRequestId: string,
     status: PageRequestStatus,
@@ -116,8 +193,18 @@ export class PageCreationService {
   ): Promise<PageRequestMetadata | undefined> {
     const existing = this.pageRequests.get(pageRequestId);
     if (!existing) return undefined;
+    let nextUnlisted = existing.unlisted;
+    if (status === 'done') {
+      try {
+        const src = await fs.readFile(path.join(this.opts.repoRoot, existing.file), 'utf8');
+        nextUnlisted = await isPageSourceUnlisted(src, path.extname(existing.file));
+      } catch {
+        // keep existing
+      }
+    }
     const updated: PageRequestMetadata = {
       ...existing,
+      unlisted: nextUnlisted,
       status,
       error: error ?? (status === 'failed' ? existing.error : undefined),
     };
@@ -468,7 +555,9 @@ export class PageCreationService {
       const updated =
         found.ext === '.astro'
           ? await togglePageUnlistedInSource(src, found.fileAbs, unlisted)
-          : src;
+          : found.ext === '.md' || found.ext === '.mdx'
+            ? toggleMarkdownUnlistedInSource(src, unlisted)
+            : src;
       if (updated !== src) {
         const tmp = `${found.fileAbs}.tmp-${Date.now()}`;
         await fs.writeFile(tmp, updated, 'utf8');
@@ -477,9 +566,11 @@ export class PageCreationService {
     });
 
     // Update any stored PageRequestMetadata for this route
+    let prUpdated = false;
     for (const [id, pr] of this.pageRequests.entries()) {
       if (pr.route === clean) {
         this.pageRequests.set(id, { ...pr, unlisted });
+        prUpdated = true;
       }
     }
     await this.save();
@@ -498,8 +589,14 @@ export class PageCreationService {
         changedFilesCount: changes.length,
       });
     }
+    if (prUpdated) {
+      this.opts.onBroadcast({
+        type: 'page_requests_sync',
+        pageRequests: this.listPageRequests(),
+      });
+    }
 
-    // Check if astro.config.mjs has a sitemap filter or if nav links reference this route
+    // Check if astro.config.mjs has a sitemap filter or if scripts/verify-seo.mjs tracks non-indexable routes
     let needsFollowUp = false;
     try {
       const astroCfg = await fs
@@ -514,8 +611,8 @@ export class PageCreationService {
 
     const followUpPrompt = needsFollowUp
       ? unlisted
-        ? `The page \`${clean}\` (${found.fileRel}) was just marked as unlisted (noindex is already set on the page). Please check \`astro.config.mjs\` to exclude \`${clean}\` from the sitemap filter if applicable, and remove any navigation menu or footer links pointing to \`${clean}\`.`
-        : `The page \`${clean}\` (${found.fileRel}) was just made public (noindex was removed from the page). If \`astro.config.mjs\` explicitly excludes \`${clean}\` from the sitemap filter, please remove that exclusion.`
+        ? `The page \`${clean}\` (${found.fileRel}) was just marked as unlisted (noindex is already set on the page). Please check \`astro.config.mjs\` to exclude \`${clean}\` from the sitemap filter if applicable, update \`scripts/verify-seo.mjs\` (\`NON_INDEXABLE_ROUTES\`) if present, and remove any navigation menu or footer links pointing to \`${clean}\`.`
+        : `The page \`${clean}\` (${found.fileRel}) was just made public (noindex was removed from the page). If \`astro.config.mjs\` explicitly excludes \`${clean}\` from the sitemap filter or \`scripts/verify-seo.mjs\` lists it in \`NON_INDEXABLE_ROUTES\`, please remove that exclusion.`
       : undefined;
 
     return {
@@ -594,13 +691,15 @@ export class PageCreationService {
       }
     });
 
-    // Deterministically update exact internal references (url('/old'), href: '/old', '/old' in astro.config.mjs)
+    // Deterministically update exact internal references (including #hash, ?query, trailing /, and base-prefixed config entries)
+    const originalBase = await detectAstroBase(this.opts.repoRoot).catch(() => '/');
+    const basePrefix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
     let updatedReferencesCount = 0;
     const escapedFrom = cleanFrom.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const refPatterns = [
-      new RegExp(`(url\\(\\s*['"])${escapedFrom}(['"]\\s*\\))`, 'g'),
-      new RegExp(`(\\bhref\\s*:\\s*['"])${escapedFrom}(['"])`, 'g'),
-      new RegExp(`(\\bhref\\s*=\\s*['"])${escapedFrom}(['"])`, 'g'),
+      new RegExp(`(url\\(\\s*['"])${escapedFrom}((?:\\/|#[^'"]*|\\?[^'"]*)?['"]\\s*\\))`, 'g'),
+      new RegExp(`(\\bhref\\s*:\\s*['"])${escapedFrom}((?:\\/|#[^'"]*|\\?[^'"]*)?['"])`, 'g'),
+      new RegExp(`(\\bhref\\s*=\\s*['"])${escapedFrom}((?:\\/|#[^'"]*|\\?[^'"]*)?['"])`, 'g'),
     ];
 
     const filesToUpdate: string[] = [];
@@ -615,7 +714,7 @@ export class PageCreationService {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) {
           await walkSrc(full);
-        } else if (/\.(astro|ts|tsx|js|mjs|cjs|json)$/.test(e.name)) {
+        } else if (/\.(astro|ts|tsx|js|mjs|cjs|json|mdx?)$/.test(e.name)) {
           filesToUpdate.push(full);
         }
       }
@@ -625,6 +724,14 @@ export class PageCreationService {
     if (await fs.access(astroCfgAbs).then(() => true).catch(() => false)) {
       filesToUpdate.push(astroCfgAbs);
     }
+    const verifySeoAbs = path.join(this.opts.repoRoot, 'scripts', 'verify-seo.mjs');
+    if (await fs.access(verifySeoAbs).then(() => true).catch(() => false)) {
+      filesToUpdate.push(verifySeoAbs);
+    }
+
+    const escapedBaseFrom = basePrefix
+      ? `${basePrefix}${cleanFrom}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      : null;
 
     for (const abs of filesToUpdate) {
       try {
@@ -633,8 +740,18 @@ export class PageCreationService {
         for (const re of refPatterns) {
           next = next.replace(re, `$1${toRoute}$2`);
         }
-        if (abs === astroCfgAbs) {
-          next = next.replace(new RegExp(`(['"])${escapedFrom}(\\/?['"])`, 'g'), `$1${toRoute}$2`);
+        if (abs === astroCfgAbs || abs === verifySeoAbs) {
+          if (escapedBaseFrom) {
+            next = next.replace(
+              new RegExp(`(['"])${escapedBaseFrom}(\\/?['"])`, 'g'),
+              `$1${basePrefix}${toRoute}$2`,
+            );
+          }
+          // Replace bare route strings while avoiding `base: '/...'`
+          next = next.replace(
+            new RegExp(`(?<!\\bbase\\s*:\\s*)(['"])${escapedFrom}(\\/?['"])`, 'g'),
+            `$1${toRoute}$2`,
+          );
         }
         if (next !== text) {
           await fs.writeFile(abs, next, 'utf8');
@@ -645,10 +762,11 @@ export class PageCreationService {
       }
     }
 
-    // Update any stored PageRequestMetadata for this route
+    // Update any stored PageRequestMetadata for this route (including section)
+    const nextSection = input.toSection || '/';
     for (const [id, pr] of this.pageRequests.entries()) {
       if (pr.route === cleanFrom) {
-        this.pageRequests.set(id, { ...pr, route: toRoute, file: toFileRel });
+        this.pageRequests.set(id, { ...pr, route: toRoute, file: toFileRel, section: nextSection });
       }
     }
     await this.save();

@@ -227,10 +227,6 @@ export function createPreviewProxy(
 
     db.updateSession(session.id, { last_active_at: new Date().toISOString() });
 
-    if (session.publish_state === 'verifying') {
-      return c.html(VERIFYING_HTML, 503);
-    }
-
     let endpoint;
     try {
       endpoint = await driver.ensureRunning(session);
@@ -265,10 +261,24 @@ export function createPreviewProxy(
             path: `${url.pathname}${url.search}`,
             method: c.req.method,
             headers,
+            timeout: 25_000,
           },
-          resolve,
+          (res) => {
+            c.req.raw.signal?.removeEventListener('abort', onAbort);
+            resolve(res);
+          },
         );
-        proxyReq.on('error', reject);
+        const onAbort = () => {
+          proxyReq.destroy(new Error('Preview proxy client aborted'));
+        };
+        c.req.raw.signal?.addEventListener('abort', onAbort, { once: true });
+        proxyReq.on('timeout', () => {
+          proxyReq.destroy(new Error('Preview proxy upstream timed out'));
+        });
+        proxyReq.on('error', (err) => {
+          c.req.raw.signal?.removeEventListener('abort', onAbort);
+          reject(err);
+        });
         if (reqBody && reqBody.length > 0) {
           proxyReq.write(reqBody);
         }
@@ -317,6 +327,13 @@ export function createPreviewProxy(
     socket: Duplex,
     head: Buffer,
   ) => {
+    const user = auth.getUserFromCookieHeader(req.headers.cookie);
+    if (!user) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     let sessionId = '';
     const match = (req.url ?? '').match(/^\/p\/([^/]+)/);
     if (match?.[1]) {
@@ -336,12 +353,22 @@ export function createPreviewProxy(
       return;
     }
 
-    const target = new URL(session.astro_url);
+    let astroUrl = session.astro_url;
+    try {
+      const ep = await driver.ensureRunning(session);
+      astroUrl = ep.astroUrl;
+    } catch {
+      socket.destroy();
+      return;
+    }
+
+    const target = new URL(astroUrl);
     const proxyReq = http.request({
       hostname: target.hostname,
       port: Number(target.port || 80),
       path: req.url,
       method: req.method,
+      timeout: 15_000,
       headers: {
         ...req.headers,
         host: `localhost:${target.port || '4321'}`,
@@ -363,6 +390,14 @@ export function createPreviewProxy(
       socket.on('error', () => proxySocket.destroy());
     });
 
+    proxyReq.on('response', (proxyRes) => {
+      proxyRes.resume();
+      socket.destroy();
+    });
+    proxyReq.on('timeout', () => {
+      proxyReq.destroy();
+      socket.destroy();
+    });
     proxyReq.on('error', () => socket.destroy());
     if (head.length) proxyReq.write(head);
     proxyReq.end();

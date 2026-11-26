@@ -234,8 +234,23 @@ export interface PatchStaticSpanInput {
 }
 
 export type PatchStaticSpanResult =
-  | { ok: true; updatedSource: string; newHash: string }
+  | {
+      ok: true;
+      updatedSource: string;
+      newHash: string;
+      topLineDelta: number;
+      afterLine: number;
+      afterLineDelta: number;
+    }
   | { ok: false; code: 400 | 404 | 409 | 422; error: string };
+
+function countNewlines(text: string): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) n++;
+  }
+  return n;
+}
 
 export async function patchStaticSpan(
   input: PatchStaticSpanInput,
@@ -285,14 +300,21 @@ export async function patchStaticSpan(
       hasUrlHelperFile,
     });
 
+    const originalInner = source.slice(inspected.innerStartOffset, inspected.innerEndOffset);
+    const afterLine = countNewlines(source.slice(0, inspected.innerEndOffset)) + 1;
+    const afterLineDelta = countNewlines(astroSource) - countNewlines(originalInner);
+
     // Preserve leading/trailing whitespace if the original template had formatting indentation
     let patched =
       source.slice(0, inspected.innerStartOffset) +
       astroSource +
       source.slice(inspected.innerEndOffset);
 
+    let topLineDelta = 0;
     if (needsUrlImport) {
+      const beforeImportLines = countNewlines(patched);
       patched = injectUrlImportIfMissing(patched, absPath, input.repoRoot);
+      topLineDelta = countNewlines(patched) - beforeImportLines;
     }
 
     const tmpPath = `${absPath}.halley-tmp-${process.pid}-${Date.now()}`;
@@ -303,6 +325,9 @@ export async function patchStaticSpan(
       ok: true,
       updatedSource: astroSource,
       newHash: inspected.snapshotHash,
+      topLineDelta,
+      afterLine,
+      afterLineDelta,
     };
   });
 }

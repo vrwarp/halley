@@ -29,6 +29,14 @@ export function ConflictCards({ sessionId, review, onUpdated, onUndone }: Props)
   const pendingRecords = review.records.filter((r) => r.status === 'needs_choice');
 
   const handleApplyChoices = async () => {
+    const missingCustom = pendingRecords.find((r) => {
+      const opt = selected[r.id] || r.options?.[0]?.id || 'theirs';
+      return opt === 'custom' && !(customText[r.id] || '').trim();
+    });
+    if (missingCustom) {
+      setError('Please describe what you want in the "Something else…" box before applying.');
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -37,7 +45,7 @@ export function ConflictCards({ sessionId, review, onUpdated, onUndone }: Props)
         return {
           recordId: r.id,
           optionId: opt,
-          ...(opt === 'custom' ? { customInstruction: customText[r.id] || '' } : {}),
+          ...(opt === 'custom' ? { customInstruction: (customText[r.id] || '').trim() } : {}),
         };
       });
       const res = await api.chooseSyncConflicts(sessionId, choices);
@@ -236,8 +244,14 @@ export function ConflictCards({ sessionId, review, onUpdated, onUndone }: Props)
               <button
                 type="button"
                 onClick={() => {
-                  setCustomOpen((p) => ({ ...p, [rec.id]: !p[rec.id] }));
-                  setSelected((p) => ({ ...p, [rec.id]: 'custom' }));
+                  const nextOpen = !customOpen[rec.id];
+                  setCustomOpen((p) => ({ ...p, [rec.id]: nextOpen }));
+                  setSelected((p) => {
+                    if (nextOpen) return { ...p, [rec.id]: 'custom' };
+                    const copy = { ...p };
+                    if (copy[rec.id] === 'custom') delete copy[rec.id];
+                    return copy;
+                  });
                 }}
                 className="text-xs font-medium text-stone-600 underline hover:text-stone-900"
               >

@@ -201,7 +201,13 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                   body: JSON.stringify({ file: relFile, loc: body.loc }),
                 }).catch(() => {});
               }
-              sendJson(res, 200, { ok: true, updatedSource: result.updatedSource });
+              sendJson(res, 200, {
+                ok: true,
+                updatedSource: result.updatedSource,
+                topLineDelta: result.topLineDelta,
+                afterLine: result.afterLine,
+                afterLineDelta: result.afterLineDelta,
+              });
             } catch (err) {
               sendJson(res, 500, {
                 error: err instanceof Error ? err.message : 'Patch failed',

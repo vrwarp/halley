@@ -184,6 +184,7 @@ export default {
     cacheDir: ${JSON.stringify(viteCacheDir)},
     server: {
       ...((baseConfig.vite && baseConfig.vite.server) || {}),
+      strictPort: true,
       allowedHosts: true,
       hmr: false,
     },
@@ -231,7 +232,13 @@ export default {
         if (isErr) {
           console.error(`[halley-astro] ${l}`);
         }
-        if (l.includes('Local') || l.includes(`:${this.opts.astroPort}`) || l.includes('watching for file changes')) {
+        const matchedExpectedPort = l.includes(`:${this.opts.astroPort}`);
+        const matchedAnyPort = /:\d{4,5}\b/.test(l);
+        if (
+          matchedExpectedPort ||
+          (l.includes('Local') && !matchedAnyPort) ||
+          l.includes('watching for file changes')
+        ) {
           this.ready = true;
           this.state = 'ready';
         }
@@ -271,7 +278,7 @@ export default {
         this.restartTimer = setTimeout(() => {
           this.restartTimer = null;
           if (!this.intentionalStop && !this.paused) {
-            void this.spawnAndWait().catch((err) => {
+            void this.enqueueOp(() => this.spawnAndWait()).catch((err) => {
               this.recentLogs.push(`[astro dev auto-restart failed: ${err instanceof Error ? err.message : String(err)}]`);
               this.state = 'crashed';
             });
@@ -309,12 +316,44 @@ export default {
     }
   }
 
+  private opQueue: Promise<unknown> = Promise.resolve();
+
+  private enqueueOp<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.opQueue.then(fn, fn);
+    this.opQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
   private async killCurrentProc(): Promise<void> {
     const p = this.proc;
     if (p && p.exitCode === null) {
+      const waitExit = (timeoutMs: number) =>
+        new Promise<boolean>((resolve) => {
+          if (p.exitCode !== null) {
+            resolve(true);
+            return;
+          }
+          const onExit = () => {
+            clearTimeout(t);
+            resolve(true);
+          };
+          const t = setTimeout(() => {
+            p.off?.('exit', onExit);
+            resolve(p.exitCode !== null);
+          }, timeoutMs);
+          t.unref?.();
+          p.once('exit', onExit);
+        });
+
       p.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 500));
-      if (p.exitCode === null) p.kill('SIGKILL');
+      const exitedGracefully = await waitExit(800);
+      if (!exitedGracefully && p.exitCode === null) {
+        p.kill('SIGKILL');
+        await waitExit(800);
+      }
     }
     if (this.proc === p) {
       this.proc = null;
@@ -322,9 +361,11 @@ export default {
   }
 
   async start(): Promise<{ originalBase: string; previewBase: string }> {
-    await this.ensureWrapperConfig();
-    await this.spawnAndWait();
-    return { originalBase: this.originalBase, previewBase: this.previewBase };
+    return this.enqueueOp(async () => {
+      await this.ensureWrapperConfig();
+      await this.spawnAndWait();
+      return { originalBase: this.originalBase, previewBase: this.previewBase };
+    });
   }
 
   /**
@@ -332,44 +373,52 @@ export default {
    * Preserves the wrapper config file so `resume()` can restart cleanly.
    */
   async pause(): Promise<void> {
-    this.clearRestartTimer();
-    this.paused = true;
-    this.intentionalStop = true;
-    this.ready = false;
-    this.state = 'paused';
-    await this.killCurrentProc();
+    return this.enqueueOp(async () => {
+      this.clearRestartTimer();
+      this.paused = true;
+      this.intentionalStop = true;
+      this.ready = false;
+      this.state = 'paused';
+      await this.killCurrentProc();
+    });
   }
 
   /** Resumes `astro dev` after `pause()`. */
   async resume(): Promise<void> {
-    if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
-      await this.ensureWrapperConfig();
-    }
-    this.paused = false;
-    await this.spawnAndWait();
+    return this.enqueueOp(async () => {
+      if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
+        await this.ensureWrapperConfig();
+      }
+      this.paused = false;
+      await this.spawnAndWait();
+    });
   }
 
   /** Resets crash history and performs a clean restart of `astro dev`. */
   async restart(): Promise<void> {
-    this.clearRestartTimer();
-    this.crashTimestamps = [];
-    this.intentionalStop = true;
-    this.paused = false;
-    await this.killCurrentProc();
-    if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
-      await this.ensureWrapperConfig();
-    }
-    await this.spawnAndWait();
+    return this.enqueueOp(async () => {
+      this.clearRestartTimer();
+      this.crashTimestamps = [];
+      this.intentionalStop = true;
+      this.paused = false;
+      await this.killCurrentProc();
+      if (!this.wrapperConfigPath && !this.opts.spawnAstro) {
+        await this.ensureWrapperConfig();
+      }
+      await this.spawnAndWait();
+    });
   }
 
   async stop(): Promise<void> {
-    this.clearRestartTimer();
-    this.intentionalStop = true;
-    this.paused = false;
-    await this.killCurrentProc();
-    this.ready = false;
-    if (this.wrapperConfigPath) {
-      await fs.rm(this.wrapperConfigPath, { force: true }).catch(() => {});
-    }
+    return this.enqueueOp(async () => {
+      this.clearRestartTimer();
+      this.intentionalStop = true;
+      this.paused = false;
+      await this.killCurrentProc();
+      this.ready = false;
+      if (this.wrapperConfigPath) {
+        await fs.rm(this.wrapperConfigPath, { force: true }).catch(() => {});
+      }
+    });
   }
 }

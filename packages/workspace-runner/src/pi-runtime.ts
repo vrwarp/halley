@@ -63,6 +63,7 @@ export interface PiRuntimeOptions {
   astroPort: number;
   controlPlaneInternalUrl: string;
   workspaceToken: string;
+  getWorkspaceToken?: () => string;
   supervisorUrl?: string;
   hostSecret?: string;
   modelId: string;
@@ -282,11 +283,14 @@ export class HalleyPiRuntime {
       auth: {
         apiKey: {
           name: 'Halley Workspace Token',
-          login: async () => ({ type: 'api_key' as const, key: this.opts.workspaceToken }),
+          login: async () => ({
+            type: 'api_key' as const,
+            key: this.opts.getWorkspaceToken?.() ?? this.opts.workspaceToken,
+          }),
           resolve: async () => ({
             auth: {
               headers: {
-                Authorization: `Bearer ${this.opts.workspaceToken}`,
+                Authorization: `Bearer ${this.opts.getWorkspaceToken?.() ?? this.opts.workspaceToken}`,
                 'x-halley-purpose': this.activePurpose,
               },
             },
@@ -373,11 +377,38 @@ export class HalleyPiRuntime {
   private buildHalleyExtension(agentsMdText: string) {
     const opts = this.opts;
 
-    // Track in-flight file mutations and build checks so parallel screenshot_page / run_checks calls
-    // emitted in the same assistant turn always wait for writes + Astro dev server recovery.
+    // Track in-flight file mutations, screenshots, and build checks so parallel tool calls
+    // emitted in the same assistant turn never race (e.g. run_checks pausing Astro mid-screenshot
+    // or create_page committing half-written edits).
     const inFlightMutations = new Set<Promise<unknown>>();
     const inFlightChecks = new Set<Promise<unknown>>();
+    const inFlightScreenshots = new Set<Promise<unknown>>();
     let lastMutationFinishedAt = 0;
+
+    let activeLockCount = 0;
+    const withWorkspaceLock = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
+      activeLockCount += 1;
+      if (activeLockCount === 1) {
+        opts.onLockChange(true, label);
+      }
+      try {
+        return await fn();
+      } finally {
+        activeLockCount = Math.max(0, activeLockCount - 1);
+        if (activeLockCount === 0) {
+          opts.onLockChange(false, label);
+        }
+      }
+    };
+
+    const isLikelyReadOnlyBash = (cmd: string): boolean => {
+      const trimmed = cmd.trim();
+      if (!trimmed) return true;
+      if (/[<>]|&&|\|\||;|\b(?:rm|mv|cp|mkdir|touch|tee|chmod|chown|sed\s+-i|perl\s+-i|git\s+(?:add|commit|checkout|reset|revert|merge|rebase|clean|rm|mv))\b/.test(trimmed)) {
+        return false;
+      }
+      return /^(?:rg|grep|ls|cat|head|tail|find|jq|wc|stat|file|pwd|echo|git\s+(?:status|diff|log|show|rev-parse|branch))\b/.test(trimmed);
+    };
 
     const trackMutation = async <T>(fn: () => Promise<T>): Promise<T> => {
       const p = fn();
@@ -472,78 +503,88 @@ export class HalleyPiRuntime {
         ),
       }),
       execute: async (args) => {
-        // Ensure any parallel edit/write/bash in the same turn finishes and Vite invalidates CSS first
+        // Ensure any parallel edit/write/bash/create_page finishes and Vite invalidates CSS first
         await waitForPendingMutations(200);
         while (inFlightChecks.size > 0) {
           await Promise.allSettled([...inFlightChecks]);
         }
 
-        const cleanRoute = args.route.startsWith('/') ? args.route : `/${args.route}`;
-        const endpoint = `${opts.controlPlaneInternalUrl.replace(/\/$/, '')}/internal/screenshot`;
-        const viewports: Array<'desktop' | 'mobile'> =
-          args.viewport === 'both' ? ['desktop', 'mobile'] : [args.viewport];
-        const output: Array<
-          { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
-        > = [];
+        const captureTask = (async () => {
+          const cleanRoute = args.route.startsWith('/') ? args.route : `/${args.route}`;
+          const endpoint = `${opts.controlPlaneInternalUrl.replace(/\/$/, '')}/internal/screenshot`;
+          const viewports: Array<'desktop' | 'mobile'> =
+            args.viewport === 'both' ? ['desktop', 'mobile'] : [args.viewport];
+          const output: Array<
+            { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+          > = [];
+          const token = opts.getWorkspaceToken?.() ?? opts.workspaceToken;
 
-        const results = await Promise.all(
-          viewports.map(async (vp) => {
-            const fallbackSize =
-              vp === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 };
-            const res = await fetch(endpoint, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${opts.workspaceToken}`,
-              },
-              body: JSON.stringify({
-                route: cleanRoute,
-                viewport: vp,
-                ...(args.fullPage ? { fullPage: true } : {}),
-              }),
-            });
+          const results = await Promise.all(
+            viewports.map(async (vp) => {
+              const fallbackSize =
+                vp === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 };
+              const res = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                  route: cleanRoute,
+                  viewport: vp,
+                  ...(args.fullPage ? { fullPage: true } : {}),
+                }),
+              });
 
-            if (!res.ok) {
-              const errText = await res.text().catch(() => res.statusText);
-              return { error: `Screenshot failed (${res.status}): ${errText}` as string };
-            }
+              if (!res.ok) {
+                const errText = await res.text().catch(() => res.statusText);
+                return { error: `Screenshot failed (${res.status}): ${errText}` as string };
+              }
 
-            const rawContentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]!.trim();
-            const mimeType = rawContentType.startsWith('image/') ? rawContentType : 'image/jpeg';
-            const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
-            const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
-            const imgBytes = Buffer.from(await res.arrayBuffer());
-            return {
-              vp,
-              width,
-              height,
-              mimeType,
-              base64: imgBytes.toString('base64'),
-            };
-          }),
-        );
-
-        for (const r of results) {
-          if ('error' in r) {
-            return {
-              output: [{ type: 'text', text: r.error! }],
-              isError: true,
-            };
-          }
-          output.push(
-            {
-              type: 'text',
-              text: `Captured ${r.vp} (${r.width}x${r.height}${args.fullPage ? ', fullPage' : ''}) screenshot of ${cleanRoute}`,
-            },
-            {
-              type: 'image',
-              data: r.base64,
-              mimeType: r.mimeType,
-            },
+              const rawContentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0]!.trim();
+              const mimeType = rawContentType.startsWith('image/') ? rawContentType : 'image/jpeg';
+              const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
+              const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
+              const imgBytes = Buffer.from(await res.arrayBuffer());
+              return {
+                vp,
+                width,
+                height,
+                mimeType,
+                base64: imgBytes.toString('base64'),
+              };
+            }),
           );
-        }
 
-        return { output };
+          for (const r of results) {
+            if ('error' in r) {
+              return {
+                output: [{ type: 'text' as const, text: r.error! }],
+                isError: true,
+              };
+            }
+            output.push(
+              {
+                type: 'text' as const,
+                text: `Captured ${r.vp} (${r.width}x${r.height}${args.fullPage ? ', fullPage' : ''}) screenshot of ${cleanRoute}`,
+              },
+              {
+                type: 'image' as const,
+                data: r.base64,
+                mimeType: r.mimeType,
+              },
+            );
+          }
+
+          return { output };
+        })();
+
+        inFlightScreenshots.add(captureTask);
+        try {
+          return await captureTask;
+        } finally {
+          inFlightScreenshots.delete(captureTask);
+        }
       },
     });
 
@@ -553,9 +594,13 @@ export class HalleyPiRuntime {
         'Run the full pre-publish verification suite (Astro Hygiene Guard, astro check, production build, verify:seo, etc.) against the repository.',
       parameters: obj({}),
       execute: async () => {
-        await waitForPendingMutations(0);
         const queueNotes: string[] = [];
+        // Register in inFlightChecks synchronously BEFORE any await so parallel screenshot_page calls wait cleanly
         const runTask = (async () => {
+          await waitForPendingMutations(0);
+          while (inFlightScreenshots.size > 0) {
+            await Promise.allSettled([...inFlightScreenshots]);
+          }
           await opts.pauseAstroForBuild?.();
           try {
             const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot, {
@@ -610,26 +655,39 @@ export class HalleyPiRuntime {
         styleLikeRoute: opt(
           str({ description: 'Optional existing route to match visually, e.g. "/events/mens-retreat", or "__blank__"' }),
         ),
-        navGroup: opt(str({ description: 'Optional navigation group name if adding to the site menu' })),
-        unlisted: opt(bool({ description: 'True to keep the page hidden from menus, search engines, and sitemap' })),
+        navGroup: opt(
+          str({
+            description:
+              'Optional navigation group name if adding to the top site menu. Omit this for normal subpages (like event detail pages) that should stay out of the main nav menu while still being public/searchable.',
+          }),
+        ),
+        unlisted: opt(
+          bool({
+            description:
+              'True ONLY for hidden/private/draft pages that must have noindex and stay out of Google search and the sitemap. Leave false/omitted for normal public pages even if they are not in the top navigation menu.',
+          }),
+        ),
       }),
       execute: async (args) => {
         if (!opts.pageService) {
           return { output: [{ type: 'text', text: 'Page creation service is unavailable.' }], isError: true };
         }
+        await waitForPendingMutations(0);
         try {
           const slug = (args.slug && args.slug.trim()) || slugifyPagePath(args.title);
-          const result = await opts.pageService.createPage(
-            {
-              title: args.title,
-              slug,
-              section: args.section || '/',
-              purpose: args.purpose,
-              styleLikeRoute: args.styleLikeRoute,
-              nav: args.navGroup && !args.unlisted ? { mode: 'group', group: args.navGroup } : { mode: 'none' },
-              unlisted: Boolean(args.unlisted),
-            },
-            { fromPiTool: true },
+          const result = await trackMutation(() =>
+            opts.pageService!.createPage(
+              {
+                title: args.title,
+                slug,
+                section: args.section || '/',
+                purpose: args.purpose,
+                styleLikeRoute: args.styleLikeRoute,
+                nav: args.navGroup && !args.unlisted ? { mode: 'group', group: args.navGroup } : { mode: 'none' },
+                unlisted: Boolean(args.unlisted),
+              },
+              { fromPiTool: true },
+            ),
           );
           this.trackedPageRequestIds.add(result.pageRequest.pageRequestId);
           return {
@@ -668,14 +726,9 @@ export class HalleyPiRuntime {
         ) => {
           const target = String((args as Record<string, unknown>).path ?? '');
           const rel = path.relative(opts.repoRoot, path.resolve(opts.repoRoot, target)).split(path.sep).join('/');
-          opts.onLockChange(true, rel);
-          try {
-            return await trackMutation(() =>
-              opts.fileLock.withLock(rel, () => base.execute(args as never, api, ctx)),
-            );
-          } finally {
-            opts.onLockChange(false, rel);
-          }
+          return withWorkspaceLock(rel, () =>
+            trackMutation(() => opts.fileLock.withLock(rel, () => base.execute(args as never, api, ctx))),
+          );
         },
       }));
 
@@ -687,9 +740,8 @@ export class HalleyPiRuntime {
         ctx: Parameters<typeof base.execute>[2],
       ) => {
         const cmd = String((args as Record<string, unknown>).command ?? '');
-        opts.onLockChange(true, 'shell');
-        try {
-          return await trackMutation(async () => {
+        const runBash = () =>
+          trackMutation(async () => {
             if (cmd && isDependencyMutationCommand(cmd)) {
               await detachHardlinkedNodeModules(opts.repoRoot, opts.stateDir).catch(() => {});
             }
@@ -697,9 +749,10 @@ export class HalleyPiRuntime {
             await sanitizeProtectedPaths(opts.repoRoot).catch(() => {});
             return res;
           });
-        } finally {
-          opts.onLockChange(false, 'shell');
+        if (isLikelyReadOnlyBash(cmd)) {
+          return runBash();
         }
+        return withWorkspaceLock('shell', runBash);
       },
     }));
 
@@ -798,6 +851,9 @@ export class HalleyPiRuntime {
                 }
               }
             }
+            if (opts.pageService) {
+              await opts.pageService.syncPageRequestsFromDisk().catch(() => {});
+            }
             return undefined;
           },
         }),
@@ -838,7 +894,7 @@ export class HalleyPiRuntime {
       'Shared server rule: this session shares a workspace container with other live editor sessions. Stay strictly inside your current working directory (`cwd`), never traverse parent directories (`..`), never run process-killing commands (`kill`, `pkill`, `killall`, `fuser`) or launch dev servers (`astro dev` is managed automatically by Halley), and always use `run_checks` instead of running `astro build` / `npm run build` / `npm run check` via `bash`.',
       'Never attempt to modify files under `.github/`. They are protected and read-only.',
       `When the user asks in chat to create a brand-new page, ALWAYS call the \`create_page\` tool first to scaffold and validate the page, then edit the generated file to replace the \`${HALLEY_PLACEHOLDER_ATTR}\` section with complete content. Never leave \`${HALLEY_PLACEHOLDER_ATTR}\` in a finished page.`,
-      'When creating an unlisted, hidden, or placeholder ("coming soon") page without real visitor content yet, keep `indexable={false}` (or `<meta name="robots" content="noindex" />`), do NOT link it in navigation menus or footer, and exclude it from the sitemap in `astro.config.mjs` if `@astrojs/sitemap` filter is used. Once real visitor content is added, offer or switch it to indexable.',
+      'Omitting `navGroup` on `create_page` already keeps a subpage (e.g. an event detail page) out of the top navigation menu while keeping it public and searchable. Only pass `unlisted: true` when the user explicitly wants a hidden/unlisted `noindex` page or a temporary "coming soon" placeholder—and if `unlisted: true` was requested, preserve `indexable={false}` (or `<meta name="robots" content="noindex" />`), exclude it from `astro.config.mjs` sitemap filter and `scripts/verify-seo.mjs` (`NON_INDEXABLE_ROUTES`) if present, and do NOT link it in navigation menus or footer.',
       'When images are attached with a `stagedId`, use `process_image` to convert and save them cleanly into `public/images/...`.',
       'After significant layout or visual changes, use `screenshot_page` (you can pass `viewport: "both"` and `fullPage: true` to inspect desktop and mobile in one step) to verify your work visually, and run `run_checks` to confirm `astro check`, `build`, and SEO checks pass.',
     ].join('\n');
@@ -1046,6 +1102,13 @@ export class HalleyPiRuntime {
                 .map((b) => b.text)
                 .join('\n')
             : '';
+          let toolPageRequest: PageRequestMetadata | undefined;
+          if (msg.toolName === 'create_page' && !msg.isError && this.opts.pageService) {
+            const routeMatch = textOut.match(/\(route\s+(\/[^)\s]+)\)/);
+            if (routeMatch?.[1]) {
+              toolPageRequest = this.opts.pageService.findLatestByRoute(routeMatch[1]);
+            }
+          }
           entries.push({
             id: String(entry.id),
             kind: entry.kind,
@@ -1054,6 +1117,7 @@ export class HalleyPiRuntime {
             toolName: msg.toolName,
             toolStatus: msg.isError ? 'error' : 'done',
             toolOutput: textOut.slice(0, 1200),
+            ...(toolPageRequest ? { pageRequest: toolPageRequest } : {}),
           });
         }
       }

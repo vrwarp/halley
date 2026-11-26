@@ -753,11 +753,19 @@ export async function withSupervisorBuildLock<T>(
     return await fn();
   } finally {
     await closeReader();
-    await fetch(`${supervisorUrl}/internal/build-lock/release`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ leaseId }),
-    }).catch(() => {});
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const relRes = await fetch(`${supervisorUrl}/internal/build-lock/release`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ leaseId }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (relRes.ok) break;
+      } catch {
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 150));
+      }
+    }
   }
 }
 
@@ -882,14 +890,20 @@ export async function runAllVerificationChecks(
       // Same-tree coalescing
       if (treeSha && existing.treeSha === treeSha && !existing.abortController.signal.aborted) {
         if (existing.priority === 'speculative' && priority === 'foreground') {
-          existing.priority = 'foreground';
           if (existing.leaseId && existing.supervisorUrl) {
-            void promoteSupervisorBuildLock(
+            const promoted = await promoteSupervisorBuildLock(
               existing.supervisorUrl,
               existing.hostSecret,
               existing.leaseId,
             );
+            if (!promoted) {
+              // Lease was already preempted by another session: abort the speculative run and start fresh
+              existing.abortController.abort();
+              await existing.promise.catch(() => {});
+              continue;
+            }
           }
+          existing.priority = 'foreground';
         }
         const joined = await existing.promise;
         if (joined.aborted && priority === 'foreground') {

@@ -51,6 +51,23 @@ export function createControlPlane(
   customScreenshotService?: ScreenshotService,
 ) {
   const db = new ControlPlaneDb(path.join(config.dataDir, 'control-plane.sqlite'), config);
+  const stalePublishStates = new Set([
+    'verifying',
+    'rebasing',
+    'resolving_conflicts',
+    'pushing_pr',
+    'waiting_ci',
+    'deploying_pages',
+  ]);
+  for (const s of db.listSessions()) {
+    if (
+      stalePublishStates.has(s.publish_state) &&
+      s.status !== 'merged' &&
+      s.status !== 'published'
+    ) {
+      db.updateSession(s.id, { publish_state: 'idle', publish_error: null });
+    }
+  }
   const auth = new AuthService(config, db);
   const github = new GitHubService(config);
 
@@ -167,16 +184,14 @@ export function createControlPlane(
 
     db.updateSession(session.id, { last_active_at: new Date().toISOString() });
 
-    let astroUrl = session.astro_url;
-    let originalBase = session.astro_base || '/';
-    if (!astroUrl) {
-      try {
-        const ep = await driver.ensureRunning(session);
-        astroUrl = ep.astroUrl;
-        originalBase = ep.astroBase || '/';
-      } catch {
-        return c.json({ error: 'Workspace preview server is not running' }, 503);
-      }
+    let astroUrl: string;
+    let originalBase: string;
+    try {
+      const ep = await driver.ensureRunning(session);
+      astroUrl = ep.astroUrl;
+      originalBase = ep.astroBase || '/';
+    } catch {
+      return c.json({ error: 'Workspace preview server is not running' }, 503);
     }
 
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -228,7 +243,7 @@ export function createControlPlane(
   });
 
   // Internal hook called by workspace-runner when an edit checkpoint is created
-  app.post('/internal/session/diverged', (c) => {
+  app.post('/internal/session/diverged', async (c) => {
     const authHeader = c.req.header('authorization') || '';
     const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
     if (!rawToken) {
@@ -237,6 +252,10 @@ export function createControlPlane(
     const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
     if (!session) {
       return c.json({ error: 'Invalid workspace token' }, 401);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as { changedFilesCount?: unknown };
+    if (typeof body.changedFilesCount === 'number' && Number.isFinite(body.changedFilesCount)) {
+      db.updateSession(session.id, { changed_files_count: body.changedFilesCount });
     }
     const converted = convertAndBroadcastIfRevert(session.id);
     return c.json({ ok: true, converted: Boolean(converted), kind: converted?.kind ?? session.kind });
@@ -443,17 +462,20 @@ export function createControlPlane(
 
     // Ensure source transcript is captured in session_archives for unified Hybrid carry-over (Q18, Q19)
     let srcArchive = db.getSessionArchive(src.id);
-    if (!srcArchive && src.runner_url) {
-      await publishService
-        .archiveSessionDeterministically(
-          src.id,
-          src.runner_url,
-          src.base_branch,
-          src.merged_sha,
-          src.pr_url,
-        )
-        .catch(() => {});
-      srcArchive = db.getSessionArchive(src.id);
+    if (!srcArchive && !src.volume_expired_at && (src.runner_url || src.status === 'sleeping')) {
+      const srcEp = await driver.ensureRunning(src).catch(() => null);
+      if (srcEp?.runnerUrl) {
+        await publishService
+          .archiveSessionDeterministically(
+            src.id,
+            srcEp.runnerUrl,
+            src.base_branch,
+            src.merged_sha,
+            src.pr_url,
+          )
+          .catch(() => {});
+        srcArchive = db.getSessionArchive(src.id);
+      }
     }
 
     const parentArchive = src.parent_session_id ? db.getSessionArchive(src.parent_session_id) : null;
@@ -474,7 +496,7 @@ export function createControlPlane(
     const slug = slugify(title);
     const rawToken = crypto.randomBytes(24).toString('hex');
 
-    const copy = db.createSession({
+    let copy = db.createSession({
       id,
       title,
       slug,
@@ -488,6 +510,10 @@ export function createControlPlane(
       volumeName: `halley-ws-${id}`,
       workspaceTokenHash: hashWorkspaceToken(rawToken),
     });
+    if (mode === 'branch-off' && src.changed_files_count > 0) {
+      db.updateSession(copy.id, { changed_files_count: src.changed_files_count });
+      copy = db.getSession(copy.id) ?? copy;
+    }
 
     driver.setRawWorkspaceToken?.(id, rawToken);
 
@@ -500,6 +526,7 @@ export function createControlPlane(
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ note: handoffSummary, persist: true }),
+            signal: AbortSignal.timeout(15_000),
           }).catch(() => {});
         }
       })
@@ -564,16 +591,19 @@ export function createControlPlane(
     // Ensure source transcript is captured if undoing a Halley session whose archive wasn't saved yet
     let srcArchive = srcSession ? db.getSessionArchive(srcSession.id) : null;
     if (srcSession && !srcArchive && srcSession.runner_url) {
-      await publishService
-        .archiveSessionDeterministically(
-          srcSession.id,
-          srcSession.runner_url,
-          srcSession.base_branch,
-          srcSession.merged_sha,
-          srcSession.pr_url,
-        )
-        .catch(() => {});
-      srcArchive = db.getSessionArchive(srcSession.id);
+      const srcEp = await driver.ensureRunning(srcSession).catch(() => null);
+      if (srcEp?.runnerUrl) {
+        await publishService
+          .archiveSessionDeterministically(
+            srcSession.id,
+            srcEp.runnerUrl,
+            srcSession.base_branch,
+            srcSession.merged_sha,
+            srcSession.pr_url,
+          )
+          .catch(() => {});
+        srcArchive = db.getSessionArchive(srcSession.id);
+      }
     }
     const parentArchive = srcSession?.parent_session_id
       ? db.getSessionArchive(srcSession.parent_session_id)
@@ -609,6 +639,7 @@ export function createControlPlane(
       revertCheckpointSha?: string;
       revertedCommits?: RevertedCommitSummaryDto[];
       conflictedFiles?: string[];
+      changedFilesCount?: number;
       [key: string]: unknown;
     };
     let revertResult: RevertStartResult | null = null;
@@ -618,12 +649,18 @@ export function createControlPlane(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shas: targetShas }),
+        signal: AbortSignal.timeout(55_000),
       });
       revertResult = (await res.json().catch(() => null)) as RevertStartResult | null;
+      const revUpdates: Record<string, unknown> = {};
       if (revertResult?.revertCheckpointSha) {
-        db.updateSession(revertSession.id, {
-          initial_revert_sha: revertResult.revertCheckpointSha,
-        });
+        revUpdates.initial_revert_sha = revertResult.revertCheckpointSha;
+      }
+      if (typeof revertResult?.changedFilesCount === 'number') {
+        revUpdates.changed_files_count = revertResult.changedFilesCount;
+      }
+      if (Object.keys(revUpdates).length > 0) {
+        db.updateSession(revertSession.id, revUpdates);
       }
 
       const undoSummary = buildUndoHandoffSummary({
@@ -648,6 +685,7 @@ export function createControlPlane(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ note: undoSummary, persist: true }),
+        signal: AbortSignal.timeout(15_000),
       }).catch(() => {});
     } catch {
       // Workspace may still be booting; UI can retry
@@ -833,6 +871,7 @@ export function createControlPlane(
     const ep = await driver.ensureRunning(s);
     const res = await fetch(
       `${ep.runnerUrl}/internal/page-options?capped=${spend.capped ? 'true' : 'false'}`,
+      { signal: AbortSignal.timeout(15_000) },
     );
     return c.json(await res.json(), res.status as 200);
   });
@@ -847,6 +886,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, capped: spend.capped }),
+      signal: AbortSignal.timeout(25_000),
     });
     const data = (await res.json()) as { changedFilesCount?: number };
     if (res.ok && typeof data.changedFilesCount === 'number') {
@@ -871,6 +911,7 @@ export function createControlPlane(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ capped: spend.capped, viewport: reqBody.viewport }),
+        signal: AbortSignal.timeout(25_000),
       },
     );
     return c.json(await res.json(), res.status as 200);
@@ -883,12 +924,16 @@ export function createControlPlane(
     const route = c.req.query('route') || '';
     const res = await fetch(
       `${ep.runnerUrl}/internal/pages?route=${encodeURIComponent(route)}`,
-      { method: 'DELETE' },
+      { method: 'DELETE', signal: AbortSignal.timeout(25_000) },
     );
+    const data = (await res.json()) as { changedFilesCount?: number };
+    if (res.ok && typeof data.changedFilesCount === 'number') {
+      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
     if (res.ok) {
       convertAndBroadcastIfRevert(check.session.id);
     }
-    return c.json(await res.json(), res.status as 200);
+    return c.json(data, res.status as 200);
   });
 
   app.post('/api/sessions/:id/pages/visibility', auth.requireAuth, async (c) => {
@@ -901,6 +946,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, capped: spend.capped }),
+      signal: AbortSignal.timeout(25_000),
     });
     const data = (await res.json()) as { changedFilesCount?: number };
     if (res.ok && typeof data.changedFilesCount === 'number') {
@@ -921,6 +967,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25_000),
     });
     const data = (await res.json()) as { changedFilesCount?: number };
     if (res.ok && typeof data.changedFilesCount === 'number') {
@@ -957,11 +1004,16 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...body, baseRef: `origin/${check.session.base_branch}` }),
+      signal: AbortSignal.timeout(25_000),
     });
+    const data = (await res.json()) as { changedFilesCount?: number };
     if (res.ok) {
+      if (typeof data.changedFilesCount === 'number') {
+        db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+      }
       convertAndBroadcastIfRevert(check.session.id);
     }
-    return c.json(await res.json(), res.status as 200);
+    return c.json(data, res.status as 200);
   });
 
   app.post('/api/sessions/:id/undo', auth.requireAuth, async (c) => {
@@ -973,15 +1025,23 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25_000),
     });
-    return c.json(await res.json(), res.status as 200);
+    const data = (await res.json()) as { changedFilesCount?: number };
+    if (res.ok && typeof data.changedFilesCount === 'number') {
+      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
+    }
+    return c.json(data, res.status as 200);
   });
 
   app.post('/api/sessions/:id/verify', auth.requireAuth, async (c) => {
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
     const ep = await driver.ensureRunning(s);
-    const res = await fetch(`${ep.runnerUrl}/internal/verify`, { method: 'POST' });
+    const res = await fetch(`${ep.runnerUrl}/internal/verify`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(180_000),
+    });
     return c.json(await res.json(), res.status as 200);
   });
 
@@ -993,6 +1053,7 @@ export function createControlPlane(
     const res = await fetch(`${ep.runnerUrl}/internal/uploads`, {
       method: 'POST',
       body: formData,
+      signal: AbortSignal.timeout(30_000),
     });
     return c.json(await res.json(), res.status as 200);
   });
@@ -1006,8 +1067,12 @@ export function createControlPlane(
     };
     const ep = await driver.ensureRunning(check.session);
     const ghToken = await github.getAccessToken().catch(() => '');
+    let fetchedByDriver = false;
     if (ghToken) {
-      await driver.fetchIntoSession(check.session, ghToken).catch(() => {});
+      fetchedByDriver = await driver
+        .fetchIntoSession(check.session, ghToken)
+        .then(() => true)
+        .catch(() => false);
     }
     const res = await fetch(`${ep.runnerUrl}/internal/sync/start`, {
       method: 'POST',
@@ -1016,14 +1081,24 @@ export function createControlPlane(
         baseBranch: check.session.base_branch,
         kind: body.kind ?? 'sync',
         autoSyncOnly: body.autoSyncOnly,
-        skipFetch: Boolean(ghToken),
+        skipFetch: fetchedByDriver,
       }),
+      signal: AbortSignal.timeout(55_000),
     });
     const data = (await res.json().catch(() => ({ error: 'Sync failed' }))) as {
-      review?: { newBaseSha?: string; prevBaseSha?: string; status?: string };
+      review?: {
+        newBaseSha?: string;
+        prevBaseSha?: string;
+        status?: string;
+        alreadyUpToDate?: boolean;
+      };
       error?: string;
     };
-    if (data.review?.newBaseSha && data.review.status !== 'needs_choices') {
+    if (
+      data.review?.newBaseSha &&
+      data.review.status !== 'needs_choices' &&
+      !data.review.alreadyUpToDate
+    ) {
       db.updateSession(check.session.id, {
         prev_base_sha: data.review.prevBaseSha ?? (check.session.base_sha || null),
         base_sha: data.review.newBaseSha,
@@ -1050,6 +1125,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(55_000),
     });
     const data = (await res.json().catch(() => ({ error: 'Choice failed' }))) as {
       review?: { newBaseSha?: string; prevBaseSha?: string; status?: string };
@@ -1072,11 +1148,23 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25_000),
     });
-    if (res.ok && check.session.prev_base_sha) {
-      db.updateSession(check.session.id, { base_sha: check.session.prev_base_sha });
+    const data = (await res.json().catch(() => ({ ok: res.ok }))) as {
+      ok?: boolean;
+      changedFilesCount?: number;
+    };
+    if (res.ok) {
+      const updates: Record<string, unknown> = {};
+      if (check.session.prev_base_sha) updates.base_sha = check.session.prev_base_sha;
+      if (typeof data.changedFilesCount === 'number') {
+        updates.changed_files_count = data.changedFilesCount;
+      }
+      if (Object.keys(updates).length > 0) {
+        db.updateSession(check.session.id, updates);
+      }
     }
-    return c.json(await res.json().catch(() => ({ ok: res.ok })), res.status as 200);
+    return c.json(data, res.status as 200);
   });
 
   app.post('/api/sessions/:id/sync/estimate-escalation', auth.requireAuth, async (c) => {
@@ -1102,6 +1190,7 @@ export function createControlPlane(
         escalationModelId: config.escalationModelId,
         hardCeilingUsd: config.escalationMaxUsd,
       }),
+      signal: AbortSignal.timeout(25_000),
     });
     return c.json(await res.json().catch(() => ({ error: 'Estimate failed' })), res.status as 200);
   });
@@ -1125,6 +1214,7 @@ export function createControlPlane(
         escalationThinking: config.escalationThinkingLevel,
         ceilingUsd: Math.min(body.ceilingUsd ?? config.escalationMaxUsd, config.escalationMaxUsd),
       }),
+      signal: AbortSignal.timeout(55_000),
     });
     return c.json(await res.json().catch(() => ({ error: 'Escalation failed' })), res.status as 200);
   });
@@ -1138,6 +1228,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25_000),
     });
     return c.json(await res.json().catch(() => ({ error: 'Apply failed' })), res.status as 200);
   });
@@ -1155,7 +1246,9 @@ export function createControlPlane(
     });
     if (activeRoute) qs.set('activeRoute', activeRoute);
 
-    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
+    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`, {
+      signal: AbortSignal.timeout(20_000),
+    });
     if (res.ok && !includeScreenshots && s.status === 'running' && s.kind === 'revert') {
       void fetch(`${ep.runnerUrl}/internal/verify/speculative`, { method: 'POST' }).catch(() => {});
     }
@@ -1225,7 +1318,9 @@ export function createControlPlane(
     const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
 
     const qs = new URLSearchParams({ baseRef: `origin/${s.base_branch}` });
-    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`);
+    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`, {
+      signal: AbortSignal.timeout(20_000),
+    });
     if (!res.ok) {
       return c.json({ error: 'Failed to load review metadata' }, 502);
     }
@@ -1259,6 +1354,7 @@ export function createControlPlane(
       baseSha: data.baseSha ?? s.base_sha,
       viewport: screenshotViewport,
       liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+      signal: c.req.raw.signal,
     });
 
     return c.json({ page });
@@ -1328,6 +1424,7 @@ export function createControlPlane(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(25_000),
     });
     const data = await res.json().catch(() => ({ ok: res.ok }));
     return c.json(data, res.ok ? 200 : 400);
@@ -1409,6 +1506,7 @@ export function createControlPlane(
       >;
       return c.json({ ...data, priorThread }, res.ok ? 200 : 502);
     } catch {
+      void driver.reconcileSessions?.().catch(() => {});
       return c.json(
         {
           error: 'Workspace is not reachable',
@@ -1466,8 +1564,10 @@ export function createControlPlane(
         contextChips: [],
         attachments: [],
       }),
+      signal: AbortSignal.timeout(25_000),
     });
     db.updateSession(check.session.id, { publish_state: 'idle', publish_error: null });
+    broadcastToSession(check.session.id, { type: 'publish_state', payload: { state: 'idle' } });
     return c.json({ ok: true });
   });
 
@@ -1660,6 +1760,12 @@ export function createControlPlane(
       socket.destroy();
       return;
     }
+    const user = auth.getUserFromCookieHeader(req.headers.cookie);
+    if (!user) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     const sessionId = chatMatch[1];
     const session = db.getSession(sessionId);
     if (!session) {
@@ -1682,6 +1788,24 @@ export function createControlPlane(
         }
       }, 20_000);
 
+      let runnerWs: WebSocket | null = null;
+      let browserClosed = false;
+      const pendingMessages: string[] = [];
+
+      // Register close handler BEFORE awaiting driver.ensureRunning so early disconnects
+      // never leak pingTimer, browserWsBySession entries, or orphan runnerWs sockets.
+      browserWs.on('close', () => {
+        browserClosed = true;
+        clearInterval(pingTimer);
+        set?.delete(browserWs);
+        if (
+          runnerWs &&
+          (runnerWs.readyState === WebSocket.OPEN || runnerWs.readyState === WebSocket.CONNECTING)
+        ) {
+          runnerWs.close();
+        }
+      });
+
       // Push current spend, publish status, and boot progress immediately (re-read latest DB state)
       const latestSession = db.getSession(sessionId) ?? session;
       const spend = db.getSpendStatus(latestSession.owner_user_id);
@@ -1702,10 +1826,23 @@ export function createControlPlane(
         browserWs.send(JSON.stringify({ type: 'boot_progress', progress: currentBootProgress }));
       }
 
-      let runnerWs: WebSocket | null = null;
-      const pendingMessages: string[] = [];
-
       browserWs.on('message', (data) => {
+        const curSession = db.getSession(sessionId) ?? latestSession;
+        const canEdit =
+          (curSession.owner_user_id === user.id || user.isAdmin) &&
+          curSession.status !== 'published' &&
+          curSession.status !== 'merged';
+        if (!canEdit) {
+          if (browserWs.readyState === WebSocket.OPEN) {
+            browserWs.send(
+              JSON.stringify({
+                type: 'error',
+                message: 'This session is read-only. You do not have permission to send edits.',
+              }),
+            );
+          }
+          return;
+        }
         db.updateSession(sessionId, { last_active_at: new Date().toISOString() });
         const str = data.toString();
         if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
@@ -1717,9 +1854,16 @@ export function createControlPlane(
 
       try {
         const ep = await driver.ensureRunning(latestSession);
+        if (browserClosed || browserWs.readyState !== WebSocket.OPEN) {
+          return;
+        }
         const wsUrl = ep.runnerUrl.replace(/^http/, 'ws') + '/ws';
         runnerWs = new WebSocket(wsUrl);
         runnerWs.on('open', () => {
+          if (browserClosed) {
+            runnerWs?.close();
+            return;
+          }
           while (pendingMessages.length > 0 && runnerWs?.readyState === WebSocket.OPEN) {
             runnerWs.send(pendingMessages.shift()!);
           }
@@ -1734,13 +1878,20 @@ export function createControlPlane(
             );
           }
         });
+        runnerWs.on('close', () => {
+          // Close the browser socket with 1012 (Service Restart) so the client reconnects
+          // cleanly instead of black-holing prompts to a dead runner socket.
+          if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
+            browserWs.close(1012, 'Workspace connection closed');
+          }
+        });
         runnerWs.on('message', (data) => {
           if (browserWs.readyState === WebSocket.OPEN) {
             browserWs.send(data.toString());
           }
         });
       } catch (err) {
-        if (browserWs.readyState === WebSocket.OPEN) {
+        if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
           if (err instanceof WorkspaceCrashLoopError) {
             const now = new Date().toISOString();
             browserWs.send(
@@ -1769,14 +1920,6 @@ export function createControlPlane(
           );
         }
       }
-
-      browserWs.on('close', () => {
-        clearInterval(pingTimer);
-        set?.delete(browserWs);
-        if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
-          runnerWs.close();
-        }
-      });
     });
   };
 
