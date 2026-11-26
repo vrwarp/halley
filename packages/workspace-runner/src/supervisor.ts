@@ -392,6 +392,8 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
     // Poll until astroReady
     const deadline = Date.now() + 90_000;
+    let lastAstroState: string | undefined;
+    let lastAstroLogs: string[] = [];
     while (Date.now() < deadline) {
       if (spawnError !== null) {
         throw new Error(`Failed to spawn workspace process: ${(spawnError as Error).message}`);
@@ -410,23 +412,52 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
           const health = (await res.json()) as {
             originalBase?: string;
             astroReady?: boolean;
+            astroState?: string;
+            astroLogs?: string[];
             baseSha?: string;
           };
           managed.astroBase = health.originalBase || '/';
           if (health.baseSha) managed.baseSha = health.baseSha;
+          if (health.astroState) lastAstroState = health.astroState;
+          if (Array.isArray(health.astroLogs) && health.astroLogs.length > 0) {
+            lastAstroLogs = health.astroLogs;
+          }
           if (health.astroReady) {
             emitProgress(params.sessionId, 'ready', 'Workspace ready!');
             return managed;
           }
+          if (health.astroState === 'crashed') {
+            const tail = (
+              lastAstroLogs.length > 0
+                ? lastAstroLogs
+                : (logsBySession.get(params.sessionId) ?? [])
+            )
+              .slice(-10)
+              .join('\n');
+            await stopSessionProcess(params.sessionId);
+            throw new Error(
+              `Workspace preview server crashed during startup.${tail ? `\n${tail}` : ''}`,
+            );
+          }
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith('Workspace preview server crashed')) {
+          throw err;
+        }
         // still booting
       }
       await new Promise((r) => setTimeout(r, 350));
     }
 
+    const tail = (
+      lastAstroLogs.length > 0 ? lastAstroLogs : (logsBySession.get(params.sessionId) ?? [])
+    )
+      .slice(-10)
+      .join('\n');
     await stopSessionProcess(params.sessionId);
-    throw new Error('Timed out waiting for workspace preview server to become ready');
+    throw new Error(
+      `Timed out waiting for workspace preview server to become ready${lastAstroState ? ` (state=${lastAstroState})` : ''}.${tail ? `\n${tail}` : ''}`,
+    );
   }
 
   async function bootWarmSlot(slot: WarmSlot): Promise<void> {

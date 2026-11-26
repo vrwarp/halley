@@ -610,7 +610,8 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       expect(cp.db.getSessionByTokenHash(hashWorkspaceToken(initialToken))).toBeNull();
       expect(hostDriver.ensureSessionToken(session.id)).toBe(rotated);
 
-      // Reconcile after workspaces container restart: session marked 'running' in DB but absent from supervisor flips to 'sleeping'
+      // Reconcile after workspaces container restart: sessions marked 'running' or stale 'starting' in DB
+      // but absent from supervisor flip to 'sleeping'
       cp.db.updateSession(session.id, {
         status: 'running',
         runner_url: 'http://workspaces:4101',
@@ -623,6 +624,11 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
       expect(afterReconcile.status).toBe('sleeping');
       expect(afterReconcile.runner_url).toBeNull();
       expect(afterReconcile.astro_url).toBeNull();
+
+      cp.db.updateSession(session.id, { status: 'starting' });
+      fakeInstanceId = 'inst-3';
+      await hostDriver.reconcileSessions();
+      expect(cp.db.getSession(session.id)!.status).toBe('sleeping');
 
       // Doctor reports clear error on protocol version mismatch
       fakeProtocolVersion = 99;
