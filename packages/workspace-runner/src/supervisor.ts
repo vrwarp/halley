@@ -13,6 +13,7 @@ import {
 } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import { scanBareGitRepo } from './astro-optimizer.js';
 import { BuildQueueTimeoutError, FifoBuildQueue } from './build-queue.js';
 import { NodeModulesCacheManager } from './nm-cache.js';
 
@@ -1078,6 +1079,28 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       speculativeStreamClosers.get(body.leaseId)?.();
     }
     return c.json({ ok: true, released });
+  });
+
+  app.post('/api/optimize/scan', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      baseBranch?: string;
+      repo?: string;
+    };
+    const branch = body.baseBranch || opts.baseBranch;
+    const repoSlug = body.repo || opts.repo;
+    try {
+      await syncLocalMirror(branch);
+      const scanned = await scanBareGitRepo(mirrorDir, {
+        repoSlug,
+        baseBranch: branch,
+      });
+      return c.json(scanned);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Repository scan failed' },
+        500,
+      );
+    }
   });
 
   return {

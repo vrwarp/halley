@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   WORKSPACE_HOST_PROTOCOL_VERSION,
+  type AstroAuditReportDto,
   type BootProgressDto,
   type BootStage,
 } from '@halley/shared';
@@ -810,6 +811,35 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     }
 
     return { ok: errors.length === 0, warnings, errors, details };
+  }
+
+  async scanRepository(baseBranch: string): Promise<{
+    sha: string;
+    report: AstroAuditReportDto;
+    digest: string;
+  }> {
+    const hostUrl = await this.getHostUrl();
+    await this.ensureControlPlaneMirror(baseBranch, { allowStaleOnError: true });
+    const res = await fetch(`${hostUrl}/api/optimize/scan`, {
+      method: 'POST',
+      headers: this.authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        baseBranch,
+        repo: this.config.repo,
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!res.ok) {
+      const errData = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(
+        errData.error || `Repository optimization scan failed (HTTP ${res.status})`,
+      );
+    }
+    return (await res.json()) as {
+      sha: string;
+      report: AstroAuditReportDto;
+      digest: string;
+    };
   }
 
   async close(): Promise<void> {

@@ -25,6 +25,7 @@ import { buildContinuationHandoffSummary, buildUndoHandoffSummary } from './hand
 import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
 import { createPreviewProxy } from './proxy/preview-proxy.js';
 import { startSessionReaper } from './reaper.js';
+import { OptimizeService } from './routes/optimize.js';
 import { PublishService } from './routes/publish.js';
 import { ScreenshotService, type ScreenshotViewport } from './screenshot-service.js';
 
@@ -92,6 +93,16 @@ export function createControlPlane(
     (sessionId, payload: PublishProgressPayload) => {
       broadcastToSession(sessionId, { type: 'publish_state', payload });
     },
+    (sessionId) => {
+      broadcastToSession(sessionId, { type: 'session_meta_updated' });
+    },
+  );
+
+  const optimizeService = new OptimizeService(
+    config,
+    db,
+    driver,
+    enrichSessionDto,
     (sessionId) => {
       broadcastToSession(sessionId, { type: 'session_meta_updated' });
     },
@@ -229,6 +240,25 @@ export function createControlPlane(
     }
     const converted = convertAndBroadcastIfRevert(session.id);
     return c.json({ ok: true, converted: Boolean(converted), kind: converted?.kind ?? session.kind });
+  });
+
+  // Internal hook called when the initial Optimization Draft pass settles (clears escalation gate)
+  app.post('/internal/session/optimization-settled', (c) => {
+    const authHeader = c.req.header('authorization') || '';
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!rawToken) {
+      return c.json({ error: 'Missing workspace token' }, 401);
+    }
+    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    if (!session) {
+      return c.json({ error: 'Invalid workspace token' }, 401);
+    }
+    db.updateSession(session.id, {
+      optimize_escalation_allowed: 0,
+      active_model_label: null,
+    });
+    broadcastToSession(session.id, { type: 'session_meta_updated' });
+    return c.json({ ok: true });
   });
 
   // Auth routes
@@ -1487,6 +1517,82 @@ export function createControlPlane(
     if (!s) return c.json({ error: 'Not found' }, 404);
     await driver.stop(s);
     return c.json({ ok: true });
+  });
+
+  // Optimize Astro (Admin-only Halley Readiness & Speed Advisor)
+  app.get('/api/admin/optimize/latest', auth.requireAdmin, (c) => {
+    return c.json(optimizeService.getLatestOverview());
+  });
+
+  app.post('/api/admin/optimize/scan', auth.requireAdmin, async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { force?: boolean };
+    try {
+      const report = await optimizeService.runStaticScan({ force: Boolean(body.force) });
+      return c.json({
+        report,
+        defaultModelId: config.modelId,
+        escalationModelId: config.escalationModelId,
+      });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to scan repository' },
+        500,
+      );
+    }
+  });
+
+  app.post('/api/admin/optimize/ai-estimate', auth.requireAdmin, async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { sha?: string };
+    if (!body.sha) return c.json({ error: 'Missing sha' }, 400);
+    try {
+      const estimate = await optimizeService.estimateDeepAiReview(body.sha, c.get('user'));
+      return c.json({ estimate });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to estimate Deep AI Review' },
+        400,
+      );
+    }
+  });
+
+  app.post('/api/admin/optimize/ai-review', auth.requireAdmin, async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { sha?: string };
+    if (!body.sha) return c.json({ error: 'Missing sha' }, 400);
+    try {
+      const report = await optimizeService.runDeepAiReview(body.sha, c.get('user'));
+      return c.json({ report });
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Deep AI Review failed' },
+        400,
+      );
+    }
+  });
+
+  app.post('/api/admin/optimize/create-draft', auth.requireAdmin, async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      sha?: string;
+      findingIds?: string[];
+      useEscalationModel?: boolean;
+      title?: string;
+    };
+    if (!body.sha || !Array.isArray(body.findingIds)) {
+      return c.json({ error: 'Missing sha or findingIds' }, 400);
+    }
+    try {
+      const session = await optimizeService.createOptimizationDraft(c.get('user'), {
+        sha: body.sha,
+        findingIds: body.findingIds,
+        useEscalationModel: body.useEscalationModel,
+        title: body.title,
+      });
+      return c.json({ session }, 201);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : 'Failed to create Optimization Draft' },
+        400,
+      );
+    }
   });
 
   // Preview Proxy (/p/:sessionId/*) + Referer-scoped Vite dev module proxy (/@vite/*, /@fs/*, /src/*, /node_modules/*)

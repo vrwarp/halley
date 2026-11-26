@@ -18,6 +18,7 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [openPublishOnLoad, setOpenPublishOnLoad] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
+  const [focusOptimize, setFocusOptimize] = useState(false);
 
   const openSession = (id: string, opts?: { openPublish?: boolean }) => {
     setOpenPublishOnLoad(Boolean(opts?.openPublish));
@@ -74,12 +75,15 @@ export function App() {
   if (showAdmin && auth.user.isAdmin) {
     return (
       <AdminPage
+        focusOptimize={focusOptimize}
         onBack={() => {
           setShowAdmin(false);
+          setFocusOptimize(false);
           void refresh();
         }}
         onOpenSession={(id) => {
           setShowAdmin(false);
+          setFocusOptimize(false);
           openSession(id);
         }}
       />
@@ -111,7 +115,14 @@ export function App() {
       sessions={sessions}
       spend={spend}
       onOpenSession={(id, opts) => openSession(id, opts)}
-      onOpenAdmin={() => setShowAdmin(true)}
+      onOpenAdmin={() => {
+        setFocusOptimize(false);
+        setShowAdmin(true);
+      }}
+      onOpenOptimize={() => {
+        setFocusOptimize(true);
+        setShowAdmin(true);
+      }}
       onRefresh={refresh}
       onLogout={async () => {
         await api.logout();
