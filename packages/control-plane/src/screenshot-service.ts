@@ -24,8 +24,10 @@ const DEFAULT_LIVE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const DEFAULT_LIVE_CACHE_TTL_MS = 10 * 60_000;
 
 const DETERMINISTIC_CAPTURE_CSS = `
-  astro-dev-toolbar { display: none !important; }
+  html, body { scroll-behavior: auto !important; }
+  astro-dev-toolbar { display: none !important; visibility: hidden !important; opacity: 0 !important; pointer-events: none !important; }
   *, *::before, *::after {
+    content-visibility: visible !important;
     animation-duration: 0s !important;
     animation-delay: 0s !important;
     transition-duration: 0s !important;
@@ -300,55 +302,364 @@ export class ScreenshotService {
     page: Page,
     url: string,
     timeoutMs: number,
+    opts?: { loadAllImages?: boolean; maxImageY?: number },
   ): Promise<{ status: () => number } | null> {
+    const loadAllImages = opts?.loadAllImages === true;
+    const maxImageY = opts?.maxImageY ?? MAX_REVIEW_CAPTURE_HEIGHT;
+
+    // Crucial for Blink/Chromium: <img loading="lazy"> latches Blink's internal
+    // LazyLoadImageObserver deferred-paint flag at HTML parse/insertion time, causing
+    // offscreen images to stay unpainted during fullPage / captureBeyondViewport even
+    // after download completes. Intercepting <img> nodes at document_start via
+    // addInitScript ensures Blink treats them as native eager + sync-decoded from birth.
+    if (loadAllImages && typeof (page as { addInitScript?: unknown }).addInitScript === 'function') {
+      await page
+        .addInitScript((cssText: string) => {
+          const g = globalThis as unknown as {
+            MutationObserver?: new (
+              cb: (muts: Array<{ addedNodes: Iterable<unknown>; target?: unknown }>) => void,
+            ) => {
+              observe: (target: unknown, opts: Record<string, unknown>) => void;
+              disconnect?: () => void;
+            };
+            document?: {
+              documentElement?: { appendChild?: (n: unknown) => void };
+              head?: { appendChild?: (n: unknown) => void };
+              createElement?: (tag: string) => { textContent?: string };
+            };
+          };
+          const injectCss = () => {
+            const root = g.document?.head || g.document?.documentElement;
+            if (!root || !g.document?.createElement) return false;
+            const style = g.document.createElement('style');
+            style.textContent = cssText;
+            root.appendChild?.(style);
+            return true;
+          };
+          if (!injectCss() && g.MutationObserver && g.document) {
+            const cssObs = new g.MutationObserver(() => {
+              if (injectCss()) cssObs.disconnect?.();
+            });
+            cssObs.observe(g.document, { childList: true });
+          }
+
+          type NodeLike = {
+            tagName?: string;
+            loading?: string;
+            decoding?: string;
+            getAttribute?: (k: string) => string | null;
+            setAttribute?: (k: string, v: string) => void;
+            removeAttribute?: (k: string) => void;
+            querySelectorAll?: (sel: string) => Iterable<NodeLike>;
+          };
+          const eagerizeImg = (img: NodeLike) => {
+            const dataSrc = img.getAttribute?.('data-src');
+            if (dataSrc && !img.getAttribute?.('src')) {
+              img.setAttribute?.('src', dataSrc);
+            }
+            const dataSrcset = img.getAttribute?.('data-srcset');
+            if (dataSrcset && !img.getAttribute?.('srcset')) {
+              img.setAttribute?.('srcset', dataSrcset);
+            }
+            if (img.getAttribute?.('loading') || img.loading === 'lazy') {
+              img.loading = 'eager';
+              img.removeAttribute?.('loading');
+            }
+            img.decoding = 'sync';
+            img.setAttribute?.('decoding', 'sync');
+          };
+          const scanNode = (node: NodeLike | null | undefined) => {
+            if (!node) return;
+            if (node.tagName === 'IMG') eagerizeImg(node);
+            if (typeof node.querySelectorAll === 'function') {
+              for (const img of node.querySelectorAll('img')) {
+                eagerizeImg(img);
+              }
+            }
+          };
+          if (g.MutationObserver && g.document) {
+            new g.MutationObserver((muts) => {
+              for (const m of muts) {
+                if (m.target && (m.target as NodeLike).tagName === 'IMG') {
+                  eagerizeImg(m.target as NodeLike);
+                }
+                for (const n of m.addedNodes) {
+                  scanNode(n as NodeLike);
+                }
+              }
+            }).observe(g.document, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              attributeFilter: ['loading', 'data-src', 'data-srcset'],
+            });
+          }
+        }, DETERMINISTIC_CAPTURE_CSS)
+        .catch(() => {});
+    }
+
     const res = await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
 
     if (typeof (page as { addStyleTag?: unknown }).addStyleTag === 'function') {
       await page.addStyleTag({ content: DETERMINISTIC_CAPTURE_CSS }).catch(() => {});
       await page
-        .evaluate(async () => {
-          const doc = (
-            globalThis as unknown as {
+        .evaluate(
+          async ({ eagerAll, maxY }: { eagerAll: boolean; maxY: number }) => {
+            type ImgLike = {
+              src?: string;
+              currentSrc?: string;
+              srcset?: string;
+              complete?: boolean;
+              naturalWidth?: number;
+              loading?: string;
+              decoding?: string;
+              getAttribute?: (k: string) => string | null;
+              setAttribute?: (k: string, v: string) => void;
+              removeAttribute?: (k: string) => void;
+              getBoundingClientRect?: () => { top: number };
+              addEventListener?: (ev: string, cb: () => void, opts?: { once?: boolean }) => void;
+              decode?: () => Promise<void>;
+            };
+            type FontFaceLike = { status?: string; loaded?: Promise<unknown> };
+            const g = globalThis as unknown as {
+              innerHeight?: number;
+              scrollTo?: (x: number, y: number) => void;
+              getComputedStyle?: (el: unknown) => { backgroundImage?: string };
+              Image?: new () => ImgLike;
+              requestAnimationFrame?: (cb: () => void) => number;
               document?: {
-                fonts?: { ready?: Promise<unknown> };
-                images?: Iterable<{
-                  complete?: boolean;
+                body?: { scrollHeight?: number; offsetHeight?: number };
+                documentElement?: { scrollHeight?: number; offsetHeight?: number };
+                fonts?: {
+                  ready?: Promise<unknown>;
+                  [Symbol.iterator]?: () => Iterator<FontFaceLike>;
+                };
+                images?: Iterable<ImgLike>;
+                querySelectorAll?: (sel: string) => Iterable<{
                   loading?: string;
-                  decode?: () => Promise<void>;
+                  removeAttribute?: (k: string) => void;
+                  getBoundingClientRect?: () => { top: number };
                 }>;
               };
-            }
-          ).document;
-          const fontWait = doc?.fonts?.ready
-            ? Promise.race([
-                doc.fonts.ready.catch(() => {}),
-                new Promise((r) => setTimeout(r, 1200)),
-              ])
-            : Promise.resolve();
+            };
+            const doc = g.document;
+            if (!doc) return;
 
-          const imgPromises: Array<Promise<unknown>> = [];
-          if (doc?.images) {
-            for (const img of doc.images) {
-              if (!img.complete && img.loading !== 'lazy' && typeof img.decode === 'function') {
-                imgPromises.push(img.decode().catch(() => {}));
+            const nextFrame = () =>
+              new Promise<void>((resolve) => {
+                let done = false;
+                const finish = () => {
+                  if (!done) {
+                    done = true;
+                    resolve();
+                  }
+                };
+                const t = setTimeout(finish, 24);
+                if (typeof g.requestAnimationFrame === 'function') {
+                  g.requestAnimationFrame(() => {
+                    clearTimeout(t);
+                    finish();
+                  });
+                }
+              });
+
+            const promoteLazyElements = () => {
+              if (doc.images) {
+                for (const img of doc.images) {
+                  const dataSrc = img.getAttribute?.('data-src');
+                  if (dataSrc && !img.getAttribute?.('src')) {
+                    img.setAttribute?.('src', dataSrc);
+                  }
+                  const dataSrcset = img.getAttribute?.('data-srcset');
+                  if (dataSrcset && !img.getAttribute?.('srcset')) {
+                    img.setAttribute?.('srcset', dataSrcset);
+                  }
+                  const top =
+                    typeof img.getBoundingClientRect === 'function'
+                      ? img.getBoundingClientRect().top
+                      : 0;
+                  if (top > maxY) continue;
+                  if (eagerAll && (img.loading === 'lazy' || img.getAttribute?.('loading') === 'lazy')) {
+                    img.loading = 'eager';
+                    img.decoding = 'sync';
+                    img.setAttribute?.('loading', 'eager');
+                    img.removeAttribute?.('loading');
+                  } else if (eagerAll && img.decoding === 'async') {
+                    img.decoding = 'sync';
+                  }
+                }
+              }
+              if (eagerAll && typeof doc.querySelectorAll === 'function') {
+                for (const frame of doc.querySelectorAll('iframe[loading="lazy"]')) {
+                  const top =
+                    typeof frame.getBoundingClientRect === 'function'
+                      ? frame.getBoundingClientRect().top
+                      : 0;
+                  if (top > maxY) continue;
+                  frame.loading = 'eager';
+                  frame.removeAttribute?.('loading');
+                }
+              }
+            };
+
+            // Stage 1: Promote deferred/lazy attributes immediately
+            promoteLazyElements();
+
+            // Stage 2: Fast viewport scroll sweep (0 -> maxY -> 0) for full-page captures so
+            // IntersectionObservers (Astro client:visible islands, scroll reveals), <picture>/srcset,
+            // CSS background-images, and @font-face unicode-range subsets across the full page activate.
+            if (eagerAll && typeof g.scrollTo === 'function') {
+              const totalH = Math.min(
+                Math.max(doc.body?.scrollHeight ?? 0, doc.documentElement?.scrollHeight ?? 0),
+                maxY,
+              );
+              const step = Math.max(400, g.innerHeight || 800);
+              if (totalH > step) {
+                for (let y = step; y < totalH; y += step) {
+                  g.scrollTo(0, y);
+                  await nextFrame();
+                }
+                g.scrollTo(0, Math.max(0, totalH - step));
+                await nextFrame();
+                g.scrollTo(0, 0);
+                void doc.documentElement?.offsetHeight;
+                await nextFrame();
+                // Promote any newly mounted <img> elements from hydrated Astro client:visible islands
+                promoteLazyElements();
               }
             }
-          }
-          const imgWait =
-            imgPromises.length > 0
-              ? Promise.race([
-                  Promise.allSettled(imgPromises),
-                  new Promise((r) => setTimeout(r, 1200)),
-                ])
-              : Promise.resolve();
 
-          await Promise.all([fontWait, imgWait]);
-          const raf = (globalThis as unknown as { requestAnimationFrame?: (cb: () => void) => number })
-            .requestAnimationFrame;
-          if (typeof raf === 'function') {
-            await new Promise<void>((resolve) => raf(() => raf(() => resolve())));
-          }
-        })
+            // Stage 3: Force layout so all @font-face subsets transition from 'unloaded' -> 'loading',
+            // then await fonts + all in-range <img> elements (load + decode) + CSS background-images.
+            void doc.body?.offsetHeight;
+
+            const waitFonts = async () => {
+              if (!doc.fonts) return;
+              if (doc.fonts.ready) {
+                await doc.fonts.ready.catch(() => {});
+              }
+              if (typeof doc.fonts[Symbol.iterator] === 'function') {
+                const activeFontLoads: Array<Promise<unknown>> = [];
+                for (const face of doc.fonts as Iterable<FontFaceLike>) {
+                  if (face.status === 'loading' && face.loaded) {
+                    activeFontLoads.push(face.loaded.catch(() => {}));
+                  }
+                }
+                if (activeFontLoads.length > 0) {
+                  await Promise.allSettled(activeFontLoads);
+                }
+              }
+            };
+
+            const imgPromises: Array<Promise<unknown>> = [];
+            if (doc.images) {
+              for (const img of doc.images) {
+                if (!img.currentSrc && !img.src && !img.srcset) continue;
+                const rectTop =
+                  typeof img.getBoundingClientRect === 'function'
+                    ? img.getBoundingClientRect().top
+                    : 0;
+                if (rectTop > maxY) continue;
+                if (!eagerAll && img.loading === 'lazy') continue;
+
+                const waitImg = async () => {
+                  if (!img.complete) {
+                    await new Promise<void>((resolve) => {
+                      if (typeof img.addEventListener !== 'function') {
+                        resolve();
+                        return;
+                      }
+                      let settled = false;
+                      const done = () => {
+                        if (!settled) {
+                          settled = true;
+                          resolve();
+                        }
+                      };
+                      img.addEventListener('load', done, { once: true });
+                      img.addEventListener('error', done, { once: true });
+                      // Guard against race if img.complete flipped synchronously before listener registration
+                      if (img.complete) done();
+                    });
+                  }
+                  if (typeof img.decode === 'function' && (img.naturalWidth ?? 0) > 0) {
+                    await img.decode().catch(() => {});
+                  }
+                };
+                imgPromises.push(waitImg());
+              }
+            }
+
+            // Preload & decode CSS background-image URLs on visible/in-range elements
+            if (
+              eagerAll &&
+              typeof doc.querySelectorAll === 'function' &&
+              typeof g.getComputedStyle === 'function' &&
+              typeof g.Image === 'function'
+            ) {
+              const bgUrls = new Set<string>();
+              let scanned = 0;
+              for (const el of doc.querySelectorAll('*')) {
+                if (++scanned > 1500 || bgUrls.size >= 24) break;
+                const top =
+                  typeof el.getBoundingClientRect === 'function'
+                    ? el.getBoundingClientRect().top
+                    : 0;
+                if (top > maxY) continue;
+                const bg = g.getComputedStyle(el).backgroundImage || '';
+                if (!bg || bg === 'none' || !bg.includes('url(')) continue;
+                const matches = bg.matchAll(/url\((['"]?)(.*?)\1\)/g);
+                for (const m of matches) {
+                  const u = m[2]?.trim();
+                  if (u && !u.startsWith('data:')) {
+                    bgUrls.add(u);
+                  }
+                }
+              }
+              const ImageCtor = g.Image;
+              for (const u of bgUrls) {
+                imgPromises.push(
+                  (async () => {
+                    const bgImg = new ImageCtor();
+                    bgImg.decoding = 'sync';
+                    bgImg.src = u;
+                    if (!bgImg.complete) {
+                      await new Promise<void>((resolve) => {
+                        let settled = false;
+                        const done = () => {
+                          if (!settled) {
+                            settled = true;
+                            resolve();
+                          }
+                        };
+                        bgImg.addEventListener?.('load', done, { once: true });
+                        bgImg.addEventListener?.('error', done, { once: true });
+                        if (bgImg.complete) done();
+                      });
+                    }
+                    if (typeof bgImg.decode === 'function' && (bgImg.naturalWidth ?? 0) > 0) {
+                      await bgImg.decode().catch(() => {});
+                    }
+                  })(),
+                );
+              }
+            }
+
+            const readinessCeilingMs = eagerAll ? 8000 : 2500;
+            await Promise.race([
+              Promise.all([waitFonts(), Promise.allSettled(imgPromises)]),
+              new Promise((r) => setTimeout(r, readinessCeilingMs)),
+            ]);
+
+            // Ensure scroll is pinned at top and wait two frames for compositor texture upload
+            if (eagerAll && typeof g.scrollTo === 'function') {
+              g.scrollTo(0, 0);
+            }
+            await nextFrame();
+            await nextFrame();
+          },
+          { eagerAll: loadAllImages, maxY: maxImageY },
+        )
         .catch(() => {});
     }
 
@@ -436,7 +747,10 @@ export class ScreenshotService {
       });
       try {
         const page = await context.newPage();
-        await this.gotoAndReady(page, req.url, 25_000);
+        await this.gotoAndReady(page, req.url, 25_000, {
+          loadAllImages: Boolean(req.fullPage),
+          maxImageY: MAX_FULL_PAGE_HEIGHT,
+        });
         if (req.fullPage) {
           let captureHeight = size.height;
           if (typeof page.evaluate === 'function') {
@@ -466,8 +780,8 @@ export class ScreenshotService {
   private async captureDraftFull(
     draftUrl: string,
     size: { width: number; height: number },
-    draftFiles: string[],
-    mergedFromLiveFiles: string[],
+    _draftFiles: string[],
+    _mergedFromLiveFiles: string[],
     fallbackTitle: string,
     signal?: AbortSignal,
   ): Promise<{ title: string; capture: CompressedCapture; highlights: VisualDiffHighlightDto[] } | null> {
@@ -480,12 +794,13 @@ export class ScreenshotService {
       });
       try {
         const page = await context.newPage();
-        await this.gotoAndReady(page, draftUrl, 20_000);
+        await this.gotoAndReady(page, draftUrl, 20_000, {
+          loadAllImages: true,
+          maxImageY: MAX_REVIEW_CAPTURE_HEIGHT,
+        });
         const title = (await page.title().catch(() => '')) || fallbackTitle;
 
         let captureHeight = size.height;
-        let highlights: VisualDiffHighlightDto[] = [];
-
         if (typeof page.evaluate === 'function') {
           const docHeight = await page
             .evaluate<number>(
@@ -496,75 +811,10 @@ export class ScreenshotService {
             Math.max(docHeight || size.height, size.height),
             MAX_REVIEW_CAPTURE_HEIGHT,
           );
-
-          highlights = await page
-            .evaluate(
-              ({
-                dFiles,
-                mFiles,
-                vpW,
-                vpH,
-              }: {
-                dFiles: string[];
-                mFiles: string[];
-                vpW: number;
-                vpH: number;
-              }) => {
-                const out: Array<{
-                  x: number;
-                  y: number;
-                  width: number;
-                  height: number;
-                  kind: 'draft' | 'merged_from_live';
-                  file: string;
-                }> = [];
-                const doc = (
-                  globalThis as unknown as {
-                    document: {
-                      querySelectorAll: (sel: string) => Iterable<{
-                        getAttribute: (name: string) => string | null;
-                        getBoundingClientRect: () => {
-                          left: number;
-                          top: number;
-                          width: number;
-                          height: number;
-                          bottom: number;
-                        };
-                      }>;
-                    };
-                  }
-                ).document;
-                const els = doc.querySelectorAll('[data-astro-source-file]');
-                for (const el of els) {
-                  const src = (el.getAttribute('data-astro-source-file') || '').replace(/\\/g, '/');
-                  const isDraft = dFiles.some((f) => src.endsWith(f));
-                  const isMerged = mFiles.some((f) => src.endsWith(f));
-                  if (!isDraft && !isMerged) continue;
-                  const rect = el.getBoundingClientRect();
-                  if (rect.width < 8 || rect.height < 8 || rect.top >= vpH || rect.bottom <= 0) continue;
-                  const clampedTop = Math.max(0, rect.top);
-                  const clampedBottom = Math.min(vpH, rect.bottom);
-                  const clampedHeight = clampedBottom - clampedTop;
-                  if (clampedHeight < 4) continue;
-                  out.push({
-                    x: Math.round((Math.max(0, rect.left) / vpW) * 1000) / 10,
-                    y: Math.round((clampedTop / vpH) * 1000) / 10,
-                    width: Math.round((Math.min(vpW - Math.max(0, rect.left), rect.width) / vpW) * 1000) / 10,
-                    height: Math.round((clampedHeight / vpH) * 1000) / 10,
-                    kind: isDraft ? 'draft' : 'merged_from_live',
-                    file: src,
-                  });
-                  if (out.length >= 24) break;
-                }
-                return out;
-              },
-              { dFiles: draftFiles, mFiles: mergedFromLiveFiles, vpW: size.width, vpH: captureHeight },
-            )
-            .catch(() => []);
         }
 
         const capture = await this.captureFullPageCompressed(context, page, size.width, captureHeight);
-        return { title, capture, highlights };
+        return { title, capture, highlights: [] };
       } catch {
         return null;
       } finally {
@@ -596,7 +846,10 @@ export class ScreenshotService {
       });
       try {
         const livePage = await context.newPage();
-        const liveRes = await this.gotoAndReady(livePage, liveUrl, 15_000);
+        const liveRes = await this.gotoAndReady(livePage, liveUrl, 15_000, {
+          loadAllImages: true,
+          maxImageY: MAX_REVIEW_CAPTURE_HEIGHT,
+        });
         if (liveRes && typeof liveRes.status === 'function' && liveRes.status() >= 400) {
           return null;
         }
