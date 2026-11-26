@@ -532,8 +532,8 @@ export function EditorPage({
     };
   }, [sessionId, wsReconnectNonce]);
 
-  // Reload iframe smoothly once Astro dev resumes after pre-publish verification
-  const isPreviewPaused = previewPaused.paused || publishProgress?.state === 'verifying';
+  // Reload iframe smoothly once Astro dev resumes after a paused verification run
+  const isPreviewPaused = previewPaused.paused;
   useEffect(() => {
     if (prevPreviewPausedRef.current && !isPreviewPaused) {
       reloadPreview(true);

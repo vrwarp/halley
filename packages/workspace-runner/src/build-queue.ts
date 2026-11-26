@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
 
+export type BuildPriority = 'foreground' | 'speculative';
+
 export interface BuildQueueStatus {
   activeSessionId: string | null;
+  activePriority: BuildPriority | null;
   queueLength: number;
   queuedSessionIds: string[];
 }
@@ -9,13 +12,24 @@ export interface BuildQueueStatus {
 export interface BuildLease {
   leaseId: string;
   sessionId: string;
+  priority: BuildPriority;
   release: () => void;
+}
+
+interface ActiveLease {
+  leaseId: string;
+  sessionId: string;
+  priority: BuildPriority;
+  onPreempted?: () => void;
 }
 
 interface Waiter {
   id: string;
   sessionId: string;
+  priority: BuildPriority;
   onPosition?: (position: number) => void;
+  lastPosition?: number;
+  onPreempted?: () => void;
   resolve: (lease: BuildLease) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout | null;
@@ -32,7 +46,7 @@ export class BuildQueueTimeoutError extends Error {
 }
 
 export class FifoBuildQueue {
-  private active: { leaseId: string; sessionId: string } | null = null;
+  private active: ActiveLease | null = null;
   private queue: Waiter[] = [];
 
   constructor(private readonly defaultTimeoutMs = 10 * 60_000) {}
@@ -40,6 +54,7 @@ export class FifoBuildQueue {
   getStatus(): BuildQueueStatus {
     return {
       activeSessionId: this.active?.sessionId ?? null,
+      activePriority: this.active?.priority ?? null,
       queueLength: this.queue.length,
       queuedSessionIds: this.queue.map((w) => w.sessionId),
     };
@@ -48,17 +63,33 @@ export class FifoBuildQueue {
   acquire(
     sessionId: string,
     opts?: {
+      priority?: BuildPriority;
       timeoutMs?: number;
       signal?: AbortSignal;
       onQueued?: (position: number) => void;
+      onPreempted?: () => void;
     },
   ): Promise<BuildLease> {
+    const priority: BuildPriority = opts?.priority ?? 'foreground';
+
+    // Preempt an active speculative lease immediately when a foreground build arrives
+    if (this.active && this.active.priority === 'speculative' && priority === 'foreground') {
+      const preempted = this.active;
+      this.active = null;
+      try {
+        preempted.onPreempted?.();
+      } catch {
+        // ignore callback errors
+      }
+    }
+
     if (!this.active) {
       const leaseId = crypto.randomUUID();
-      this.active = { leaseId, sessionId };
+      this.active = { leaseId, sessionId, priority, onPreempted: opts?.onPreempted };
       return Promise.resolve({
         leaseId,
         sessionId,
+        priority,
         release: () => this.releaseByLease(leaseId),
       });
     }
@@ -69,7 +100,9 @@ export class FifoBuildQueue {
       const waiter: Waiter = {
         id: waiterId,
         sessionId,
+        priority,
         onPosition: opts?.onQueued,
+        onPreempted: opts?.onPreempted,
         resolve,
         reject,
         timer: null,
@@ -108,9 +141,33 @@ export class FifoBuildQueue {
       }, timeoutMs);
       waiter.timer.unref?.();
 
-      this.queue.push(waiter);
-      opts?.onQueued?.(this.queue.length);
+      if (priority === 'foreground') {
+        // Insert after the last queued foreground waiter, ahead of any speculative waiters
+        let insertAt = this.queue.length;
+        for (let i = 0; i < this.queue.length; i++) {
+          if (this.queue[i]!.priority === 'speculative') {
+            insertAt = i;
+            break;
+          }
+        }
+        this.queue.splice(insertAt, 0, waiter);
+        this.notifyPositions();
+      } else {
+        this.queue.push(waiter);
+        this.notifyPositions();
+      }
     });
+  }
+
+  /**
+   * Promotes an active speculative lease to foreground in-place (used when a
+   * session coalesces its own in-flight speculative check into a foreground Publish).
+   */
+  promoteToForeground(leaseId: string): boolean {
+    if (this.active?.leaseId !== leaseId) return false;
+    this.active.priority = 'foreground';
+    this.active.onPreempted = undefined;
+    return true;
   }
 
   releaseByLease(leaseId: string): boolean {
@@ -153,18 +210,28 @@ export class FifoBuildQueue {
       next.timer = null;
     }
     const leaseId = crypto.randomUUID();
-    this.active = { leaseId, sessionId: next.sessionId };
+    this.active = {
+      leaseId,
+      sessionId: next.sessionId,
+      priority: next.priority,
+      onPreempted: next.onPreempted,
+    };
     this.notifyPositions();
     next.resolve({
       leaseId,
       sessionId: next.sessionId,
+      priority: next.priority,
       release: () => this.releaseByLease(leaseId),
     });
   }
 
   private notifyPositions(): void {
     this.queue.forEach((w, idx) => {
-      w.onPosition?.(idx + 1);
+      const pos = idx + 1;
+      if (w.lastPosition !== pos) {
+        w.lastPosition = pos;
+        w.onPosition?.(pos);
+      }
     });
   }
 }

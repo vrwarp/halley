@@ -10,6 +10,7 @@ export interface PrInfo {
 
 export interface CheckStatusSummary {
   state: 'pending' | 'passed' | 'failed';
+  totalCount: number;
   failedSummary?: string;
   failedLogs?: string;
 }
@@ -254,7 +255,7 @@ export class GitHubService {
     }>(`/repos/${owner}/${repo}/commits/${headSha}/check-runs`);
 
     if (runs.total_count === 0) {
-      return { state: 'passed' };
+      return { state: 'passed', totalCount: 0 };
     }
 
     const failed = runs.check_runs.filter(
@@ -271,13 +272,14 @@ export class GitHubService {
         .slice(0, 4000);
       return {
         state: 'failed',
+        totalCount: runs.total_count,
         failedSummary: `GitHub checks failed: ${names}`,
         failedLogs: details || names,
       };
     }
 
     const pending = runs.check_runs.some((r) => r.status !== 'completed');
-    return { state: pending ? 'pending' : 'passed' };
+    return { state: pending ? 'pending' : 'passed', totalCount: runs.total_count };
   }
 
   async squashMergePr(input: {
@@ -296,6 +298,22 @@ export class GitHubService {
       }),
     });
     return res.sha;
+  }
+
+  async hasActiveCiWorkflow(): Promise<boolean> {
+    const { owner, repo } = this.ownerRepo;
+    const data = await this.api<{
+      workflows: Array<{
+        id: number;
+        name: string;
+        path: string;
+        state: string;
+      }>;
+    }>(`/repos/${owner}/${repo}/actions/workflows?per_page=50`);
+
+    return (data.workflows ?? []).some(
+      (w) => w.state === 'active' && !matchesDeployWorkflow(w, this.config.deployWorkflow),
+    );
   }
 
   async hasActiveDeployWorkflow(): Promise<boolean> {
