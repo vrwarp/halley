@@ -39,7 +39,7 @@ COPY --from=builder /app/packages/control-plane/node_modules ./packages/control-
 # Install Chromium (only) + OS libs for the shared screenshot service before copying app dist layers
 RUN node /app/packages/control-plane/node_modules/playwright/cli.js install --with-deps chromium \
   && rm -rf /var/lib/apt/lists/* \
-  && node --input-type=module -e "import { chromium } from '/app/packages/control-plane/node_modules/playwright/index.mjs'; const b = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }); await b.close(); console.log('Playwright Chromium verified OK');"
+  && node --input-type=module -e "import { chromium } from '/app/packages/control-plane/node_modules/playwright/index.mjs'; import sharp from '/app/packages/control-plane/node_modules/sharp/lib/index.js'; const b = await chromium.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }); await b.close(); await sharp({ create: { width: 2, height: 2, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } } }).webp().toBuffer(); console.log('Playwright Chromium + sharp verified OK');"
 
 COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/packages/control-plane/dist ./packages/control-plane/dist

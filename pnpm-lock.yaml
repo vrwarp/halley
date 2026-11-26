@@ -57,6 +57,9 @@ importers:
       playwright:
         specifier: 1.65.1
         version: 1.65.1
+      sharp:
+        specifier: ^0.34.1
+        version: 0.34.5
       ws:
         specifier: ^8.18.1
         version: 8.23.0

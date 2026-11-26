@@ -1,14 +1,22 @@
-import type { ChangeCardDto, VisualDiffHighlightDto, VisualDiffPageDto } from '@halley/shared';
+import type {
+  ChangeCardDto,
+  VisualDiffHighlightDto,
+  VisualDiffHunkDto,
+  VisualDiffPageDto,
+} from '@halley/shared';
 import {
   AlertTriangle,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   ChevronsLeftRight,
   Code2,
   Eye,
   Loader2,
+  Maximize2,
   Monitor,
   RotateCcw,
+  Scissors,
   Smartphone,
   ZoomIn,
 } from 'lucide-react';
@@ -18,6 +26,11 @@ import { ImageLightbox } from './ImageLightbox.js';
 interface Props {
   cards: ChangeCardDto[];
   pages: VisualDiffPageDto[];
+  targetRoutes?: string[];
+  loadingRoutes?: Record<string, boolean>;
+  fullPagesByRoute?: Record<string, VisualDiffPageDto>;
+  loadingFullByRoute?: Record<string, boolean>;
+  onRequestFullPage?: (route: string) => void;
   isUndoMode: boolean;
   defaultShowTechnical?: boolean;
   excludedPaths: Record<string, boolean>;
@@ -30,9 +43,27 @@ interface Props {
   screenshotsEnabled?: boolean;
 }
 
+function UnchangedDivider({ px, label }: { px: number; label?: string }) {
+  if (px <= 0) return null;
+  return (
+    <div className="my-1.5 flex items-center gap-2 text-[10px] font-mono text-stone-400 select-none">
+      <span className="h-px flex-1 border-t border-dashed border-stone-300" />
+      <span>
+        {label ?? `${px.toLocaleString()} px unchanged`}
+      </span>
+      <span className="h-px flex-1 border-t border-dashed border-stone-300" />
+    </div>
+  );
+}
+
 export function VisualReview({
   cards,
   pages,
+  targetRoutes,
+  loadingRoutes = {},
+  fullPagesByRoute = {},
+  loadingFullByRoute = {},
+  onRequestFullPage,
   isUndoMode,
   defaultShowTechnical = false,
   excludedPaths,
@@ -46,6 +77,7 @@ export function VisualReview({
 }: Props) {
   const [expandedDiff, setExpandedDiff] = useState<Record<string, boolean>>({});
   const [showAllCode, setShowAllCode] = useState(defaultShowTechnical);
+  const [fullModeByRoute, setFullModeByRoute] = useState<Record<string, boolean>>({});
   const [lightbox, setLightbox] = useState<{
     src: string;
     alt: string;
@@ -53,7 +85,24 @@ export function VisualReview({
     highlights?: VisualDiffHighlightDto[];
   } | null>(null);
 
-  const showViewportToggle = Boolean(onSelectScreenshotViewport) && (screenshotsEnabled || pages.length > 0 || loadingScreenshots);
+  const showViewportToggle =
+    Boolean(onSelectScreenshotViewport) &&
+    (screenshotsEnabled || pages.length > 0 || loadingScreenshots);
+
+  const pagesByRoute = new Map(pages.map((p) => [p.route, p]));
+  const orderedRoutes =
+    targetRoutes && targetRoutes.length > 0
+      ? targetRoutes
+      : pages.map((p) => p.route);
+  const frameClass = screenshotViewport === 'mobile' ? 'mx-auto max-w-[390px]' : '';
+
+  const toggleFullPage = (route: string, nextFull: boolean) => {
+    const key = `${screenshotViewport}:${route}`;
+    setFullModeByRoute((prev) => ({ ...prev, [key]: nextFull }));
+    if (nextFull && !fullPagesByRoute[route]) {
+      onRequestFullPage?.(route);
+    }
+  };
 
   return (
     <div className="space-y-5">
@@ -111,7 +160,7 @@ export function VisualReview({
           )}
         </div>
 
-        {loadingScreenshots && pages.length === 0 && (
+        {loadingScreenshots && orderedRoutes.length === 0 && (
           <div className="mt-2.5 flex items-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-3.5 py-4 text-xs text-stone-500">
             <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
             <span>
@@ -120,59 +169,249 @@ export function VisualReview({
           </div>
         )}
 
-        {pages.length > 0 && (
+        {orderedRoutes.length > 0 && (
           <div className="mt-2.5 space-y-3">
-            {pages.map((p) => {
-              const shot = p.shots?.[screenshotViewport];
+            {orderedRoutes.map((route) => {
+              const croppedPage = pagesByRoute.get(route);
+              const isRouteLoading = Boolean(loadingRoutes[route]) && !croppedPage;
+
+              if (isRouteLoading) {
+                return (
+                  <div
+                    key={`${route}-${screenshotViewport}-skeleton`}
+                    className="rounded-xl border border-stone-200 bg-stone-50 p-3"
+                  >
+                    <div className="mb-2 flex items-center justify-between text-xs">
+                      <span className="font-semibold text-stone-700 truncate">{route}</span>
+                      <span className="inline-flex items-center gap-1.5 text-[11px] text-stone-400">
+                        <Loader2 className="h-3 w-3 animate-spin text-amber-600" />
+                        Capturing {screenshotViewport}…
+                      </span>
+                    </div>
+                    <div className={`h-36 animate-pulse rounded-lg bg-stone-200/70 ${frameClass}`} />
+                  </div>
+                );
+              }
+
+              if (!croppedPage) return null;
+
+              const viewKey = `${screenshotViewport}:${route}`;
+              const wantFull = Boolean(fullModeByRoute[viewKey]);
+              const fullPage = fullPagesByRoute[route];
+              const isFullLoading = Boolean(loadingFullByRoute[route]);
+              const activePage = wantFull && fullPage ? fullPage : croppedPage;
+
+              const croppedShot = croppedPage.shots?.[screenshotViewport];
+              const shot = activePage.shots?.[screenshotViewport];
               const liveUrl =
                 shot?.liveScreenshotDataUrl ??
                 (screenshotViewport === 'mobile'
-                  ? p.mobileLiveScreenshotDataUrl
-                  : p.liveScreenshotDataUrl);
+                  ? activePage.mobileLiveScreenshotDataUrl
+                  : activePage.liveScreenshotDataUrl);
               const draftUrl =
                 shot?.draftScreenshotDataUrl ??
                 (screenshotViewport === 'mobile'
-                  ? p.mobileDraftScreenshotDataUrl
-                  : p.draftScreenshotDataUrl);
-              const highlights = shot?.highlights ?? p.highlights ?? [];
-              const hasLive = Boolean(liveUrl);
+                  ? activePage.mobileDraftScreenshotDataUrl
+                  : activePage.draftScreenshotDataUrl);
+              const highlights = shot?.highlights ?? activePage.highlights ?? [];
+              const hunks: VisualDiffHunkDto[] | undefined =
+                !wantFull && croppedShot?.hunks ? croppedShot.hunks : undefined;
+              const isIdentical = Boolean(!wantFull && croppedShot?.identical);
+              const hasLive = Boolean(
+                liveUrl || (hunks && hunks.some((h) => Boolean(h.liveScreenshotDataUrl))),
+              );
+              const canToggleFull = Boolean(croppedShot?.hasFullPage && onRequestFullPage);
 
               return (
-                <div key={`${p.route}-${screenshotViewport}`} className="rounded-xl border border-stone-200 bg-stone-50 p-3">
-                  <div className="mb-2 flex flex-wrap items-center justify-between gap-1 text-xs">
+                <div
+                  key={`${route}-${screenshotViewport}`}
+                  className="rounded-xl border border-stone-200 bg-stone-50 p-3"
+                >
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
                     <span className="font-semibold text-stone-800 truncate">
-                      {p.title} ({p.route})
+                      {activePage.title} ({activePage.route})
                     </span>
-                    <span className="text-[11px] text-stone-500">
-                      {hasLive ? `Live as of ${p.liveTimestamp}` : 'Draft preview'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-stone-500">
+                        {hasLive ? `Live as of ${activePage.liveTimestamp}` : 'Draft preview'}
+                      </span>
+                      {canToggleFull && (
+                        <div className="inline-flex rounded-md border border-stone-200 bg-white p-0.5 text-[10px]">
+                          <button
+                            type="button"
+                            onClick={() => toggleFullPage(route, false)}
+                            className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium transition ${
+                              !wantFull
+                                ? 'bg-stone-900 text-white'
+                                : 'text-stone-500 hover:text-stone-900'
+                            }`}
+                          >
+                            <Scissors className="h-2.5 w-2.5" />
+                            Cropped
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => toggleFullPage(route, true)}
+                            className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium transition ${
+                              wantFull
+                                ? 'bg-stone-900 text-white'
+                                : 'text-stone-500 hover:text-stone-900'
+                            }`}
+                          >
+                            <Maximize2 className="h-2.5 w-2.5" />
+                            Full page
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  {hasLive && liveUrl && draftUrl ? (
-                    <BeforeAfterWipe
-                      liveUrl={liveUrl}
-                      draftUrl={draftUrl}
-                      route={p.route}
-                      viewport={screenshotViewport}
-                      highlights={highlights}
-                      onZoom={(side) =>
-                        setLightbox(
-                          side === 'live'
-                            ? {
-                                src: liveUrl,
-                                alt: `Live ${p.route}`,
-                                title: `Live · ${p.route} (${screenshotViewport})`,
+
+                  {wantFull && isFullLoading ? (
+                    <div
+                      className={`flex h-40 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white text-xs text-stone-500 ${frameClass}`}
+                    >
+                      <Loader2 className="h-4 w-4 animate-spin text-amber-600" />
+                      <span>Loading full-page {screenshotViewport} screenshot…</span>
+                    </div>
+                  ) : isIdentical ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-stone-200 bg-white px-3.5 py-3 text-xs text-stone-600">
+                      <span className="inline-flex items-center gap-1.5">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                        No visual pixel changes detected on this page.
+                      </span>
+                      {canToggleFull && (
+                        <button
+                          type="button"
+                          onClick={() => toggleFullPage(route, true)}
+                          className="rounded-md border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11px] font-medium text-stone-700 hover:bg-stone-100"
+                        >
+                          View full page
+                        </button>
+                      )}
+                    </div>
+                  ) : hunks && hunks.length > 0 ? (
+                    <div className={`space-y-2 ${frameClass}`}>
+                      {hunks.map((hunk, hunkIdx) => {
+                        const hunkHasLive = Boolean(hunk.liveScreenshotDataUrl);
+                        return (
+                          <div key={hunk.id}>
+                            <UnchangedDivider
+                              px={hunk.unchangedBeforePx}
+                              label={
+                                hunkIdx === 0
+                                  ? `${hunk.unchangedBeforePx.toLocaleString()} px unchanged above`
+                                  : `${hunk.unchangedBeforePx.toLocaleString()} px unchanged`
                               }
-                            : {
-                                src: draftUrl,
-                                alt: `Draft ${p.route}`,
-                                title: `Draft · ${p.route} (${screenshotViewport})`,
-                                highlights,
-                              },
-                        )
-                      }
-                    />
+                            />
+                            {hunkHasLive && hunk.liveScreenshotDataUrl ? (
+                              <BeforeAfterWipe
+                                liveUrl={hunk.liveScreenshotDataUrl}
+                                draftUrl={hunk.draftScreenshotDataUrl}
+                                route={activePage.route}
+                                viewport={screenshotViewport}
+                                highlights={hunk.highlights}
+                                onZoom={(side) =>
+                                  setLightbox(
+                                    side === 'live'
+                                      ? {
+                                          src: hunk.liveScreenshotDataUrl!,
+                                          alt: `Live ${activePage.route}`,
+                                          title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                        }
+                                      : {
+                                          src: hunk.draftScreenshotDataUrl,
+                                          alt: `Draft ${activePage.route}`,
+                                          title: `Draft · ${activePage.route} (${screenshotViewport})`,
+                                          highlights: hunk.highlights,
+                                        },
+                                  )
+                                }
+                              />
+                            ) : (
+                              <div>
+                                <div className="mb-1 flex items-center justify-between">
+                                  <p className="text-[11px] font-medium text-stone-500">Draft</p>
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] text-stone-400">
+                                    <ZoomIn className="h-3 w-3" /> Tap to zoom
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setLightbox({
+                                      src: hunk.draftScreenshotDataUrl,
+                                      alt: `Draft ${activePage.route}`,
+                                      title: `Draft · ${activePage.route} (${screenshotViewport})`,
+                                      highlights: hunk.highlights,
+                                    })
+                                  }
+                                  className="relative block w-full overflow-hidden rounded-lg border border-stone-200 bg-white text-left focus:outline-none focus:ring-2 focus:ring-amber-500"
+                                >
+                                  <img
+                                    src={hunk.draftScreenshotDataUrl}
+                                    alt={`Draft ${activePage.route}`}
+                                    className="w-full block"
+                                  />
+                                  {hunk.highlights.map((h, idx) => (
+                                    <div
+                                      key={idx}
+                                      title={h.warning || h.file}
+                                      style={{
+                                        left: `${h.x}%`,
+                                        top: `${h.y}%`,
+                                        width: `${h.width}%`,
+                                        height: `${h.height}%`,
+                                      }}
+                                      className={`pointer-events-none absolute rounded border-2 ${
+                                        h.kind === 'merged_from_live'
+                                          ? 'border-teal-500 bg-teal-500/15'
+                                          : 'border-amber-500 bg-amber-500/15'
+                                      }`}
+                                    />
+                                  ))}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <UnchangedDivider
+                        px={croppedShot?.unchangedAfterPx ?? 0}
+                        label={
+                          hasLive
+                            ? `${(croppedShot?.unchangedAfterPx ?? 0).toLocaleString()} px unchanged below`
+                            : `${(croppedShot?.unchangedAfterPx ?? 0).toLocaleString()} px more below`
+                        }
+                      />
+                    </div>
+                  ) : hasLive && liveUrl && draftUrl ? (
+                    <div className={frameClass}>
+                      <BeforeAfterWipe
+                        liveUrl={liveUrl}
+                        draftUrl={draftUrl}
+                        route={activePage.route}
+                        viewport={screenshotViewport}
+                        highlights={highlights}
+                        onZoom={(side) =>
+                          setLightbox(
+                            side === 'live'
+                              ? {
+                                  src: liveUrl,
+                                  alt: `Live ${activePage.route}`,
+                                  title: `Live · ${activePage.route} (${screenshotViewport})`,
+                                }
+                              : {
+                                  src: draftUrl,
+                                  alt: `Draft ${activePage.route}`,
+                                  title: `Draft · ${activePage.route} (${screenshotViewport})`,
+                                  highlights,
+                                },
+                          )
+                        }
+                      />
+                    </div>
                   ) : (
-                    <div>
+                    <div className={frameClass}>
                       <div className="mb-1 flex items-center justify-between">
                         <p className="text-[11px] font-medium text-stone-500">Draft</p>
                         {draftUrl && (
@@ -187,8 +426,8 @@ export function VisualReview({
                           onClick={() =>
                             setLightbox({
                               src: draftUrl,
-                              alt: `Draft ${p.route}`,
-                              title: `Draft · ${p.route} (${screenshotViewport})`,
+                              alt: `Draft ${activePage.route}`,
+                              title: `Draft · ${activePage.route} (${screenshotViewport})`,
                               highlights,
                             })
                           }
@@ -196,7 +435,7 @@ export function VisualReview({
                         >
                           <img
                             src={draftUrl}
-                            alt={`Draft ${p.route}`}
+                            alt={`Draft ${activePage.route}`}
                             className="w-full block"
                           />
                           {highlights.map((h, idx) => (

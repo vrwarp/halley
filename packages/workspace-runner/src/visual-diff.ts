@@ -136,7 +136,97 @@ function humanTitleForFile(relPath: string): string {
   if (relPath === 'src/data/site.ts') return 'Site-wide settings & navigation';
   if (route === '/') return 'Homepage';
   if (route === 'All pages') return `Shared layout (${path.basename(relPath)})`;
+  if (route === 'Shared component') return `Shared component (${path.basename(relPath)})`;
   return `Page ${route}`;
+}
+
+const SERMON_INDEX_FIELDS = new Set([
+  'title',
+  'book',
+  'dateRange',
+  'description',
+  'coverImage',
+  'featured',
+  'order',
+]);
+
+function normalizeRoutePath(route?: string | null): string | null {
+  if (!route) return null;
+  const trimmed = route.trim();
+  if (!trimmed || !trimmed.startsWith('/')) return null;
+  const noQuery = trimmed.split(/[?#]/)[0] || '/';
+  if (noQuery.includes('..') || noQuery.includes('[')) return null;
+  return noQuery.length > 1 ? noQuery.replace(/\/+$/, '') : '/';
+}
+
+/**
+ * Resolves up to 4 target routes to screenshot in Publish -> Visual Review:
+ * - Explicit static `src/pages/*` routes
+ * - `src/content/sermons/<slug>.json` -> `/sermons/<slug>` (+ `/sermons` if index-card fields changed)
+ * - Shared files (`src/components/*`, `src/layouts/*`, `src/styles/*`, `src/data/site.ts`, `public/images/*`)
+ *   prioritize the editor's active `activeRoute` first, plus `/` if different.
+ */
+export function resolveVisualReviewRoutes(
+  cards: ChangeCardDto[],
+  activeRoute?: string | null,
+  maxRoutes = 4,
+): string[] {
+  const normActive = normalizeRoutePath(activeRoute);
+  const routes: string[] = [];
+  const pushUnique = (r: string | null) => {
+    if (!r || routes.includes(r)) return;
+    routes.push(r);
+  };
+
+  let hasSharedChange = false;
+
+  for (const card of cards) {
+    const normPath = card.path.replace(/\\/g, '/');
+    if (normPath.startsWith('src/content/sermons/') && normPath.endsWith('.json')) {
+      const slug = path.basename(normPath, '.json');
+      if (slug && card.status !== 'deleted') {
+        pushUnique(`/sermons/${slug}`);
+      }
+      const touchesIndex =
+        card.status === 'added' ||
+        card.status === 'untracked' ||
+        card.status === 'deleted' ||
+        (card.jsonFields ?? []).some((f) => SERMON_INDEX_FIELDS.has(f.field));
+      if (touchesIndex) {
+        pushUnique('/sermons');
+      }
+      continue;
+    }
+
+    const inferred = inferRouteFromFilePath(normPath);
+    if (inferred === 'All pages' || inferred === 'Site imagery' || inferred === 'Shared component') {
+      hasSharedChange = true;
+      continue;
+    }
+
+    const explicit = normalizeRoutePath(inferred);
+    if (explicit) {
+      pushUnique(explicit);
+    } else {
+      hasSharedChange = true;
+    }
+  }
+
+  if (hasSharedChange) {
+    const prioritized: string[] = [];
+    if (normActive) prioritized.push(normActive);
+    if (!prioritized.includes('/')) prioritized.push('/');
+    for (const r of routes) {
+      if (!prioritized.includes(r)) prioritized.push(r);
+    }
+    return prioritized.slice(0, maxRoutes);
+  }
+
+  if (routes.length === 0) {
+    return [normActive || '/'];
+  }
+
+  return routes.slice(0, maxRoutes);
 }
 
 export async function buildChangeCards(
@@ -218,7 +308,10 @@ export async function buildChangeCards(
       path: c.path,
       status: c.status,
       title: humanTitleForFile(c.path),
-      route: route === 'All pages' || route === 'Site imagery' ? '/' : route,
+      route:
+        route === 'All pages' || route === 'Site imagery' || route === 'Shared component'
+          ? '/'
+          : route,
       summary,
       attribution: opts.editorName,
       conflictBadge:

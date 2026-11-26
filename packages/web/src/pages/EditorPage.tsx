@@ -2870,6 +2870,7 @@ export function EditorPage({
         <PublishModal
           session={session}
           persona={persona}
+          currentRoute={currentRoute}
           publishProgress={publishProgress}
           onClose={() => setShowPublish(false)}
           onAskHalleyToFix={async (summary, logs) => {
