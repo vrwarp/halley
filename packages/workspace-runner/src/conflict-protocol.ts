@@ -42,6 +42,8 @@ export interface ConflictEvidencePack {
   baseContent: string | null;
   oursContent: string | null;
   theirsContent: string | null;
+  /** Optional 3-way merged file containing `<<<<<<<` / `=======` / `>>>>>>>` hunks from `git merge-tree`. */
+  mergedMarkedContent?: string | null;
   isBinary: boolean;
   upstreamCommits: UpstreamCommitInfoDto[];
   localCheckpoints: string[];
@@ -94,6 +96,12 @@ async function readGitStage(repoRoot: string, stage: 1 | 2 | 3, relPath: string)
   return res.code === 0 ? res.stdout : null;
 }
 
+async function readGitRefFile(repoRoot: string, ref: string | undefined, relPath: string): Promise<string | null> {
+  if (!ref) return null;
+  const res = await gitRaw(repoRoot, ['show', `${ref}:${relPath}`]);
+  return res.code === 0 ? res.stdout : null;
+}
+
 export async function getUpstreamCommits(
   repoRoot: string,
   fromRef: string,
@@ -121,18 +129,34 @@ export async function getUpstreamCommits(
     .filter((c) => Boolean(c.sha));
 }
 
+export interface VirtualConflictRefs {
+  baseSha: string;
+  oursSha: string;
+  theirsSha: string;
+  virtualTreeSha?: string;
+}
+
 export async function buildConflictEvidencePack(
   repoRoot: string,
   relPath: string,
   prevBaseSha: string,
   baseBranch: string,
   kind?: 'sync' | 'publish' | 'revert',
+  virtualRefs?: VirtualConflictRefs,
 ): Promise<ConflictEvidencePack> {
-  const [baseContent, oursContent, theirsContent] = await Promise.all([
-    readGitStage(repoRoot, 1, relPath),
-    readGitStage(repoRoot, 2, relPath),
-    readGitStage(repoRoot, 3, relPath),
-  ]);
+  const [baseContent, oursContent, theirsContent, mergedMarkedContent] = virtualRefs
+    ? await Promise.all([
+        readGitRefFile(repoRoot, virtualRefs.baseSha, relPath),
+        readGitRefFile(repoRoot, virtualRefs.oursSha, relPath),
+        readGitRefFile(repoRoot, virtualRefs.theirsSha, relPath),
+        readGitRefFile(repoRoot, virtualRefs.virtualTreeSha, relPath),
+      ])
+    : await Promise.all([
+        readGitStage(repoRoot, 1, relPath),
+        readGitStage(repoRoot, 2, relPath),
+        readGitStage(repoRoot, 3, relPath),
+        Promise.resolve(null),
+      ]);
 
   let diskSample: Buffer | undefined;
   try {
@@ -173,6 +197,7 @@ export async function buildConflictEvidencePack(
     baseContent,
     oursContent,
     theirsContent,
+    ...(mergedMarkedContent ? { mergedMarkedContent } : {}),
     isBinary,
     upstreamCommits,
     localCheckpoints,
@@ -669,30 +694,143 @@ export function buildContradictionRecord(
   };
 }
 
+export interface ParsedConflictHunk {
+  index: number;
+  startChar: number;
+  endChar: number;
+  oursBlock: string;
+  theirsBlock: string;
+  contextBefore: string;
+  contextAfter: string;
+}
+
+export function parseMarkedConflictHunks(markedText: string): ParsedConflictHunk[] {
+  const hunks: ParsedConflictHunk[] = [];
+  const re = /^<{7}[^\n]*\r?\n([\s\S]*?)^={7}\r?\n([\s\S]*?)^>{7}[^\n]*(?:\r?\n|$)/gm;
+  let m: RegExpExecArray | null;
+  let idx = 1;
+  while ((m = re.exec(markedText)) !== null) {
+    const startChar = m.index;
+    const endChar = m.index + m[0].length;
+    const beforeLines = markedText.slice(0, startChar).split(/\r?\n/);
+    const afterLines = markedText.slice(endChar).split(/\r?\n/);
+    hunks.push({
+      index: idx++,
+      startChar,
+      endChar,
+      oursBlock: m[1] ?? '',
+      theirsBlock: m[2] ?? '',
+      contextBefore: beforeLines.slice(-12).join('\n'),
+      contextAfter: afterLines.slice(0, 12).join('\n'),
+    });
+  }
+  return hunks;
+}
+
+export function spliceResolvedHunks(
+  markedText: string,
+  parsedHunks: ParsedConflictHunk[],
+  replacements: Array<{ index: number; replacement: string }>,
+): string | null {
+  const byIdx = new Map(replacements.map((r) => [Number(r.index), r.replacement]));
+  if (parsedHunks.some((h) => !byIdx.has(h.index))) return null;
+  let out = '';
+  let cursor = 0;
+  for (const h of parsedHunks) {
+    out += markedText.slice(cursor, h.startChar);
+    let rep = byIdx.get(h.index) ?? '';
+    const origHadTrailingNewline = markedText.slice(h.startChar, h.endChar).endsWith('\n');
+    if (origHadTrailingNewline && rep.length > 0 && !rep.endsWith('\n')) {
+      rep += '\n';
+    }
+    out += rep;
+    cursor = h.endChar;
+  }
+  out += markedText.slice(cursor);
+  return out;
+}
+
+function extractBalancedJsonObject(raw: string): string {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw);
+  const candidate = fenced?.[1]?.trim() ?? raw.trim();
+  const start = candidate.indexOf('{');
+  if (start === -1) return candidate;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < candidate.length; i++) {
+    const ch = candidate[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return candidate.slice(start, i + 1);
+      }
+    }
+  }
+  return candidate.slice(start);
+}
+
 export function buildConflictPromptForPack(
   pack: ConflictEvidencePack,
   extra?: { rejectedAttempt?: string; userNote?: string; customInstruction?: string },
-): { system: string; user: string } {
+): { system: string; user: string; hunks?: ParsedConflictHunk[] } {
+  const parsedHunks =
+    pack.mergedMarkedContent && pack.mergedMarkedContent.length > 2_500
+      ? parseMarkedConflictHunks(pack.mergedMarkedContent)
+      : [];
+  const useHunkMode = parsedHunks.length > 0;
+
   const system = [
-    'You are Halley\'s expert Git Conflict Resolution Assistant for an Astro static website.',
+    "You are Halley's expert Git Conflict Resolution Assistant for an Astro static website.",
     'Resolve conflicts by INTENT using commit history and checkpoints, not naive line picking.',
     'Classify the conflict into one of:',
     'adjacent_disjoint | identical_intent | formatting_vs_content | refinement | moved_refactored | both_added | derived_file | delete_vs_modify | true_contradiction | binary_contradiction.',
     'Auto-resolve with confidence="high" or "medium" whenever intents are compatible.',
     'Only set status="needs_choice" with confidence="low" when there is a genuine contradiction with multiple logical outcomes (provide at most 3 options).',
-    'Never leave <<<<<<<, =======, or >>>>>>> markers in resolvedContent.',
+    'Never leave <<<<<<<, =======, or >>>>>>> markers in your output.',
     'Respond ONLY with a single JSON object matching:',
-    '{ "category": "...", "confidence": "high|medium|low", "status": "auto_resolved|needs_review|needs_choice", "explanation": "One plain-language sentence with no git jargon", "resolvedContent": "full file content if resolved or combined", "recommended": "theirs|ours|combined" }',
+    useHunkMode
+      ? '{ "category": "...", "confidence": "high|medium|low", "status": "auto_resolved|needs_review|needs_choice", "explanation": "One plain-language sentence with no git jargon", "hunks": [{ "index": 1, "replacement": "exact merged lines for hunk 1" }], "recommended": "theirs|ours|combined" }'
+      : '{ "category": "...", "confidence": "high|medium|low", "status": "auto_resolved|needs_review|needs_choice", "explanation": "One plain-language sentence with no git jargon", "resolvedContent": "full file content if resolved or combined", "recommended": "theirs|ours|combined" }',
   ].join('\n');
 
   const parts = [
     `File: ${pack.path} (route: ${pack.affectedRoute}, type: ${pack.fileType})`,
     `Upstream live commits:\n${pack.upstreamCommits.map((c) => `- ${c.shortSha} (${c.author}, ${c.date}): ${c.subject}`).join('\n') || '(none)'}`,
     `User draft checkpoints:\n${pack.localCheckpoints.map((c) => `- ${c}`).join('\n') || '(none)'}`,
-    `--- BASE (before either edit) ---\n${pack.baseContent ?? '(absent)'}`,
-    `--- OURS (user draft) ---\n${pack.oursContent ?? '(deleted)'}`,
-    `--- THEIRS (latest live site) ---\n${pack.theirsContent ?? '(deleted)'}`,
   ];
+
+  if (useHunkMode) {
+    parts.push(
+      `This file has ${parsedHunks.length} localized conflict hunk(s). Provide the exact merged replacement for every hunk index 1..${parsedHunks.length} (without surrounding context lines):`,
+    );
+    for (const h of parsedHunks) {
+      parts.push(
+        [
+          `=== CONFLICT HUNK #${h.index} ===`,
+          `[Context before (do NOT repeat in replacement)]:\n${h.contextBefore}`,
+          `--- OURS (user draft) ---\n${h.oursBlock.replace(/\r?\n$/, '')}`,
+          `--- THEIRS (latest live site) ---\n${h.theirsBlock.replace(/\r?\n$/, '')}`,
+          `[Context after (do NOT repeat in replacement)]:\n${h.contextAfter}`,
+        ].join('\n'),
+      );
+    }
+  } else {
+    parts.push(
+      `--- BASE (before either edit) ---\n${pack.baseContent ?? '(absent)'}`,
+      `--- OURS (user draft) ---\n${pack.oursContent ?? '(deleted)'}`,
+      `--- THEIRS (latest live site) ---\n${pack.theirsContent ?? '(deleted)'}`,
+    );
+  }
+
   if (extra?.rejectedAttempt) {
     parts.push(`--- PREVIOUS ATTEMPT REJECTED BY USER ---\n${extra.rejectedAttempt}`);
   }
@@ -703,7 +841,7 @@ export function buildConflictPromptForPack(
     parts.push(`User custom instruction ("Something else"): ${extra.customInstruction}`);
   }
 
-  return { system, user: parts.join('\n\n') };
+  return { system, user: parts.join('\n\n'), ...(useHunkMode ? { hunks: parsedHunks } : {}) };
 }
 
 export interface LlmConflictCaller {
@@ -726,7 +864,7 @@ export async function resolvePackWithLlm(
   caller: LlmConflictCaller,
   extra?: { rejectedAttempt?: string; userNote?: string; customInstruction?: string },
 ): Promise<{ record: ConflictResolutionRecordDto; usageUsd: number; stoppedAtCeiling?: boolean }> {
-  const { system, user } = buildConflictPromptForPack(pack, extra);
+  const { system, user, hunks: promptHunks } = buildConflictPromptForPack(pack, extra);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Authorization: `Bearer ${caller.workspaceToken}`,
@@ -746,7 +884,7 @@ export async function resolvePackWithLlm(
 
   const body: Record<string, unknown> = {
     model: caller.modelId,
-    max_tokens: thinkingBudget > 0 ? thinkingBudget + 4096 : 4096,
+    max_tokens: thinkingBudget > 0 ? thinkingBudget + 8192 : 8192,
     system,
     messages: [{ role: 'user', content: user }],
   };
@@ -796,18 +934,31 @@ export async function resolvePackWithLlm(
   const usageUsd = (inp / 1_000_000) * inRate + (out / 1_000_000) * outRate;
 
   try {
-    const match = textBlock.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : textBlock) as {
+    const jsonText = extractBalancedJsonObject(textBlock);
+    const parsed = JSON.parse(jsonText) as {
       category?: ConflictCategory;
       confidence?: ConflictConfidence;
       status?: 'auto_resolved' | 'needs_review' | 'needs_choice';
       explanation?: string;
       resolvedContent?: string;
+      hunks?: Array<{ index: number; replacement: string }>;
       recommended?: 'theirs' | 'ours' | 'combined';
     };
 
-    if (parsed.resolvedContent) {
-      const check = await validateResolvedContent(repoRoot, pack.path, parsed.resolvedContent);
+    let finalResolvedContent = parsed.resolvedContent;
+    if (
+      !finalResolvedContent &&
+      promptHunks &&
+      promptHunks.length > 0 &&
+      pack.mergedMarkedContent &&
+      Array.isArray(parsed.hunks)
+    ) {
+      finalResolvedContent =
+        spliceResolvedHunks(pack.mergedMarkedContent, promptHunks, parsed.hunks) ?? undefined;
+    }
+
+    if (finalResolvedContent) {
+      const check = await validateResolvedContent(repoRoot, pack.path, finalResolvedContent);
       if (!check.valid) {
         return {
           record: buildContradictionRecord(pack, {
@@ -819,11 +970,11 @@ export async function resolvePackWithLlm(
       }
     }
 
-    if (parsed.status === 'needs_choice' || parsed.confidence === 'low' || !parsed.resolvedContent) {
+    if (parsed.status === 'needs_choice' || parsed.confidence === 'low' || !finalResolvedContent) {
       return {
         record: buildContradictionRecord(pack, {
           explanation: parsed.explanation,
-          combinedContent: parsed.resolvedContent,
+          combinedContent: finalResolvedContent,
           recommended: parsed.recommended,
           modelUsed: caller.modelId,
         }),
@@ -848,8 +999,8 @@ export async function resolvePackWithLlm(
         affectedRoute: pack.affectedRoute,
         oursPreview: previewSnippet(pack.oursContent),
         theirsPreview: previewSnippet(pack.theirsContent),
-        resolvedPreview: previewSnippet(parsed.resolvedContent),
-        resolvedContent: parsed.resolvedContent,
+        resolvedPreview: previewSnippet(finalResolvedContent),
+        resolvedContent: finalResolvedContent,
         modelUsed: caller.modelId,
       },
       usageUsd,

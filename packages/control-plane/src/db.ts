@@ -14,6 +14,7 @@ import type {
   SpendStatusDto,
   UserDto,
 } from '@halley/shared';
+import { deriveWorkspaceToken, hashWorkspaceToken, safeEqualToken } from '@halley/shared/auth';
 import type { HalleyConfig } from './config.js';
 
 export interface SessionRecord {
@@ -50,11 +51,33 @@ export interface SessionRecord {
   changed_files_count: number;
   optimize_escalation_allowed: number;
   active_model_label: string | null;
+  state_version: number;
+  lease_epoch: number;
+  token_epoch: number;
   last_active_at: string;
   archived_at: string | null;
   node_modules_pruned_at: string | null;
   volume_expired_at: string | null;
   created_at: string;
+}
+
+export interface PublishRunRecord {
+  session_id: string;
+  run_id: string;
+  actor_user_id: string;
+  title: string | null;
+  summary: string | null;
+  exclude_paths_json: string | null;
+  step: PublishState;
+  local_head_sha: string | null;
+  pre_exclude_sha: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  merged_sha: string | null;
+  native_auto_merge: number;
+  error: string | null;
+  started_at: string;
+  updated_at: string;
 }
 
 export class ControlPlaneDb {
@@ -63,9 +86,19 @@ export class ControlPlaneDb {
   constructor(dbPath: string, private config: HalleyConfig) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     this.migrate();
     this.seedAllowlist();
+  }
+
+  close(): void {
+    try {
+      if (this.db.isOpen) {
+        this.db.close();
+      }
+    } catch {
+      // ignore already-closed DB
+    }
   }
 
   private migrate(): void {
@@ -165,6 +198,25 @@ export class ControlPlaneDb {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS publish_runs (
+        session_id TEXT PRIMARY KEY REFERENCES editor_sessions(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL,
+        actor_user_id TEXT NOT NULL,
+        title TEXT,
+        summary TEXT,
+        exclude_paths_json TEXT,
+        step TEXT NOT NULL,
+        local_head_sha TEXT,
+        pre_exclude_sha TEXT,
+        pr_number INTEGER,
+        pr_url TEXT,
+        merged_sha TEXT,
+        native_auto_merge INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS astro_audit_reports (
         sha TEXT PRIMARY KEY,
         base_branch TEXT NOT NULL,
@@ -181,7 +233,7 @@ export class ControlPlaneDb {
       );
     `);
 
-    // Idempotent migrations for existing SQLite databases created before P0
+    // Idempotent migrations for existing SQLite databases created before P0/v2
     const cols = new Set(
       (this.db.prepare('PRAGMA table_info(editor_sessions)').all() as Array<{ name: string }>).map(
         (c) => c.name,
@@ -202,6 +254,9 @@ export class ControlPlaneDb {
     addCol('volume_expired_at', 'TEXT');
     addCol('optimize_escalation_allowed', 'INTEGER NOT NULL DEFAULT 0');
     addCol('active_model_label', 'TEXT');
+    addCol('state_version', 'INTEGER NOT NULL DEFAULT 1');
+    addCol('lease_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    addCol('token_epoch', 'INTEGER NOT NULL DEFAULT 0');
 
     const existingCap = this.db
       .prepare('SELECT value FROM settings WHERE key = ?')
@@ -544,6 +599,24 @@ export class ControlPlaneDb {
     return row ?? null;
   }
 
+  resolveSessionByWorkspaceToken(rawToken: string): SessionRecord | null {
+    if (!rawToken) return null;
+    const direct = this.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    if (direct) return direct;
+
+    for (const s of this.listSessions()) {
+      const derived = deriveWorkspaceToken(this.config.sessionSecret, s.id, s.token_epoch ?? 0);
+      if (safeEqualToken(rawToken, derived)) {
+        const derivedHash = hashWorkspaceToken(derived);
+        if (s.workspace_token_hash !== derivedHash) {
+          this.updateSession(s.id, { workspace_token_hash: derivedHash });
+        }
+        return this.getSession(s.id);
+      }
+    }
+    return null;
+  }
+
   listSessions(): SessionRecord[] {
     return this.db
       .prepare(
@@ -558,9 +631,148 @@ export class ControlPlaneDb {
   updateSession(id: string, patch: Partial<SessionRecord>): void {
     const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
     if (entries.length === 0) return;
-    const cols = entries.map(([k]) => `${k} = ?`).join(', ');
+    const hasStateVer = entries.some(([k]) => k === 'state_version');
+    const setClauses = entries.map(([k]) => `${k} = ?`);
+    if (!hasStateVer) {
+      setClauses.push('state_version = state_version + 1');
+    }
     const vals = entries.map(([, v]) => v as string | number | null);
-    this.db.prepare(`UPDATE editor_sessions SET ${cols} WHERE id = ?`).run(...vals, id);
+    this.db.prepare(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE id = ?`).run(...vals, id);
+  }
+
+  /**
+   * Atomic compare-and-swap (CAS) session state transition.
+   * Guards expected status/epoch in SQLite so background reapers, stale boot promises,
+   * or concurrent wake/restart calls never clobber a newer lease or un-freeze a merged session.
+   */
+  transitionSession(
+    id: string,
+    opts: {
+      fromStatuses?: SessionStatus[];
+      expectedEpoch?: number;
+      bumpEpoch?: boolean;
+      allowUnfreeze?: boolean;
+      patch: Partial<SessionRecord>;
+    },
+  ): SessionRecord | null {
+    const entries = Object.entries(opts.patch).filter(
+      ([k, v]) => v !== undefined && k !== 'state_version' && k !== 'lease_epoch',
+    );
+    const setClauses = entries.map(([k]) => `${k} = ?`);
+    setClauses.push('state_version = state_version + 1');
+    if (opts.bumpEpoch) {
+      setClauses.push('lease_epoch = lease_epoch + 1');
+    }
+    const vals: Array<string | number | null> = entries.map(([, v]) => v as string | number | null);
+
+    const whereClauses: string[] = ['id = ?'];
+    vals.push(id);
+
+    if (opts.fromStatuses && opts.fromStatuses.length > 0) {
+      whereClauses.push(`status IN (${opts.fromStatuses.map(() => '?').join(', ')})`);
+      vals.push(...opts.fromStatuses);
+    }
+    if (opts.expectedEpoch !== undefined) {
+      whereClauses.push('lease_epoch = ?');
+      vals.push(opts.expectedEpoch);
+    }
+    const nextStatus = opts.patch.status;
+    if (
+      !opts.allowUnfreeze &&
+      nextStatus !== undefined &&
+      nextStatus !== 'merged' &&
+      nextStatus !== 'published'
+    ) {
+      whereClauses.push("status NOT IN ('merged', 'published')");
+    }
+
+    const res = this.db
+      .prepare(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE ${whereClauses.join(' AND ')}`)
+      .run(...vals);
+    if (res.changes === 0) return null;
+    return this.getSession(id);
+  }
+
+  upsertPublishRun(input: {
+    sessionId: string;
+    runId: string;
+    actorUserId: string;
+    title?: string | null;
+    summary?: string | null;
+    excludePathsJson?: string | null;
+    step: PublishState;
+    localHeadSha?: string | null;
+    preExcludeSha?: string | null;
+    prNumber?: number | null;
+    prUrl?: string | null;
+    mergedSha?: string | null;
+    nativeAutoMerge?: boolean;
+    error?: string | null;
+  }): PublishRunRecord {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO publish_runs (
+           session_id, run_id, actor_user_id, title, summary, exclude_paths_json, step,
+           local_head_sha, pre_exclude_sha, pr_number, pr_url, merged_sha, native_auto_merge,
+           error, started_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           run_id = excluded.run_id,
+           actor_user_id = excluded.actor_user_id,
+           title = COALESCE(excluded.title, publish_runs.title),
+           summary = COALESCE(excluded.summary, publish_runs.summary),
+           exclude_paths_json = COALESCE(excluded.exclude_paths_json, publish_runs.exclude_paths_json),
+           step = excluded.step,
+           local_head_sha = COALESCE(excluded.local_head_sha, publish_runs.local_head_sha),
+           pre_exclude_sha = COALESCE(excluded.pre_exclude_sha, publish_runs.pre_exclude_sha),
+           pr_number = COALESCE(excluded.pr_number, publish_runs.pr_number),
+           pr_url = COALESCE(excluded.pr_url, publish_runs.pr_url),
+           merged_sha = COALESCE(excluded.merged_sha, publish_runs.merged_sha),
+           native_auto_merge = CASE WHEN excluded.native_auto_merge = 1 THEN 1 ELSE publish_runs.native_auto_merge END,
+           error = excluded.error,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.sessionId,
+        input.runId,
+        input.actorUserId,
+        input.title ?? null,
+        input.summary ?? null,
+        input.excludePathsJson ?? null,
+        input.step,
+        input.localHeadSha ?? null,
+        input.preExcludeSha ?? null,
+        input.prNumber ?? null,
+        input.prUrl ?? null,
+        input.mergedSha ?? null,
+        input.nativeAutoMerge ? 1 : 0,
+        input.error ?? null,
+        now,
+        now,
+      );
+    return this.getPublishRun(input.sessionId)!;
+  }
+
+  getPublishRun(sessionId: string): PublishRunRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM publish_runs WHERE session_id = ?')
+      .get(sessionId) as PublishRunRecord | undefined;
+    return row ?? null;
+  }
+
+  listActivePublishRuns(): PublishRunRecord[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM publish_runs
+         WHERE step IN ('rebasing', 'resolving_conflicts', 'verifying', 'pushing_pr', 'waiting_ci', 'deploying_pages')
+         ORDER BY updated_at ASC`,
+      )
+      .all() as unknown as PublishRunRecord[];
+  }
+
+  deletePublishRun(sessionId: string): void {
+    this.db.prepare('DELETE FROM publish_runs WHERE session_id = ?').run(sessionId);
   }
 
   deleteSession(id: string): void {

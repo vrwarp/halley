@@ -437,7 +437,7 @@ export function MobileChatCard({
                         className="inline-flex items-center gap-1"
                       >
                         <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-600 px-1 text-[10px] font-bold text-white">
-                          {chips.findIndex((x) => elementKey(x) === elementKey(c)) + 1}
+                          {[...new Set(chips.map((x) => elementKey(x)))].indexOf(elementKey(c)) + 1}
                         </span>
                         <span className="max-w-[130px] truncate">{chipLabelOf(c, persona)}</span>
                       </button>

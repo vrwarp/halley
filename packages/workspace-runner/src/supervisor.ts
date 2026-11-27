@@ -11,8 +11,10 @@ import {
   type BootProgressDto,
   type BootStage,
 } from '@halley/shared';
+import { extractBearerToken, safeEqualToken } from '@halley/shared/auth';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import { computePreviewBase } from './astro-manager.js';
 import { scanBareGitRepo } from './astro-optimizer.js';
 import { BuildQueueTimeoutError, FifoBuildQueue } from './build-queue.js';
 import { NodeModulesCacheManager } from './nm-cache.js';
@@ -83,22 +85,6 @@ export interface DiskUsageInfo {
   usedPercent: number;
 }
 
-async function getFreePort(host = '0.0.0.0'): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, host, () => {
-      const addr = srv.address();
-      if (addr && typeof addr === 'object') {
-        const port = addr.port;
-        srv.close(() => resolve(port));
-      } else {
-        srv.close(() => reject(new Error('Failed to allocate port')));
-      }
-    });
-    srv.on('error', reject);
-  });
-}
-
 async function fileExists(p: string): Promise<boolean> {
   return fs
     .access(p)
@@ -122,11 +108,48 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
   const mirrorDir = path.join(workspacesDir, 'git-mirror', 'repo.git');
   const nmCacheDir = path.join(workspacesDir, 'nm-cache');
   const pkgCacheDir = path.join(workspacesDir, 'pkg-cache');
+  const verifySandboxDir = path.join(workspacesDir, 'verify-sandbox');
   const nmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
   const buildQueue = new FifoBuildQueue(opts.buildQueueTimeoutMs ?? 10 * 60_000);
 
+  let activeHostSecret = (opts.hostSecret || '').trim();
+
+  // Port lease registry prevents ephemeral TOCTOU collisions across concurrent boots
+  const leasedPorts = new Set<number>();
+
+  async function allocateLeasedPort(host = '0.0.0.0'): Promise<number> {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const candidate = await new Promise<number>((resolve, reject) => {
+        const srv = net.createServer();
+        srv.listen(0, host, () => {
+          const addr = srv.address();
+          if (addr && typeof addr === 'object') {
+            const port = addr.port;
+            srv.close(() => resolve(port));
+          } else {
+            srv.close(() => reject(new Error('Failed to allocate port')));
+          }
+        });
+        srv.on('error', reject);
+      });
+      if (!leasedPorts.has(candidate)) {
+        leasedPorts.add(candidate);
+        return candidate;
+      }
+    }
+    throw new Error('Exhausted port lease allocation attempts');
+  }
+
+  function releaseLeasedPort(port: number): void {
+    if (port <= 0) return;
+    setTimeout(() => {
+      leasedPorts.delete(port);
+    }, 1500).unref?.();
+  }
+
   const activeSessions = new Map<string, ManagedSession>();
   const bootingSessions = new Map<string, Promise<ManagedSession>>();
+  const deletedSessionIds = new Set<string>();
   const logsBySession = new Map<string, string[]>();
   const bootProgressBySession = new Map<string, BootProgressDto>();
 
@@ -205,8 +228,8 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     timeoutMs = 30_000,
   ): Promise<string> {
     const fullArgs = ['-c', 'safe.directory=*'];
-    if (includeAuthHeader && opts.hostSecret) {
-      fullArgs.push('-c', `http.extraHeader=Authorization: Bearer ${opts.hostSecret}`);
+    if (includeAuthHeader && activeHostSecret) {
+      fullArgs.push('-c', `http.extraHeader=Authorization: Bearer ${activeHostSecret}`);
     }
     fullArgs.push(...args);
     const { stdout } = await execFileAsync('git', fullArgs, {
@@ -237,11 +260,30 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         true,
       );
       await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});
-      return runGit(mirrorDir, ['rev-parse', `refs/heads/${baseBranch}`]).catch(() => '');
+      const headSha = await runGit(mirrorDir, ['rev-parse', `refs/heads/${baseBranch}`]).catch(() => '');
+      if (headSha) {
+        void recycleStaleWarmSlots(headSha);
+      }
+      return headSha;
     })().finally(() => {
       mirrorSyncPromise = null;
     });
     return mirrorSyncPromise;
+  }
+
+  async function recycleStaleWarmSlots(latestBaseSha: string): Promise<void> {
+    if (!warmPoolRunning || !latestBaseSha) return;
+    const stale = warmPool.filter(
+      (s) => s.state === 'ready' && !s.claimedBySessionId && s.baseSha && s.baseSha !== latestBaseSha,
+    );
+    if (stale.length === 0) return;
+    for (const slot of stale) {
+      const idx = warmPool.indexOf(slot);
+      if (idx !== -1) warmPool.splice(idx, 1);
+      await stopSessionProcess(slot.id).catch(() => {});
+      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
+    }
+    replenishWarmPool();
   }
 
   async function getDiskUsage(): Promise<DiskUsageInfo | null> {
@@ -281,9 +323,10 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     activeSessions.delete(sessionId);
     if (!managed) return;
     if (managed.proc.exitCode === null) {
-      managed.proc.kill('SIGTERM');
+      // Signal entire process group so astro dev / Vite / esbuild children exit cleanly too
+      killRunnerGroup(managed.proc, 'SIGTERM');
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, 1500);
+        const t = setTimeout(resolve, 1800);
         t.unref?.();
         managed.proc.once('exit', () => {
           clearTimeout(t);
@@ -294,34 +337,52 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         killRunnerGroup(managed.proc, 'SIGKILL');
       }
     }
+    releaseLeasedPort(managed.runnerPort);
+    releaseLeasedPort(managed.astroPort);
   }
 
+  /**
+   * Enforces `maxActiveWorkspaces` across ALL running processes (including warm standby).
+   * Reclaims unclaimed warm standby slots first so user sessions are never evicted needlessly,
+   * and sorts remaining sessions by real `lastActiveAt` (synced from control-plane).
+   */
   async function enforceLruCap(excludeSessionId: string, protectedIds: Set<string>): Promise<void> {
     const cap = opts.maxActiveWorkspaces;
     if (cap <= 0) return;
 
-    const nonWarm = [...activeSessions.values()].filter(
-      (s) => !s.isWarmStandby && s.id !== excludeSessionId,
-    );
-    if (nonWarm.length < cap) return;
+    let totalRunning = [...activeSessions.values()].filter((s) => s.id !== excludeSessionId).length;
+    if (totalRunning < cap) return;
+
+    // 1. Reclaim unclaimed warm standby processes first
+    for (const slot of [...warmPool]) {
+      if (totalRunning < cap) break;
+      if (slot.claimedBySessionId || slot.id === excludeSessionId) continue;
+      const idx = warmPool.indexOf(slot);
+      if (idx !== -1) warmPool.splice(idx, 1);
+      await stopSessionProcess(slot.id).catch(() => {});
+      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
+      totalRunning = [...activeSessions.values()].filter((s) => s.id !== excludeSessionId).length;
+    }
+
+    if (totalRunning < cap) return;
 
     const bq = buildQueue.getStatus();
     const buildProtected = new Set<string>(bq.queuedSessionIds);
     if (bq.activeSessionId) buildProtected.add(bq.activeSessionId);
 
-    // Sort oldest lastActiveAt first
+    const nonWarm = [...activeSessions.values()].filter(
+      (s) => !s.isWarmStandby && s.id !== excludeSessionId,
+    );
     nonWarm.sort((a, b) => a.lastActiveAt - b.lastActiveAt);
 
-    let activeCount = nonWarm.length;
     for (const candidate of nonWarm) {
-      if (activeCount < cap) break;
+      if (totalRunning < cap) break;
       if (protectedIds.has(candidate.id) || buildProtected.has(candidate.id)) continue;
 
-      // Check if candidate's Pi agent, sync/escalation, or open merge review is currently active
       let runnerBusy = false;
       try {
         const res = await fetch(`http://127.0.0.1:${candidate.runnerPort}/health`, {
-          signal: AbortSignal.timeout(1500),
+          signal: AbortSignal.timeout(3_000),
         });
         if (res.ok) {
           const data = (await res.json()) as { piBusy?: boolean; busy?: boolean };
@@ -336,7 +397,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         `[halley-supervisor] LRU cap (${cap}) reached — putting idle session ${candidate.id.slice(0, 8)} to sleep`,
       );
       await stopSessionProcess(candidate.id);
-      activeCount--;
+      totalRunning--;
     }
   }
 
@@ -354,8 +415,14 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     isWarmStandby: boolean;
   }): Promise<ManagedSession> {
     const bindHost = opts.bindHost || '0.0.0.0';
-    const runnerPort = await getFreePort(bindHost);
-    const astroPort = await getFreePort(bindHost);
+    const runnerPort = await allocateLeasedPort(bindHost);
+    let astroPort = 0;
+    try {
+      astroPort = await allocateLeasedPort(bindHost);
+    } catch (err) {
+      releaseLeasedPort(runnerPort);
+      throw err;
+    }
 
     emitProgress(params.sessionId, 'starting_preview', 'Starting Astro live preview…', {
       warmHit: params.isWarmStandby || undefined,
@@ -372,12 +439,14 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         HALLEY_BASE_BRANCH: params.baseBranch,
         HALLEY_BASE_SHA: params.baseSha,
         HALLEY_MIRROR_PATH: mirrorDir,
+        HALLEY_NM_CACHE_DIR: nmCacheDir,
         HALLEY_PKG_CACHE_DIR: pkgCacheDir,
+        HALLEY_VERIFY_SANDBOX_DIR: verifySandboxDir,
         RUNNER_PORT: String(runnerPort),
         ASTRO_PORT: String(astroPort),
         CONTROL_PLANE_INTERNAL_URL: controlPlaneBase,
         HALLEY_SUPERVISOR_URL: supervisorSelfUrl,
-        ...(opts.hostSecret ? { WORKSPACE_HOST_SECRET: opts.hostSecret } : {}),
+        ...(activeHostSecret ? { WORKSPACE_HOST_SECRET: activeHostSecret } : {}),
         WORKSPACE_TOKEN: params.workspaceToken,
         HALLEY_MODEL_ID: opts.modelId,
         HALLEY_THINKING_LEVEL: opts.thinkingLevel,
@@ -411,6 +480,8 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         activeSessions.delete(params.sessionId);
       }
       buildQueue.releaseBySession(params.sessionId);
+      releaseLeasedPort(runnerPort);
+      releaseLeasedPort(astroPort);
     });
     child.stdout?.on('data', (d: Buffer) => appendLog(params.sessionId, d, false));
     child.stderr?.on('data', (d: Buffer) => appendLog(params.sessionId, d, true));
@@ -419,13 +490,19 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         activeSessions.delete(params.sessionId);
       }
       buildQueue.releaseBySession(params.sessionId);
+      releaseLeasedPort(runnerPort);
+      releaseLeasedPort(astroPort);
     });
 
-    // Poll until astroReady
+    // Poll until astroReady (generous 90s ceiling for cold Ryzen V1500B boots)
     const deadline = Date.now() + 90_000;
     let lastAstroState: string | undefined;
     let lastAstroLogs: string[] = [];
     while (Date.now() < deadline) {
+      if (deletedSessionIds.has(params.sessionId)) {
+        await stopSessionProcess(params.sessionId);
+        throw new Error('Session was deleted while starting');
+      }
       if (spawnError !== null) {
         throw new Error(`Failed to spawn workspace process: ${(spawnError as Error).message}`);
       }
@@ -437,7 +514,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       }
       try {
         const res = await fetch(`http://127.0.0.1:${runnerPort}/health`, {
-          signal: AbortSignal.timeout(2000),
+          signal: AbortSignal.timeout(4_000),
         });
         if (res.ok) {
           const health = (await res.json()) as {
@@ -472,7 +549,11 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
           }
         }
       } catch (err) {
-        if (err instanceof Error && err.message.startsWith('Workspace preview server crashed')) {
+        if (
+          err instanceof Error &&
+          (err.message.startsWith('Workspace preview server crashed') ||
+            err.message === 'Session was deleted while starting')
+        ) {
           throw err;
         }
         // still booting
@@ -553,13 +634,21 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         isWarmStandby: true,
       });
 
+      // Pre-render `/` once so Vite + Tailwind v4 JIT + Astro Content Layer are already hot in RAM!
+      const previewBase = computePreviewBase(slot.id, managed.astroBase);
+      await fetch(`http://127.0.0.1:${managed.astroPort}${previewBase}/`, {
+        signal: AbortSignal.timeout(25_000),
+      })
+        .then((r) => r.arrayBuffer())
+        .catch(() => {});
+
       slot.runnerPort = managed.runnerPort;
       slot.astroPort = managed.astroPort;
       slot.astroBase = managed.astroBase;
       slot.baseSha = managed.baseSha;
       slot.state = 'ready';
       console.log(
-        `[halley-warm-pool] Standby workspace ${slot.id.slice(0, 8)} is hot & ready (baseSha=${slot.baseSha.slice(0, 7)})`,
+        `[halley-warm-pool] Standby workspace ${slot.id.slice(0, 8)} is pre-rendered & ready (baseSha=${slot.baseSha.slice(0, 7)})`,
       );
     } catch (err) {
       slot.state = 'failed';
@@ -567,11 +656,15 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       const idx = warmPool.indexOf(slot);
       if (idx !== -1) warmPool.splice(idx, 1);
       await stopSessionProcess(slot.id).catch(() => {});
-      await fs.rm(baseDir, { recursive: true, force: true }).catch(() => {});
-      if (!slot.claimedBySessionId && warmPoolRunning) {
-        setTimeout(() => {
-          if (warmPoolRunning) replenishWarmPool();
-        }, 30_000).unref?.();
+      // Only remove baseDir here if not currently claimed by an active `/start` handler
+      // (if claimed, `/start` owns cleanup before its cold-boot fallback to avoid racing fs.rm!)
+      if (!slot.claimedBySessionId) {
+        await fs.rm(baseDir, { recursive: true, force: true }).catch(() => {});
+        if (warmPoolRunning) {
+          setTimeout(() => {
+            if (warmPoolRunning) replenishWarmPool();
+          }, 30_000).unref?.();
+        }
       }
     }
   }
@@ -579,7 +672,12 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
   function replenishWarmPool(): void {
     if (!warmPoolRunning || opts.warmPoolSize <= 0) return;
     warmPool = warmPool.filter((s) => s.state !== 'failed');
-    while (warmPool.length < opts.warmPoolSize) {
+    // Respect MAX_ACTIVE_WORKSPACES across active user sessions + standby slots
+    const activeNonWarmCount = [...activeSessions.values()].filter((s) => !s.isWarmStandby).length;
+    const availableCapacity = Math.max(0, opts.maxActiveWorkspaces - activeNonWarmCount);
+    const targetSlots = Math.min(opts.warmPoolSize, availableCapacity);
+
+    while (warmPool.length < targetSlots) {
       const id = crypto.randomUUID();
       const rawToken = crypto.randomBytes(24).toString('hex');
       const now = new Date().toISOString();
@@ -613,7 +711,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       if (slot.state !== 'ready') continue;
       try {
         const res = await fetch(`http://127.0.0.1:${slot.runnerPort}/health`, {
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(4_000),
         });
         if (!res.ok) unhealthy.push(slot);
       } catch {
@@ -626,7 +724,6 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       await stopSessionProcess(slot.id).catch(() => {});
       await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
     }
-    // Reclaim unclaimed warm reservations older than 5 minutes (e.g. if control-plane crashed mid-create)
     const now = Date.now();
     for (const [id, slot] of Array.from(reservedWarmSlots.entries())) {
       if (slot.reservedAt && now - slot.reservedAt > 5 * 60_000) {
@@ -672,11 +769,34 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
   const app = new Hono();
 
-  // Optional Bearer auth when WORKSPACE_HOST_SECRET is set
+  /**
+   * Zero-config HKDF handshake from control-plane: adopts `internalHostToken` on startup
+   * when `WORKSPACE_HOST_SECRET` was not set manually, then enforces mandatory Bearer auth!
+   */
+  app.post('/api/handshake', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { internalHostToken?: string };
+    const candidate = (body.internalHostToken || '').trim();
+    if (!candidate) {
+      return c.json({ error: 'Missing internalHostToken' }, 400);
+    }
+    if (!activeHostSecret) {
+      activeHostSecret = candidate;
+      startWarmPool();
+    } else if (!safeEqualToken(candidate, activeHostSecret)) {
+      return c.json({ error: 'Unauthorized: host secret mismatch' }, 401);
+    }
+    return c.json({
+      ok: true,
+      protocolVersion: WORKSPACE_HOST_PROTOCOL_VERSION,
+      instanceId,
+    });
+  });
+
   app.use('*', async (c, next) => {
-    if (opts.hostSecret) {
-      const auth = c.req.header('authorization') || '';
-      if (auth !== `Bearer ${opts.hostSecret}`) {
+    if (c.req.path === '/api/handshake') return next();
+    if (activeHostSecret) {
+      const bearer = extractBearerToken(c.req.header('authorization'));
+      if (!safeEqualToken(bearer, activeHostSecret)) {
         return c.json({ error: 'Unauthorized' }, 401);
       }
     }
@@ -685,20 +805,51 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
   app.get('/health', async (c) => {
     const diskUsage = await getDiskUsage();
-    const activeIds = [...activeSessions.values()]
-      .filter((s) => !s.isWarmStandby)
-      .map((s) => s.id);
+    const activeNonWarm = [...activeSessions.values()].filter((s) => !s.isWarmStandby);
+    const astroReadySessionIds: string[] = [];
+    await Promise.all(
+      activeNonWarm.map(async (s) => {
+        try {
+          const r = await fetch(`http://127.0.0.1:${s.runnerPort}/health`, {
+            signal: AbortSignal.timeout(1500),
+          });
+          if (r.ok) {
+            const d = (await r.json()) as { astroReady?: boolean };
+            if (d.astroReady) astroReadySessionIds.push(s.id);
+          }
+        } catch {
+          // ignore
+        }
+      }),
+    );
+    const activeIds = activeNonWarm.map((s) => s.id);
     return c.json({
       ok: true,
       protocolVersion: WORKSPACE_HOST_PROTOCOL_VERSION,
       instanceId,
       activeSessionIds: activeIds,
+      astroReadySessionIds,
       activeCount: activeIds.length,
       maxActiveWorkspaces: opts.maxActiveWorkspaces,
       warmPool: getWarmPoolStatus(),
       buildQueue: buildQueue.getStatus(),
       diskUsage,
     });
+  });
+
+  app.post('/api/mirror/notify-updated', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { baseBranch?: string };
+    void syncLocalMirror(body.baseBranch || opts.baseBranch).catch(() => {});
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/sessions/:id/touch', (c) => {
+    const sessionId = c.req.param('id')!;
+    const s = activeSessions.get(sessionId);
+    if (s) {
+      s.lastActiveAt = Date.now();
+    }
+    return c.json({ ok: true });
   });
 
   app.post('/api/warm/reserve', (c) => {
@@ -740,8 +891,21 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     });
   });
 
+  app.post('/api/warm/release/:id', async (c) => {
+    const id = c.req.param('id')!;
+    const slot = reservedWarmSlots.get(id);
+    if (slot) {
+      reservedWarmSlots.delete(id);
+      await stopSessionProcess(slot.id).catch(() => {});
+      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
+      replenishWarmPool();
+    }
+    return c.json({ ok: true });
+  });
+
   app.post('/api/sessions/:id/start', async (c) => {
     const sessionId = c.req.param('id')!;
+    deletedSessionIds.delete(sessionId);
     const body = (await c.req.json()) as {
       baseBranch: string;
       workingBranch: string;
@@ -777,8 +941,11 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
           const tokRes = await fetch(`http://127.0.0.1:${existing.runnerPort}/internal/token`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ workspaceToken: body.workspaceToken }),
-            signal: AbortSignal.timeout(4_000),
+            body: JSON.stringify({
+              workspaceToken: body.workspaceToken,
+              hostSecret: activeHostSecret || undefined,
+            }),
+            signal: AbortSignal.timeout(5_000),
           });
           if (tokRes.ok) {
             existing.workspaceToken = body.workspaceToken;
@@ -802,7 +969,6 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     }
 
     const bootPromise = (async (): Promise<ManagedSession> => {
-      // Check if this session reserved a warm standby slot
       const reservedSlot = reservedWarmSlots.get(sessionId);
       if (reservedSlot) {
         reservedWarmSlots.delete(sessionId);
@@ -831,6 +997,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
                   syncFromMirror: needsSync,
                   mirrorPath: mirrorDir,
                   workspaceToken: body.workspaceToken || undefined,
+                  hostSecret: activeHostSecret || undefined,
                 }),
                 signal: AbortSignal.timeout(60_000),
               });
@@ -851,11 +1018,17 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
           }
         } catch (err) {
           console.warn(
-            `[halley-warm-pool] Claim failed for ${sessionId.slice(0, 8)}, falling back to cold boot:`,
+            `[halley-warm-pool] Claim failed for ${sessionId.slice(0, 8)}, cleaning up before cold boot:`,
             err,
           );
         }
+        // Cleanly wipe failed/partial warm slot directory so cold boot starts 100% fresh on workingBranch!
         await stopSessionProcess(sessionId).catch(() => {});
+        await fs.rm(sessionDir(sessionId), { recursive: true, force: true }).catch(() => {});
+      }
+
+      if (deletedSessionIds.has(sessionId)) {
+        throw new Error('Session was deleted before boot');
       }
 
       await enforceLruCap(sessionId, protectedSet);
@@ -879,7 +1052,6 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         await runGit(workspaceDir, ['checkout', '-B', body.workingBranch, `origin/${body.baseBranch}`]);
         baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
       } else {
-        // Ensure origin points to the current internal git URL
         await runGit(workspaceDir, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
         if (!baseSha) {
           baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']).catch(() => '');
@@ -893,7 +1065,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         onInstalling: () => emitProgress(sessionId, 'installing_deps', 'Installing project packages…'),
       });
 
-      return spawnRunnerForSession({
+      const spawned = await spawnRunnerForSession({
         sessionId,
         workspaceDir,
         stateDir,
@@ -906,6 +1078,14 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
         readOnly: Boolean(body.readOnly),
         isWarmStandby: false,
       });
+
+      if (deletedSessionIds.has(sessionId)) {
+        await stopSessionProcess(sessionId).catch(() => {});
+        await fs.rm(baseDir, { recursive: true, force: true }).catch(() => {});
+        throw new Error('Session was deleted during boot');
+      }
+
+      return spawned;
     })().finally(() => {
       bootingSessions.delete(sessionId);
     });
@@ -931,6 +1111,8 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
   app.post('/api/sessions/:id/stop', async (c) => {
     const sessionId = c.req.param('id')!;
     await stopSessionProcess(sessionId);
+    // Once a user session goes to sleep, replenish warm standby if capacity opened up
+    if (warmPoolRunning) replenishWarmPool();
     return c.json({ ok: true });
   });
 
@@ -943,10 +1125,20 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
   app.delete('/api/sessions/:id', async (c) => {
     const sessionId = c.req.param('id')!;
-    reservedWarmSlots.delete(sessionId);
+    deletedSessionIds.add(sessionId);
+    const reserved = reservedWarmSlots.get(sessionId);
+    if (reserved) {
+      reservedWarmSlots.delete(sessionId);
+    }
+    const inflight = bootingSessions.get(sessionId);
     await stopSessionProcess(sessionId);
+    if (inflight) {
+      await inflight.catch(() => {});
+      await stopSessionProcess(sessionId);
+    }
     logsBySession.delete(sessionId);
     await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
+    if (warmPoolRunning) replenishWarmPool();
     return c.json({ ok: true });
   });
 
@@ -956,7 +1148,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       return c.json({ error: 'Cannot prune node_modules of an active session' }, 409);
     }
     const nmPath = path.join(sessionDir(sessionId), 'workspace', 'node_modules');
-    await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(nmPath, { recursive: true, force: true });
     return c.json({ ok: true });
   });
 
@@ -981,16 +1173,10 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
     const hasSrcRepo = await fileExists(path.join(srcWs, '.git'));
     if (hasSrcRepo) {
-      await fs.cp(srcWs, dstWs, {
-        recursive: true,
-        filter: (srcPath) => {
-          const base = path.basename(srcPath);
-          if (base === 'node_modules' || base === 'dist' || base === '.astro') return false;
-          // Never copy transient .git/*.lock files (e.g. index.lock) from an active source repo
-          if (base.endsWith('.lock') && srcPath.includes(`${path.sep}.git${path.sep}`)) return false;
-          return true;
-        },
-      });
+      // Atomic Git clone avoids torn reads of .git/index or refs when duplicating a live session!
+      await runGit(dstBase, ['clone', '--no-hardlinks', srcWs, 'workspace']);
+      await runGit(dstWs, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
+      await runGit(dstWs, ['checkout', '-B', body.targetWorkingBranch]);
     }
 
     const srcUploads = path.join(srcBase, 'state', 'uploads');
@@ -1000,11 +1186,6 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     const srcPageRequests = path.join(srcBase, 'state', 'page-requests.json');
     if (await fileExists(srcPageRequests)) {
       await fs.copyFile(srcPageRequests, path.join(dstBase, 'state', 'page-requests.json')).catch(() => {});
-    }
-
-    if (hasSrcRepo) {
-      await runGit(dstWs, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
-      await runGit(dstWs, ['checkout', '-B', body.targetWorkingBranch]);
     }
 
     return c.json({ ok: true });
@@ -1042,7 +1223,12 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     return c.json({ progress: bootProgressBySession.get(sessionId) ?? null });
   });
 
-  // Track open speculative NDJSON stream closers by leaseId so release/promote closes them cleanly
+  app.post('/internal/build-lock/defer-speculative', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { durationMs?: number };
+    buildQueue.deferSpeculativeFor(Math.min(120_000, Math.max(1_000, Number(body.durationMs) || 15_000)));
+    return c.json({ ok: true });
+  });
+
   const speculativeStreamClosers = new Map<string, () => void>();
 
   // Container-wide priority FIFO build lock (NDJSON stream)
@@ -1138,7 +1324,7 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       cancel() {
         streamCancelled = true;
         ac.abort();
-        if (acquiredLeaseId && (!sentAcquired || priority === 'speculative')) {
+        if (acquiredLeaseId && !sentAcquired) {
           buildQueue.releaseByLease(acquiredLeaseId);
         }
       },
@@ -1220,11 +1406,12 @@ if (isMain) {
       ? Math.max(0, Math.min(3, Number(warmPoolRaw) || 0))
       : 1;
   const maxActiveWorkspaces = Math.max(1, Number(process.env.MAX_ACTIVE_WORKSPACES || 5) || 5);
+  const initialHostSecret = (process.env.WORKSPACE_HOST_SECRET || '').trim() || undefined;
 
   const supervisor = createWorkspaceSupervisor({
     workspacesDir,
     controlPlaneInternalUrl,
-    hostSecret: process.env.WORKSPACE_HOST_SECRET || undefined,
+    hostSecret: initialHostSecret,
     repo: process.env.HALLEY_REPO || 'vrwarp/thecrossing.website',
     baseBranch: process.env.HALLEY_BASE_BRANCH || 'main',
     modelId: process.env.HALLEY_MODEL_ID || 'haiku-latest',
@@ -1255,21 +1442,24 @@ if (isMain) {
     `[halley-supervisor] listening on http://${bindHost}:${port} (protocol=v${WORKSPACE_HOST_PROTOCOL_VERSION}, dir=${workspacesDir}, maxActive=${maxActiveWorkspaces}, warmPool=${warmPoolSize})`,
   );
 
-  // Wait until control-plane /api/health is reachable before starting the warm standby pool
-  void (async () => {
-    const cpHealthUrl = `${controlPlaneInternalUrl.replace(/\/+$/, '')}/api/health`;
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      try {
-        const res = await fetch(cpHealthUrl, { signal: AbortSignal.timeout(2000) });
-        if (res.ok) break;
-      } catch {
-        // control-plane still starting
+  // If WORKSPACE_HOST_SECRET was explicitly provided via env, start warm pool once control-plane is reachable;
+  // otherwise `/api/handshake` from control-plane provides the HKDF token and starts the warm pool!
+  if (initialHostSecret) {
+    void (async () => {
+      const cpHealthUrl = `${controlPlaneInternalUrl.replace(/\/+$/, '')}/api/health`;
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(cpHealthUrl, { signal: AbortSignal.timeout(2000) });
+          if (res.ok) break;
+        } catch {
+          // control-plane still starting
+        }
+        await new Promise((r) => setTimeout(r, 1000));
       }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    supervisor.startWarmPool();
-  })();
+      supervisor.startWarmPool();
+    })();
+  }
 
   const shutdown = () => {
     void supervisor.stopAll().finally(() => {

@@ -2,10 +2,10 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { deriveInternalHostToken, extractBearerToken, safeEqualToken } from '@halley/shared/auth';
 import type { Context } from 'hono';
 import type { HalleyConfig } from './config.js';
 import type { ControlPlaneDb } from './db.js';
-import { hashWorkspaceToken } from './proxy/llm-proxy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -44,10 +44,26 @@ export async function configureBareMirrorForHttp(mirrorDir: string): Promise<voi
   await fs.writeFile(hookPath, PRE_RECEIVE_HOOK, { mode: 0o755 });
 }
 
+function extractGitAuthToken(authHeader?: string | null): string {
+  const bearer = extractBearerToken(authHeader);
+  if (bearer) return bearer;
+  if (authHeader && /^basic\s+/i.test(authHeader.trim())) {
+    try {
+      const decoded = Buffer.from(authHeader.trim().replace(/^basic\s+/i, ''), 'base64').toString('utf8');
+      const idx = decoded.indexOf(':');
+      return idx >= 0 ? decoded.slice(idx + 1).trim() : decoded.trim();
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
 /**
  * Hono handler serving `/internal/git/repo.git/*` via `git-http-backend`.
  * Keeps all GitHub credentials strictly inside control-plane: `workspaces` only ever
  * fetches from and pushes `halley/*` working branches to this internal endpoint.
+ * Mandatory Bearer auth is enforced unconditionally via HKDF-derived host/workspace tokens.
  */
 export function createInternalGitHttpHandler(
   config: HalleyConfig,
@@ -55,17 +71,20 @@ export function createInternalGitHttpHandler(
   ensureMirrorReady: () => Promise<void>,
 ): (c: Context) => Promise<Response> {
   const projectRoot = path.join(config.dataDir, 'git-mirror');
+  const derivedHostToken = deriveInternalHostToken(config.sessionSecret);
 
   return async (c: Context): Promise<Response> => {
-    // Authenticate: if WORKSPACE_HOST_SECRET is set, accept it OR any active WORKSPACE_TOKEN
-    if (config.workspaceHostSecret) {
-      const auth = c.req.header('authorization') || '';
-      const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-      const okSecret = token === config.workspaceHostSecret;
-      const okSession = Boolean(token && db.getSessionByTokenHash(hashWorkspaceToken(token)));
-      if (!okSecret && !okSession) {
-        return c.text('Unauthorized', 401);
-      }
+    const token = extractGitAuthToken(c.req.header('authorization'));
+    const okDerived = safeEqualToken(token, derivedHostToken);
+    const okExplicit = config.workspaceHostSecret
+      ? safeEqualToken(token, config.workspaceHostSecret)
+      : false;
+    const okSession = Boolean(token && db.resolveSessionByWorkspaceToken(token));
+    if (!okDerived && !okExplicit && !okSession) {
+      return new Response('Unauthorized', {
+        status: 401,
+        headers: { 'WWW-Authenticate': 'Bearer realm="halley-internal-git"' },
+      });
     }
 
     await ensureMirrorReady();

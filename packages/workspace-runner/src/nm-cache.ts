@@ -63,7 +63,7 @@ export async function writeNodeModulesMeta(stateDir: string, meta: NodeModulesMe
   await fs.writeFile(path.join(stateDir, NM_META_FILE), JSON.stringify(meta, null, 2), 'utf8');
 }
 
-async function runPackageInstall(workspaceDir: string, pkgCacheDir: string): Promise<void> {
+export async function runPackageInstall(workspaceDir: string, pkgCacheDir: string): Promise<void> {
   const hasPkgLock = await fileExists(path.join(workspaceDir, 'package-lock.json'));
   const hasPnpmLock = await fileExists(path.join(workspaceDir, 'pnpm-lock.yaml'));
   const hasPkgJson = await fileExists(path.join(workspaceDir, 'package.json'));
@@ -93,18 +93,34 @@ async function runPackageInstall(workspaceDir: string, pkgCacheDir: string): Pro
 }
 
 /**
- * Detaches a session from the shared hardlinked `node_modules` cache before a package
- * manager mutation runs, preventing in-place writes from modifying shared inodes.
+ * Makes regular files inside a golden cached `node_modules` read-only (`chmod a-w`) while
+ * keeping directories writable (`u+rwx`). This prevents in-place file mutations from corrupting
+ * shared hardlinked inodes across sessions while allowing fast `fs.rm` unlinking without EACCES.
+ */
+async function markRegularFilesReadOnly(rootDir: string): Promise<void> {
+  await execFileAsync('find', [rootDir, '-type', 'f', '-exec', 'chmod', 'a-w', '{}', '+'], {
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 60_000,
+  }).catch(() => {});
+}
+
+/**
+ * Detaches a session from the shared hardlinked or symlinked `node_modules` cache before a package
+ * manager mutation runs, preventing in-place writes from modifying shared inodes or host fixtures.
  */
 export async function detachHardlinkedNodeModules(
   workspaceDir: string,
   stateDir: string,
+  pkgCacheDir?: string,
 ): Promise<boolean> {
   const meta = await readNodeModulesMeta(stateDir);
-  if (meta?.mode !== 'hardlinked') return false;
+  if (!meta || (meta.mode !== 'hardlinked' && meta.mode !== 'symlink')) return false;
   const nmPath = path.join(workspaceDir, 'node_modules');
   await fs.rm(nmPath, { recursive: true, force: true });
   const hash = (await computeDependencyHash(workspaceDir)) ?? meta.hash;
+  if (meta.mode === 'symlink' && pkgCacheDir) {
+    await runPackageInstall(workspaceDir, pkgCacheDir);
+  }
   await writeNodeModulesMeta(stateDir, { mode: 'detached', hash });
   return true;
 }
@@ -138,6 +154,7 @@ async function isNodeModulesHealthy(nmPath: string, workspaceDir: string): Promi
 
 export class NodeModulesCacheManager {
   private inflight = new Map<string, Promise<string>>();
+  private activeReadRefs = new Map<string, number>();
 
   constructor(
     private readonly nmCacheDir: string,
@@ -145,13 +162,24 @@ export class NodeModulesCacheManager {
     private readonly maxCachedHashes = 2,
   ) {}
 
+  private acquireReadRef(hash: string): () => void {
+    this.activeReadRefs.set(hash, (this.activeReadRefs.get(hash) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = (this.activeReadRefs.get(hash) ?? 1) - 1;
+      if (next <= 0) this.activeReadRefs.delete(hash);
+      else this.activeReadRefs.set(hash, next);
+    };
+  }
+
   /**
    * Ensures a session workspace has an up-to-date, healthy `node_modules`.
-   * - If `devLocalRepo` has pre-installed `node_modules`, symlinks it (fast local/E2E path).
-   * - If `node_modules` is missing or incomplete/corrupt, populates atomically via hardlinked
-   *   copy (`cp -al` into a staging dir then rename) from the lockfile-hashed cache.
-   * - If `node_modules` exists in `hardlinked` mode and the lockfile hash changed (copy-on-change),
-   *   detaches and runs a fresh isolated install in the session workspace.
+   * - Holds a reference-counted read lease on `hash` during `cp -al` so `pruneOldCaches`
+   *   can never delete the source directory mid-copy.
+   * - Golden cached files are marked `a-w` (read-only) so accidental in-place writes fail
+   *   instead of corrupting shared inodes across sessions.
    */
   async ensureSessionNodeModules(opts: {
     workspaceDir: string;
@@ -172,23 +200,18 @@ export class NodeModulesCacheManager {
       if (!meta || meta.hash === hash) {
         return;
       }
-      // Lockfile / package.json changed while node_modules exists -> copy-on-change detach & install
-      onInstalling?.();
+      // Lockfile / package.json changed while node_modules exists -> re-link from cache or install
       await fs.rm(nmPath, { recursive: true, force: true });
-      await runPackageInstall(workspaceDir, this.pkgCacheDir);
-      await writeNodeModulesMeta(stateDir, { mode: 'detached', hash });
-      return;
-    }
-
-    if (hasNm && !healthy) {
+    } else if (hasNm) {
       // Self-heal partial/empty node_modules left behind by an interrupted install or copy
       await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
     }
 
-    // Fast path for local dev / E2E tests with a local fixture repo
+    // Fast path for local dev / E2E tests with a local fixture repo (only when hash matches fixture)
     if (devLocalRepo) {
+      const fixtureHash = await computeDependencyHash(devLocalRepo).catch(() => null);
       const srcModules = path.join(devLocalRepo, 'node_modules');
-      if (await fileExists(srcModules)) {
+      if ((!fixtureHash || fixtureHash === hash) && (await fileExists(srcModules))) {
         await fs.symlink(srcModules, nmPath);
         await writeNodeModulesMeta(stateDir, { mode: 'symlink', hash });
         return;
@@ -196,12 +219,13 @@ export class NodeModulesCacheManager {
     }
 
     onInstalling?.();
-    const cachedNmPath = await this.ensureCachedInstall(hash, workspaceDir);
+    const releaseRef = this.acquireReadRef(hash);
     const stagingNmPath = path.join(workspaceDir, `.node_modules.tmp-${crypto.randomUUID().slice(0, 8)}`);
     try {
+      const cachedNmPath = await this.ensureCachedInstall(hash, workspaceDir);
       await execFileAsync('cp', ['-al', cachedNmPath, stagingNmPath], {
         maxBuffer: 16 * 1024 * 1024,
-        timeout: 60_000,
+        timeout: 90_000,
       });
       await fs.rename(stagingNmPath, nmPath);
       if (!(await isNodeModulesHealthy(nmPath, workspaceDir))) {
@@ -214,6 +238,8 @@ export class NodeModulesCacheManager {
       await fs.rm(nmPath, { recursive: true, force: true }).catch(() => {});
       await runPackageInstall(workspaceDir, this.pkgCacheDir);
       await writeNodeModulesMeta(stateDir, { mode: 'detached', hash });
+    } finally {
+      releaseRef();
     }
   }
 
@@ -227,7 +253,7 @@ export class NodeModulesCacheManager {
       await fs.utimes(readyFile, now, now).catch(() => {});
       return cachedNm;
     }
-    if (await fileExists(targetDir)) {
+    if (await fileExists(targetDir) && !this.activeReadRefs.has(hash)) {
       await fs.rm(targetDir, { recursive: true, force: true }).catch(() => {});
     }
 
@@ -246,8 +272,8 @@ export class NodeModulesCacheManager {
           }
         }
         await runPackageInstall(tmpDir, this.pkgCacheDir);
+        await markRegularFilesReadOnly(path.join(tmpDir, 'node_modules'));
         await fs.writeFile(path.join(tmpDir, '.ready'), new Date().toISOString(), 'utf8');
-        // Atomic rename; if another worker raced, remove tmpDir
         try {
           await fs.rename(tmpDir, targetDir);
         } catch {
@@ -273,6 +299,7 @@ export class NodeModulesCacheManager {
     const readyDirs: Array<{ name: string; mtimeMs: number }> = [];
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith('.tmp-')) continue;
+      if ((this.activeReadRefs.get(e.name) ?? 0) > 0 || this.inflight.has(e.name)) continue;
       const readyPath = path.join(this.nmCacheDir, e.name, '.ready');
       try {
         const st = await fs.stat(readyPath);
@@ -283,6 +310,7 @@ export class NodeModulesCacheManager {
     }
     readyDirs.sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const stale of readyDirs.slice(this.maxCachedHashes)) {
+      if ((this.activeReadRefs.get(stale.name) ?? 0) > 0) continue;
       await fs.rm(path.join(this.nmCacheDir, stale.name), { recursive: true, force: true }).catch(() => {});
     }
   }

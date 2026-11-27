@@ -13,73 +13,6 @@ function escapeHtml(str: string): string {
     .replace(/"/g, '&quot;');
 }
 
-const WAKING_HTML = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Waking up preview…</title>
-  <style>
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background:#FAF9F7; color:#1C1917; display:flex; align-items:center; justify-content:center; height:100vh; }
-    .card { text-align:center; padding:32px; max-width:360px; }
-    .spinner { width:24px; height:24px; border:2px solid #E7E5E4; border-top-color:#D97706;
-      border-radius:50%; margin:0 auto 16px; animation:spin .8s linear infinite; }
-    @keyframes spin { to { transform:rotate(360deg); } }
-    h1 { font-size:16px; font-weight:600; margin:0 0 6px; }
-    p { font-size:13px; color:#78716C; margin:0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <h1>Waking up your preview…</h1>
-    <p>This usually takes a couple of seconds.</p>
-  </div>
-  <script>
-    (function () {
-      var key = 'halley_wake_attempt:' + location.pathname;
-      var attempt = Number(sessionStorage.getItem(key) || '0') + 1;
-      sessionStorage.setItem(key, String(Math.min(attempt, 6)));
-      var delays = [2000, 3000, 5000, 8000, 12000, 15000];
-      var delay = delays[Math.min(attempt - 1, delays.length - 1)];
-      setTimeout(function () { location.reload(); }, delay);
-    })();
-  </script>
-</body>
-</html>`;
-
-const VERIFYING_HTML = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Running pre-publish checks…</title>
-  <style>
-    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background:#FAF9F7; color:#1C1917; display:flex; align-items:center; justify-content:center; height:100vh; }
-    .card { text-align:center; padding:36px 32px; max-width:380px; background:#fff; border:1px solid #E7E5E4; border-radius:16px; }
-    .ring { width:36px; height:36px; border:2px solid #E7E5E4; border-top-color:#D97706;
-      border-radius:50%; margin:0 auto 18px; animation:spin .9s linear infinite; }
-    .bar { height:4px; background:#F5F5F4; border-radius:999px; overflow:hidden; margin:18px auto 0; width:200px; }
-    .bar > div { height:100%; width:42%; background:#D97706; border-radius:999px; animation:slide 1.5s ease-in-out infinite; }
-    @keyframes spin { to { transform:rotate(360deg); } }
-    @keyframes slide { 0% { transform:translateX(-110%); } 100% { transform:translateX(260%); } }
-    h1 { font-size:16px; font-weight:600; margin:0 0 6px; }
-    p { font-size:13px; color:#78716C; margin:0; line-height:1.5; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="ring"></div>
-    <h1>Preview paused for publish checks</h1>
-    <p>Verifying your build, links, and SEO before publishing. Live preview will return automatically.</p>
-    <div class="bar"><div></div></div>
-  </div>
-  <script>
-    setTimeout(function () { location.reload(); }, 4000);
-  </script>
-</body>
-</html>`;
-
 function crashLoopHtml(sessionId: string, err: WorkspaceCrashLoopError): string {
   const title = err.oom
     ? 'Workspace ran out of memory'
@@ -121,86 +54,170 @@ function crashLoopHtml(sessionId: string, err: WorkspaceCrashLoopError): string 
 </html>`;
 }
 
-const VITE_CLIENT_SHIM_JS = `
-const sheetsMap = new Map();
-let lastInsertedStyle;
-const cspNonce = document.querySelector('meta[property=csp-nonce]')?.nonce;
-function updateStyle(id, content) {
-  let style = sheetsMap.get(id);
-  if (!style) {
-    style = document.createElement('style');
-    style.setAttribute('type', 'text/css');
-    style.setAttribute('data-vite-dev-id', id);
-    style.textContent = content;
-    if (cspNonce) style.setAttribute('nonce', cspNonce);
-    if (!lastInsertedStyle) {
-      document.head.appendChild(style);
-      setTimeout(() => { lastInsertedStyle = undefined; }, 0);
-    } else {
-      lastInsertedStyle.insertAdjacentElement('afterend', style);
-    }
-    lastInsertedStyle = style;
-  } else {
-    style.textContent = content;
-  }
-  sheetsMap.set(id, style);
-}
-function removeStyle(id) {
-  const style = sheetsMap.get(id);
-  if (style) {
-    style.remove();
-    sheetsMap.delete(id);
-  }
-}
-function injectQuery(url, queryToInject) {
-  if (url[0] !== '.' && url[0] !== '/') return url;
-  const pathname = url.replace(/[?#].*$/, '');
-  const { search, hash } = new URL(url, 'http://vite.dev');
-  return pathname + '?' + queryToInject + (search ? '&' + search.slice(1) : '') + (hash || '');
-}
-function createHotContext() {
-  return {
-    data: {},
-    accept() {},
-    acceptExports() {},
-    dispose() {},
-    prune() {},
-    decline() {},
-    invalidate() {},
-    on() {},
-    off() {},
-    send() {},
-  };
-}
-class ErrorOverlay {}
-export { ErrorOverlay, createHotContext, injectQuery, removeStyle, updateStyle };
-`.trimStart();
+const STARTING_STATUS_HTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Preview starting…</title>
+  <style>
+    body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:#FAF9F7; color:#57534E; display:flex; align-items:center; justify-content:center; height:100vh; font-size:14px; }
+  </style>
+</head>
+<body>Preview server is starting…</body>
+</html>`;
 
 const ASTRO_TOOLBAR_STUB_JS = 'export default {};\nexport const loadDevToolbarApps = async () => [];\n';
+
+/**
+ * Service Worker script served at `/halley-preview-sw.js` with `Service-Worker-Allowed: /`.
+ * Eliminates the global `Path=/` `halley_preview_session` cookie so multiple open session tabs
+ * never cross-contaminate escaped root-relative requests (`/@vite/*`, `/src/*`, `/images/*`, CSS `url()`).
+ * Each preview iframe browsing context has a unique `clientId` whose URL starts with `/p/<sessionId>/`.
+ */
+export const HALLEY_PREVIEW_SW_JS = `
+const clientSessions = new Map();
+
+self.addEventListener('install', () => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+function extractSessionFromUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const m = u.pathname.match(/^\\/p\\/([^/]+)(?:\\/|$)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function isReservedTopLevelPath(pathname) {
+  return (
+    pathname === '/halley-preview-sw.js' ||
+    pathname.startsWith('/p/') ||
+    pathname.startsWith('/__halley_p/') ||
+    pathname.startsWith('/api/') ||
+    pathname.startsWith('/internal/') ||
+    pathname.startsWith('/ws/')
+  );
+}
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET' && req.method !== 'HEAD') return;
+
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+
+  if (req.mode === 'navigate') {
+    const navSid = extractSessionFromUrl(req.url);
+    if (navSid && event.resultingClientId) {
+      clientSessions.set(event.resultingClientId, navSid);
+    }
+    return;
+  }
+
+  if (isReservedTopLevelPath(url.pathname)) return;
+  if (!event.clientId) return;
+
+  event.respondWith(
+    (async () => {
+      let sid = clientSessions.get(event.clientId) || null;
+      if (!sid) {
+        const client = await self.clients.get(event.clientId);
+        if (client && client.url) {
+          sid = extractSessionFromUrl(client.url);
+          if (sid) clientSessions.set(event.clientId, sid);
+        }
+      }
+      if (!sid) {
+        return fetch(req);
+      }
+      const rewrittenUrl = new URL(
+        '/__halley_p/' + encodeURIComponent(sid) + url.pathname + url.search,
+        self.location.origin,
+      );
+      return fetch(rewrittenUrl.toString(), {
+        method: req.method,
+        headers: req.headers,
+        credentials: 'same-origin',
+        redirect: req.redirect,
+      });
+    })(),
+  );
+});
+`.trimStart();
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+function isEditorRunnerEndpoint(pathname: string): string | null {
+  for (const suffix of [
+    '/__editor/health',
+    '/__editor/routes',
+    '/__editor/inspect',
+    '/__editor/patch',
+  ]) {
+    if (pathname === suffix || pathname.endsWith(suffix)) {
+      return suffix;
+    }
+  }
+  return null;
+}
+
+export function isAllowedWsOrigin(req: http.IncomingMessage, publicUrl?: string): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true; // Non-browser WS clients or same-origin without Origin
+  try {
+    const originHost = new URL(origin).host.toLowerCase();
+    const reqHost = (req.headers['x-forwarded-host']?.toString().split(',')[0]?.trim() ||
+      req.headers.host ||
+      '').toLowerCase();
+    if (reqHost && originHost === reqHost) return true;
+    if (publicUrl) {
+      const pubHost = new URL(publicUrl).host.toLowerCase();
+      if (pubHost && originHost === pubHost) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 export function createPreviewProxy(
   auth: AuthService,
   db: ControlPlaneDb,
   driver: WorkspaceDriver,
+  publicUrl?: string,
 ) {
-  const handleHttpForSession = async (c: Context, sessionId: string) => {
+  const proxyHttpRequest = async (
+    c: Context,
+    sessionId: string,
+    opts?: { escapedRootSubPath?: string },
+  ) => {
     const user = auth.getUserFromContext(c);
     if (!user) return c.text('Unauthorized', 401);
 
-    const reqPath = new URL(c.req.url).pathname;
-    if (c.req.method === 'GET' && (reqPath === '/@vite/client' || reqPath.endsWith('/@vite/client'))) {
-      return new Response(VITE_CLIENT_SHIM_JS, {
-        status: 200,
-        headers: {
-          'content-type': 'application/javascript; charset=utf-8',
-          'cache-control': 'no-store',
-        },
-      });
-    }
+    const incomingUrl = new URL(c.req.url);
+    const effectivePathname = opts?.escapedRootSubPath ?? incomingUrl.pathname;
+
     if (
       c.req.method === 'GET' &&
-      (reqPath.endsWith('/dev-toolbar/entrypoint.js') ||
-        reqPath.includes('__x00__astro:toolbar:internal'))
+      (effectivePathname.endsWith('/dev-toolbar/entrypoint.js') ||
+        effectivePathname.includes('__x00__astro:toolbar:internal'))
     ) {
       return new Response(ASTRO_TOOLBAR_STUB_JS, {
         status: 200,
@@ -214,10 +231,12 @@ export function createPreviewProxy(
     const session = db.getSession(sessionId);
     if (!session) return c.text('Session not found', 404);
 
+    const editorAction = isEditorRunnerEndpoint(effectivePathname);
+
     // Block inline edit patches if viewer is not owner/admin or session is published/merged
     if (
       c.req.method === 'POST' &&
-      c.req.path.endsWith('/__editor/patch') &&
+      editorAction === '/__editor/patch' &&
       ((session.owner_user_id !== user.id && !user.isAdmin) ||
         session.status === 'published' ||
         session.status === 'merged')
@@ -225,29 +244,64 @@ export function createPreviewProxy(
       return c.json({ error: 'Read-only preview' }, 403);
     }
 
-    db.updateSession(session.id, { last_active_at: new Date().toISOString() });
-
     let endpoint;
     try {
       endpoint = await driver.ensureRunning(session);
     } catch (err) {
-      if (err instanceof WorkspaceCrashLoopError) {
+      const wantsHtml = (c.req.header('accept') || '').includes('text/html');
+      if (err instanceof WorkspaceCrashLoopError && wantsHtml) {
         return c.html(crashLoopHtml(session.id, err), 503);
       }
-      return c.html(WAKING_HTML, 503);
+      if (wantsHtml) {
+        return new Response(STARTING_STATUS_HTML, {
+          status: 503,
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'retry-after': '2',
+          },
+        });
+      }
+      return c.json({ error: 'Preview server is starting', retryable: true }, 503);
     }
 
-    const url = new URL(c.req.url);
-    const targetBase = new URL(endpoint.astroUrl);
-    const targetPort = Number(targetBase.port || 4321);
+    // Only stamp activity once the session is confirmed running
+    db.updateSession(session.id, { last_active_at: new Date().toISOString() });
+    driver.touchSession?.(session.id);
+
+    // Route `/__editor/*` directly to single-writer `workspace-runner` (never `astro dev`)
+    const targetBase = new URL(editorAction ? endpoint.runnerUrl : endpoint.astroUrl);
+    const targetPort = Number(targetBase.port || (editorAction ? 4322 : 4321));
+
+    let upstreamPath = effectivePathname;
+    if (editorAction) {
+      upstreamPath = editorAction;
+    } else if (opts?.escapedRootSubPath) {
+      const sub = opts.escapedRootSubPath.startsWith('/')
+        ? opts.escapedRootSubPath
+        : `/${opts.escapedRootSubPath}`;
+      const cleanAstroBase =
+        !endpoint.astroBase || endpoint.astroBase === '/'
+          ? ''
+          : `/${endpoint.astroBase.replace(/^\/+|\/+$/g, '')}`;
+      if (cleanAstroBase && (sub === cleanAstroBase || sub.startsWith(`${cleanAstroBase}/`))) {
+        upstreamPath = `/p/${sessionId}${sub}`;
+      } else {
+        upstreamPath = `/p/${sessionId}${cleanAstroBase}${sub}`;
+      }
+    }
 
     const headers: Record<string, string> = {};
     c.req.raw.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'host') {
-        headers[key] = value;
+      const lower = key.toLowerCase();
+      if (lower === 'host' || lower === 'accept-encoding' || HOP_BY_HOP_HEADERS.has(lower)) {
+        return;
       }
+      headers[key] = value;
     });
     headers['host'] = `localhost:${targetPort}`;
+    // Request uncompressed upstream bytes so Node streams match stripped content-encoding
+    headers['accept-encoding'] = 'identity';
 
     const reqBody =
       ['GET', 'HEAD'].includes(c.req.method) ? undefined : Buffer.from(await c.req.arrayBuffer());
@@ -258,7 +312,7 @@ export function createPreviewProxy(
           {
             hostname: targetBase.hostname,
             port: targetPort,
-            path: `${url.pathname}${url.search}`,
+            path: `${upstreamPath}${incomingUrl.search}`,
             method: c.req.method,
             headers,
             timeout: 25_000,
@@ -286,40 +340,59 @@ export function createPreviewProxy(
       });
 
       const resHeaders = new Headers();
+      const upstreamOriginPrefix = `http://localhost:${targetPort}`;
       for (const [k, v] of Object.entries(upstream.headers)) {
-        if (!v || k.toLowerCase() === 'content-encoding') continue;
+        const lower = k.toLowerCase();
+        if (!v || lower === 'content-encoding' || lower === 'content-length' || HOP_BY_HOP_HEADERS.has(lower)) {
+          continue;
+        }
+        if (lower === 'location' && typeof v === 'string' && v.startsWith(upstreamOriginPrefix)) {
+          resHeaders.set(k, v.slice(upstreamOriginPrefix.length) || '/');
+          continue;
+        }
         if (Array.isArray(v)) {
           for (const item of v) resHeaders.append(k, item);
         } else {
           resHeaders.set(k, v);
         }
       }
-      if (c.req.path.startsWith('/p/')) {
-        const cookieHeader = c.req.header('cookie') || '';
-        const existingCookie = cookieHeader.match(/(?:^|;\s*)halley_preview_session=([^;]+)/)?.[1];
-        if (existingCookie !== sessionId) {
-          resHeaders.append(
-            'set-cookie',
-            `halley_preview_session=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax`,
-          );
-        }
-      }
+
       return new Response(Readable.toWeb(upstream) as ReadableStream, {
         status: upstream.statusCode ?? 200,
         headers: resHeaders,
       });
     } catch {
-      const latest = db.getSession(session.id);
-      if (latest?.publish_state === 'verifying') {
-        return c.html(VERIFYING_HTML, 503);
+      const wantsHtml = (c.req.header('accept') || '').includes('text/html');
+      if (wantsHtml) {
+        return new Response(STARTING_STATUS_HTML, {
+          status: 503,
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store',
+            'retry-after': '2',
+          },
+        });
       }
-      return c.html(WAKING_HTML, 503);
+      return c.json({ error: 'Preview upstream temporarily unavailable', retryable: true }, 503);
     }
+  };
+
+  const handleHttpForSession = async (c: Context, sessionId: string) => {
+    const escapedRootSubPath = c.req.path.startsWith('/p/') ? undefined : c.req.path;
+    return proxyHttpRequest(c, sessionId, { escapedRootSubPath });
+  };
+
+  const handleServiceWorkerRewrite = async (c: Context) => {
+    const sessionId = c.req.param('sessionId') || '';
+    const prefix = `/__halley_p/${encodeURIComponent(sessionId)}`;
+    const rawPath = new URL(c.req.url).pathname;
+    const subPath = rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : '/';
+    return proxyHttpRequest(c, sessionId, { escapedRootSubPath: subPath });
   };
 
   const handleHttp = async (c: Context) => {
     const sessionId = c.req.param('sessionId') || '';
-    return handleHttpForSession(c, sessionId);
+    return proxyHttpRequest(c, sessionId);
   };
 
   const handleUpgrade = async (
@@ -327,6 +400,12 @@ export function createPreviewProxy(
     socket: Duplex,
     head: Buffer,
   ) => {
+    if (!isAllowedWsOrigin(req, publicUrl)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     const user = auth.getUserFromCookieHeader(req.headers.cookie);
     if (!user) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
@@ -335,13 +414,13 @@ export function createPreviewProxy(
     }
 
     let sessionId = '';
-    const match = (req.url ?? '').match(/^\/p\/([^/]+)/);
+    const match = (req.url ?? '').match(/^\/p\/([^/?]+)/);
     if (match?.[1]) {
-      sessionId = match[1];
+      sessionId = decodeURIComponent(match[1]);
     } else {
       const ref = req.headers.referer || '';
-      const refMatch = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
-      if (refMatch?.[1]) sessionId = refMatch[1];
+      const refMatch = ref.match(/\/p\/([^/?#]+)/);
+      if (refMatch?.[1]) sessionId = decodeURIComponent(refMatch[1]);
     }
     if (!sessionId) {
       socket.destroy();
@@ -361,6 +440,8 @@ export function createPreviewProxy(
       socket.destroy();
       return;
     }
+
+    driver.touchSession?.(sessionId);
 
     const target = new URL(astroUrl);
     const proxyReq = http.request({
@@ -403,5 +484,5 @@ export function createPreviewProxy(
     proxyReq.end();
   };
 
-  return { handleHttp, handleHttpForSession, handleUpgrade };
+  return { handleHttp, handleHttpForSession, handleServiceWorkerRewrite, handleUpgrade };
 }

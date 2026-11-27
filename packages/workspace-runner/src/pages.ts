@@ -734,32 +734,35 @@ export class PageCreationService {
       : null;
 
     for (const abs of filesToUpdate) {
-      try {
-        const text = await fs.readFile(abs, 'utf8');
-        let next = text;
-        for (const re of refPatterns) {
-          next = next.replace(re, `$1${toRoute}$2`);
-        }
-        if (abs === astroCfgAbs || abs === verifySeoAbs) {
-          if (escapedBaseFrom) {
+      const rel = path.relative(this.opts.repoRoot, abs).split(path.sep).join('/');
+      await this.opts.fileLock
+        .withLock(rel, async () => {
+          const text = await fs.readFile(abs, 'utf8');
+          let next = text;
+          for (const re of refPatterns) {
+            next = next.replace(re, `$1${toRoute}$2`);
+          }
+          if (abs === astroCfgAbs || abs === verifySeoAbs) {
+            if (escapedBaseFrom) {
+              next = next.replace(
+                new RegExp(`(['"])${escapedBaseFrom}(\\/?['"])`, 'g'),
+                `$1${basePrefix}${toRoute}$2`,
+              );
+            }
+            // Replace bare route strings while avoiding `base: '/...'`
             next = next.replace(
-              new RegExp(`(['"])${escapedBaseFrom}(\\/?['"])`, 'g'),
-              `$1${basePrefix}${toRoute}$2`,
+              new RegExp(`(?<!\\bbase\\s*:\\s*)(['"])${escapedFrom}(\\/?['"])`, 'g'),
+              `$1${toRoute}$2`,
             );
           }
-          // Replace bare route strings while avoiding `base: '/...'`
-          next = next.replace(
-            new RegExp(`(?<!\\bbase\\s*:\\s*)(['"])${escapedFrom}(\\/?['"])`, 'g'),
-            `$1${toRoute}$2`,
-          );
-        }
-        if (next !== text) {
-          await fs.writeFile(abs, next, 'utf8');
-          updatedReferencesCount += 1;
-        }
-      } catch {
-        // ignore unreadable files
-      }
+          if (next !== text) {
+            const tmp = `${abs}.halley-tmp-${process.pid}-${Date.now()}`;
+            await fs.writeFile(tmp, next, 'utf8');
+            await fs.rename(tmp, abs);
+            updatedReferencesCount += 1;
+          }
+        })
+        .catch(() => {});
     }
 
     // Update any stored PageRequestMetadata for this route (including section)

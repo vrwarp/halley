@@ -67,10 +67,23 @@ function buildDraftDescription(title: string, purpose?: string): string {
 
 function parseDefaultImports(frontmatter: string): Map<string, string> {
   const imports = new Map<string, string>();
-  const re = /^\s*import\s+([A-Z][A-Za-z0-9_]*)\s+from\s+['"]([^'"]+)['"]\s*;?/gm;
+  const defaultRe = /^\s*import\s+([A-Z][A-Za-z0-9_]*)\s+from\s+['"]([^'"]+)['"]\s*;?/gm;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(frontmatter)) !== null) {
+  while ((m = defaultRe.exec(frontmatter)) !== null) {
     imports.set(m[1]!, m[2]!);
+  }
+  const namedRe = /^\s*import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?/gm;
+  while ((m = namedRe.exec(frontmatter)) !== null) {
+    const spec = m[2]!;
+    for (const part of m[1]!.split(',')) {
+      const cleaned = part.trim().replace(/^type\s+/, '');
+      if (!cleaned) continue;
+      const aliasMatch = /^([A-Za-z0-9_]+)(?:\s+as\s+([A-Za-z0-9_]+))?$/.exec(cleaned);
+      const localName = aliasMatch?.[2] || aliasMatch?.[1];
+      if (localName && /^[A-Z]/.test(localName)) {
+        imports.set(localName, spec);
+      }
+    }
   }
   return imports;
 }
@@ -467,11 +480,28 @@ export async function togglePageUnlistedInSource(
   unlisted: boolean,
 ): Promise<string> {
   if (!unlisted) {
-    const next = source
-      .replace(/\s+indexable\s*=\s*(?:\{\s*false\s*\}|["']false["'])/g, '')
+    let working = source;
+    try {
+      const parsed = await parse(source, { position: false });
+      const ast = parsed.ast as AstNode;
+      const children = ast.children ?? [];
+      const outer = findFirstComponent(children);
+      if (outer?.name) {
+        const span = findComponentOpeningTagSpan(source, outer.name);
+        if (span) {
+          const openTag = source.slice(span.start, span.end + 1);
+          const cleanedTag = openTag.replace(/\s+indexable\s*=\s*(?:\{\s*false\s*\}|["']false["'])/g, '');
+          working = source.slice(0, span.start) + cleanedTag + source.slice(span.end + 1);
+        }
+      } else {
+        working = source.replace(/\s+indexable\s*=\s*(?:\{\s*false\s*\}|["']false["'])/g, '');
+      }
+    } catch {
+      working = source.replace(/\s+indexable\s*=\s*(?:\{\s*false\s*\}|["']false["'])/g, '');
+    }
+    return working
       .replace(/[ \t]*<meta\b[^>]*name=["']robots["'][^>]*noindex[^>]*\/?>[ \t]*\r?\n?/gi, '')
       .replace(/[ \t]*<meta\b[^>]*noindex[^>]*name=["']robots["'][^>]*\/?>[ \t]*\r?\n?/gi, '');
-    return next;
   }
 
   // Already unlisted?

@@ -649,16 +649,34 @@ export function buildClientBridgeScript(previewBase: string): string {
     document.execCommand('unlink', false);
   });
 
-  function shiftSourceMapLines(targetFile, topLineDelta, afterLine, afterLineDelta) {
-    if (!topLineDelta && !afterLineDelta) return;
+  function shiftSourceMapLines(
+    targetFile,
+    topLineDelta,
+    afterLine,
+    afterLineDelta,
+    sameLineEndCol,
+    sameLineByteDelta,
+  ) {
+    if (!topLineDelta && !afterLineDelta && !sameLineByteDelta) return;
     const all = document.body ? document.body.querySelectorAll('*') : [];
     const remapLoc = (loc) => {
       const parts = String(loc || '').split(':');
       const line = parseInt(parts[0], 10);
+      const col = parts.length > 1 ? parseInt(parts[1], 10) : NaN;
       if (Number.isNaN(line)) return loc;
       let nextLine = line;
-      if (afterLineDelta && line > afterLine) nextLine += afterLineDelta;
+      let nextCol = col;
+      if (line === afterLine && !Number.isNaN(col) && sameLineEndCol > 0 && col > sameLineEndCol) {
+        nextCol = Math.max(1, col + sameLineByteDelta);
+        if (afterLineDelta) nextLine += afterLineDelta;
+      } else if (afterLineDelta && line > afterLine) {
+        nextLine += afterLineDelta;
+      }
       if (topLineDelta) nextLine += topLineDelta;
+      if (!Number.isNaN(nextCol)) {
+        const rest = parts.length > 2 ? ':' + parts.slice(2).join(':') : '';
+        return nextLine + ':' + nextCol + rest;
+      }
       return nextLine + (parts.length > 1 ? ':' + parts.slice(1).join(':') : '');
     };
     const nextKnown = new Map();
@@ -711,22 +729,30 @@ export function buildClientBridgeScript(previewBase: string): string {
       if (!res.ok) {
         el.innerHTML = originalHtml;
         showToast(data.error || 'Could not save edit');
-        window.parent.postMessage({ type: 'halley:edit-error', message: data.error || 'Save failed' }, '*');
+        window.parent.postMessage({ type: 'halley:edit-error', message: data.error || 'Save failed' }, window.location.origin);
         return;
+      }
+      if (data.newHash) {
+        expectedHash = data.newHash;
+        if (selEl === el && selInfo) {
+          selInfo = Object.assign({}, selInfo, { snapshotHash: data.newHash });
+        }
       }
       shiftSourceMapLines(
         meta.file,
         Number(data.topLineDelta || 0),
         Number(data.afterLine || 0),
         Number(data.afterLineDelta || 0),
+        Number(data.sameLineEndCol || 0),
+        Number(data.sameLineByteDelta || 0),
       );
       showToast('Saved');
       window.parent.postMessage({
         type: 'halley:patch-saved',
         file: meta.file,
-        loc: meta.loc,
+        loc: data.newLoc || meta.loc,
         summary: 'Edited ' + meta.file,
-      }, '*');
+      }, window.location.origin);
     } catch {
       el.innerHTML = originalHtml;
       showToast('Network error while saving');
@@ -737,7 +763,7 @@ export function buildClientBridgeScript(previewBase: string): string {
 
   // Notify parent whenever the user taps/clicks inside the preview so mobile floating chat card can dismiss cleanly.
   document.addEventListener('pointerdown', () => {
-    window.parent.postMessage({ type: 'halley:preview-pointerdown' }, '*');
+    window.parent.postMessage({ type: 'halley:preview-pointerdown' }, window.location.origin);
   }, { capture: true, passive: true });
 
   document.addEventListener('click', (e) => {
@@ -806,6 +832,7 @@ export function buildClientBridgeScript(previewBase: string): string {
   }
 
   window.addEventListener('message', (e) => {
+    if (e.source && e.source !== window.parent) return;
     const msg = e.data;
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'halley:set-mode') {

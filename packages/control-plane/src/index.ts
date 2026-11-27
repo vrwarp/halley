@@ -3,13 +3,22 @@ import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type {
-  ChatServerMessage,
-  LiveHistoryEntryDto,
-  PublishProgressPayload,
-  RevertedCommitSummaryDto,
-  UserDto,
+import {
+  AdminAllowlistCreateSchema,
+  AdminGrantExtraSchema,
+  AdminSpendCapSchema,
+  CreateSessionRequestSchema,
+  PublishRequestSchema,
+  RevertSessionCreateSchema,
+  SyncStartRequestSchema,
+  UpdateSessionRequestSchema,
+  type ChatServerMessage,
+  type LiveHistoryEntryDto,
+  type PublishProgressPayload,
+  type RevertedCommitSummaryDto,
+  type UserDto,
 } from '@halley/shared';
+import { deriveWorkspaceToken } from '@halley/shared/auth';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
@@ -17,13 +26,17 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from './auth/google.js';
 import { loadConfig, resolveLiveSiteUrl, type HalleyConfig } from './config.js';
 import { ControlPlaneDb } from './db.js';
-import { WorkspaceCrashLoopError, type WorkspaceDriver } from './drivers/workspace-driver.js';
+import { WorkspaceCrashLoopError, runGit, type WorkspaceDriver } from './drivers/workspace-driver.js';
 import { WorkspaceHostDriver } from './drivers/workspace-host-driver.js';
 import { createInternalGitHttpHandler } from './git-http.js';
 import { GitHubService } from './github/client.js';
 import { buildContinuationHandoffSummary, buildUndoHandoffSummary } from './handoff.js';
 import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
-import { createPreviewProxy } from './proxy/preview-proxy.js';
+import {
+  HALLEY_PREVIEW_SW_JS,
+  createPreviewProxy,
+  isAllowedWsOrigin,
+} from './proxy/preview-proxy.js';
 import { startSessionReaper } from './reaper.js';
 import { OptimizeService } from './routes/optimize.js';
 import { PublishService } from './routes/publish.js';
@@ -51,23 +64,6 @@ export function createControlPlane(
   customScreenshotService?: ScreenshotService,
 ) {
   const db = new ControlPlaneDb(path.join(config.dataDir, 'control-plane.sqlite'), config);
-  const stalePublishStates = new Set([
-    'verifying',
-    'rebasing',
-    'resolving_conflicts',
-    'pushing_pr',
-    'waiting_ci',
-    'deploying_pages',
-  ]);
-  for (const s of db.listSessions()) {
-    if (
-      stalePublishStates.has(s.publish_state) &&
-      s.status !== 'merged' &&
-      s.status !== 'published'
-    ) {
-      db.updateSession(s.id, { publish_state: 'idle', publish_error: null });
-    }
-  }
   const auth = new AuthService(config, db);
   const github = new GitHubService(config);
 
@@ -91,6 +87,9 @@ export function createControlPlane(
 
   const enrichSessionDto = (s: import('./db.js').SessionRecord, user: UserDto) => ({
     ...db.toSessionDto(s, user),
+    astroReady: driver.isSessionAstroReady
+      ? driver.isSessionAstroReady(s.id)
+      : Boolean(s.astro_url && s.status === 'running'),
     bootProgress: driver.getBootProgress?.(s.id) ?? null,
   });
 
@@ -114,6 +113,7 @@ export function createControlPlane(
       broadcastToSession(sessionId, { type: 'session_meta_updated' });
     },
   );
+  publishService.resumeIncompletePublishes();
 
   const optimizeService = new OptimizeService(
     config,
@@ -122,6 +122,14 @@ export function createControlPlane(
     enrichSessionDto,
     (sessionId) => {
       broadcastToSession(sessionId, { type: 'session_meta_updated' });
+    },
+    (userId) => {
+      const spend = db.getSpendStatus(userId);
+      for (const s of db.listSessions()) {
+        if (s.owner_user_id === userId) {
+          broadcastToSession(s.id, { type: 'spend_status', ...spend });
+        }
+      }
     },
   );
 
@@ -132,6 +140,26 @@ export function createControlPlane(
     });
 
   const app = new Hono<Env>();
+
+  app.onError((err, c) => {
+    console.error(`[halley-control-plane] Unhandled error on ${c.req.method} ${c.req.path}:`, err);
+    return c.json(
+      { error: err instanceof Error ? err.message : 'Internal server error' },
+      500,
+    );
+  });
+
+  // Preview isolation Service Worker (clientId -> sessionId)
+  app.get('/halley-preview-sw.js', () => {
+    return new Response(HALLEY_PREVIEW_SW_JS, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Service-Worker-Allowed': '/',
+      },
+    });
+  });
 
   // Health & Doctor preflight diagnostics
   app.get('/api/health', (c) =>
@@ -177,7 +205,7 @@ export function createControlPlane(
       return c.json({ error: 'Missing workspace token' }, 401);
     }
 
-    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    const session = db.resolveSessionByWorkspaceToken(rawToken);
     if (!session) {
       return c.json({ error: 'Invalid workspace token' }, 401);
     }
@@ -249,7 +277,7 @@ export function createControlPlane(
     if (!rawToken) {
       return c.json({ error: 'Missing workspace token' }, 401);
     }
-    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    const session = db.resolveSessionByWorkspaceToken(rawToken);
     if (!session) {
       return c.json({ error: 'Invalid workspace token' }, 401);
     }
@@ -268,7 +296,7 @@ export function createControlPlane(
     if (!rawToken) {
       return c.json({ error: 'Missing workspace token' }, 401);
     }
-    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    const session = db.resolveSessionByWorkspaceToken(rawToken);
     if (!session) {
       return c.json({ error: 'Invalid workspace token' }, 401);
     }
@@ -377,37 +405,69 @@ export function createControlPlane(
 
   app.post('/api/sessions', auth.requireAuth, async (c) => {
     const user = c.get('user');
-    const body = (await c.req.json()) as { title?: string };
-    const title = (body.title || 'Website update').trim();
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = CreateSessionRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid session request' }, 400);
+    }
+    const title = (parsed.data.title || 'Website update').trim();
     const warm = (await driver.reserveWarmWorkspace?.()) ?? null;
     const id = warm ? warm.id : crypto.randomUUID();
     const short = id.slice(0, 6);
     const slug = slugify(title);
     const workingBranch = `halley/${slug}-${short}`;
-    const rawToken = warm ? warm.rawToken : crypto.randomBytes(24).toString('hex');
+    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
     const volumeName = warm ? warm.volumeName : `halley-ws-${id}`;
 
-    const session = db.createSession({
-      id,
-      title,
-      slug,
-      ownerUserId: user.id,
-      repo: config.repo,
-      baseBranch: config.baseBranch,
-      workingBranch,
-      volumeName,
-      workspaceTokenHash: hashWorkspaceToken(rawToken),
-    });
+    let session;
+    try {
+      session = db.createSession({
+        id,
+        title,
+        slug,
+        ownerUserId: user.id,
+        repo: config.repo,
+        baseBranch: config.baseBranch,
+        workingBranch,
+        volumeName,
+        workspaceTokenHash: hashWorkspaceToken(rawToken),
+      });
+    } catch (err) {
+      if (warm) {
+        await driver.releaseWarmWorkspace?.(warm.id).catch(() => {});
+      }
+      throw err;
+    }
 
     driver.setRawWorkspaceToken?.(id, rawToken);
 
     // Start booting (or claiming warm standby) workspace asynchronously so the UI opens immediately
     void driver.ensureRunning(session).catch((err) => {
-      db.updateSession(id, { status: 'error', publish_error: String(err) });
+      db.transitionSession(id, {
+        expectedEpoch: session.lease_epoch,
+        patch: { status: 'error', publish_error: String(err) },
+      });
     });
     screenshotService.prewarm();
 
     return c.json({ session: enrichSessionDto(session, user) }, 201);
+  });
+
+  app.patch('/api/sessions/:id', auth.requireAuth, async (c) => {
+    const user = c.get('user');
+    const s = db.getSession(c.req.param('id')!);
+    if (!s) return c.json({ error: 'Not found' }, 404);
+    if (s.owner_user_id !== user.id && !user.isAdmin) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = UpdateSessionRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid title' }, 400);
+    }
+    db.updateSession(s.id, { title: parsed.data.title });
+    broadcastToSession(s.id, { type: 'session_meta_updated' });
+    return c.json({ session: enrichSessionDto(db.getSession(s.id)!, user) });
   });
 
   app.get('/api/sessions/:id', auth.requireAuth, (c) => {
@@ -426,11 +486,17 @@ export function createControlPlane(
     if (!s) return c.json({ error: 'Not found' }, 404);
 
     if (s.status === 'sleeping' || s.status === 'error') {
-      db.updateSession(s.id, { status: 'starting', publish_error: null });
+      db.transitionSession(s.id, {
+        fromStatuses: ['sleeping', 'error'],
+        patch: { status: 'starting', publish_error: null },
+      });
     }
     const updated = db.getSession(s.id)!;
     void driver.ensureRunning(updated).catch((err) => {
-      db.updateSession(s.id, { status: 'error', publish_error: String(err) });
+      db.transitionSession(s.id, {
+        expectedEpoch: updated.lease_epoch,
+        patch: { status: 'error', publish_error: String(err) },
+      });
     });
     screenshotService.prewarm();
     return c.json({ session: enrichSessionDto(updated, user) });
@@ -444,13 +510,25 @@ export function createControlPlane(
       return c.json({ error: 'Only the session owner or an admin can restart this workspace.' }, 403);
     }
 
-    db.updateSession(s.id, { status: 'starting', publish_error: null, runner_url: null, astro_url: null });
+    const isFrozen = s.status === 'published' || s.status === 'merged';
+    db.transitionSession(s.id, {
+      allowUnfreeze: isFrozen,
+      patch: {
+        status: isFrozen ? s.status : 'starting',
+        publish_error: null,
+        runner_url: null,
+        astro_url: null,
+      },
+    });
     const updated = db.getSession(s.id)!;
     const starter = driver.restart
       ? driver.restart(updated)
-      : driver.stop(updated).then(() => driver.ensureRunning(updated));
+      : driver.stop(updated).then(() => driver.ensureRunning(db.getSession(s.id) ?? updated));
     void starter.catch((err) => {
-      db.updateSession(s.id, { status: 'error', publish_error: String(err) });
+      const cur = db.getSession(s.id);
+      if (cur && cur.status !== 'published' && cur.status !== 'merged') {
+        db.updateSession(s.id, { status: 'error', publish_error: String(err) });
+      }
     });
     return c.json({ session: enrichSessionDto(updated, user) });
   });
@@ -494,7 +572,7 @@ export function createControlPlane(
     const short = id.slice(0, 6);
     const title = isFinished ? `Continued: ${src.title}` : `${src.title} (Copy)`;
     const slug = slugify(title);
-    const rawToken = crypto.randomBytes(24).toString('hex');
+    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
 
     let copy = db.createSession({
       id,
@@ -538,13 +616,12 @@ export function createControlPlane(
   // Journey A: Any editor can undo a Halley publication or non-.github/** main commit (Q1, Q5, Q17)
   app.post('/api/sessions/revert', auth.requireAuth, async (c) => {
     const user = c.get('user');
-    const body = (await c.req.json().catch(() => ({}))) as {
-      sessionId?: string;
-      sha?: string;
-      shas?: string[];
-      reason?: string;
-      title?: string;
-    };
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = RevertSessionCreateSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid revert request' }, 400);
+    }
+    const body = parsed.data;
     const reason = (body.reason || '').trim();
     if (!reason) {
       return c.json({ error: 'Please enter a short reason for undoing this publication.' }, 400);
@@ -565,26 +642,55 @@ export function createControlPlane(
     }
 
     const primarySha = targetShas[0]!;
-    // In-flight publish lock only (idle/abandoned revert drafts never block teammates)
-    const inFlight = db.hasInFlightRevertForSha(primarySha);
-    if (inFlight) {
-      return c.json(
-        {
-          error: `${inFlight.owner_name || 'A teammate'} is already publishing an undo for this change.`,
-          inFlightSessionId: inFlight.id,
-        },
-        409,
-      );
+    // In-flight publish lock checked across ALL target SHAs
+    for (const sha of targetShas) {
+      const inFlight = db.hasInFlightRevertForSha(sha);
+      if (inFlight) {
+        return c.json(
+          {
+            error: `${inFlight.owner_name || 'A teammate'} is already publishing an undo for this change.`,
+            inFlightSessionId: inFlight.id,
+          },
+          409,
+        );
+      }
     }
 
-    // Block undoing developer commits that touch protected .github/** files
-    if (!srcSession) {
-      const files = await github.getCommitFiles(primarySha);
-      if (files.some((f) => f.startsWith('.github/'))) {
-        return c.json(
-          { error: 'Developer infrastructure update (.github/**) — revert directly on GitHub.' },
-          403,
-        );
+    // Block undoing developer commits that touch protected .github/** files (fail closed when GitHub or devLocalRepo is configured!)
+    if (!srcSession && (config.githubToken || config.githubAppId || config.devLocalRepo)) {
+      for (const sha of targetShas) {
+        let files: string[];
+        try {
+          if (config.devLocalRepo && !config.githubToken && !config.githubAppId) {
+            const out = await runGit(config.devLocalRepo, [
+              'diff-tree',
+              '--no-commit-id',
+              '--name-only',
+              '-r',
+              '-m',
+              sha,
+            ]);
+            files = out
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean);
+          } else {
+            files = await github.getCommitFilesOrThrow(sha);
+          }
+        } catch (err) {
+          return c.json(
+            {
+              error: `Could not verify commit files before undoing (${err instanceof Error ? err.message : 'GitHub unavailable'}). Please try again.`,
+            },
+            502,
+          );
+        }
+        if (files.some((f) => f === '.github' || f.startsWith('.github/'))) {
+          return c.json(
+            { error: 'Developer infrastructure update (.github/**) — revert directly on GitHub.' },
+            403,
+          );
+        }
       }
     }
 
@@ -614,7 +720,7 @@ export function createControlPlane(
     const baseTitle = body.title || srcSession?.title || `commit ${primarySha.slice(0, 7)}`;
     const title = `Undo: ${baseTitle}`;
     const slug = slugify(title);
-    const rawToken = crypto.randomBytes(24).toString('hex');
+    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
 
     const revertSession = db.createSession({
       id,
@@ -821,7 +927,21 @@ export function createControlPlane(
     const s = db.getSession(c.req.param('id')!);
     if (!s) return c.json({ error: 'Not found' }, 404);
     db.updateSession(s.id, { owner_user_id: user.id });
-    return c.json({ session: db.toSessionDto(db.getSession(s.id)!, user) });
+    const updated = db.getSession(s.id)!;
+    if (updated.runner_url && updated.status === 'running') {
+      void fetch(`${updated.runner_url}/internal/owner`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          editorName: user.name,
+          editorEmail: user.email,
+          persona: user.persona,
+        }),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    }
+    broadcastToSession(s.id, { type: 'session_meta_updated' });
+    return c.json({ session: enrichSessionDto(updated, user) });
   });
 
   app.delete('/api/sessions/:id', auth.requireAuth, async (c) => {
@@ -991,8 +1111,10 @@ export function createControlPlane(
       { signal: AbortSignal.timeout(15_000) },
     );
     const data = (await res.json()) as { changes?: unknown[]; checkpoints?: unknown[] };
-    db.updateSession(s.id, { changed_files_count: data.changes?.length ?? 0 });
-    return c.json(data);
+    if (res.ok && Array.isArray(data.changes)) {
+      db.updateSession(s.id, { changed_files_count: data.changes.length });
+    }
+    return c.json(data, res.status as 200);
   });
 
   app.post('/api/sessions/:id/revert-file', auth.requireAuth, async (c) => {
@@ -1061,14 +1183,16 @@ export function createControlPlane(
   app.post('/api/sessions/:id/sync', auth.requireAuth, async (c) => {
     const check = await requireSessionEdit(c);
     if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = (await c.req.json().catch(() => ({}))) as {
-      kind?: 'sync' | 'publish' | 'revert';
-      autoSyncOnly?: boolean;
-    };
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = SyncStartRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid sync request' }, 400);
+    }
+    const body = parsed.data;
     const ep = await driver.ensureRunning(check.session);
     const ghToken = await github.getAccessToken().catch(() => '');
     let fetchedByDriver = false;
-    if (ghToken) {
+    if (ghToken || config.devLocalRepo) {
       fetchedByDriver = await driver
         .fetchIntoSession(check.session, ghToken)
         .then(() => true)
@@ -1081,6 +1205,7 @@ export function createControlPlane(
         baseBranch: check.session.base_branch,
         kind: body.kind ?? 'sync',
         autoSyncOnly: body.autoSyncOnly,
+        autoApplyCleanOnly: body.autoApplyCleanOnly,
         skipFetch: fetchedByDriver,
       }),
       signal: AbortSignal.timeout(55_000),
@@ -1280,6 +1405,7 @@ export function createControlPlane(
     data.targetRoutes = resolvedRoutes;
 
     if (includeScreenshots && res.ok && data.astroReady !== false && ep.astroUrl) {
+      driver.deferSpeculativeBuilds?.(15_000);
       const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
       const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
       const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
@@ -1332,24 +1458,32 @@ export function createControlPlane(
       return c.json({ error: 'Preview server is not ready' }, 503);
     }
 
+    driver.deferSpeculativeBuilds?.(15_000);
     const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
     const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
     const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
     const liveBaseUrl = resolveLiveSiteUrl(config, data.liveSiteUrl);
 
-    const page = await screenshotService.captureRouteReview({
-      route: cleanRoute,
-      draftFiles: data.draftFiles ?? [],
-      mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
-      draftBaseUrl,
-      liveBaseUrl,
-      baseSha: data.baseSha ?? s.base_sha,
-      viewport: screenshotViewport,
-      liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
-      signal: c.req.raw.signal,
-    });
+    try {
+      const page = await screenshotService.captureRouteReview({
+        route: cleanRoute,
+        draftFiles: data.draftFiles ?? [],
+        mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
+        draftBaseUrl,
+        liveBaseUrl,
+        baseSha: data.baseSha ?? s.base_sha,
+        viewport: screenshotViewport,
+        liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+        signal: c.req.raw.signal,
+      });
 
-    return c.json({ page });
+      return c.json({ page });
+    } catch (err) {
+      if (c.req.raw.signal?.aborted || (err instanceof Error && /aborted/i.test(err.message))) {
+        return new Response(null, { status: 204 });
+      }
+      throw err;
+    }
   });
 
   app.get('/api/sessions/:id/upstream-status', auth.requireAuth, async (c) => {
@@ -1399,11 +1533,20 @@ export function createControlPlane(
   app.post('/api/sessions/:id/publish', auth.requireAuth, async (c) => {
     const check = await requireSessionEdit(c);
     if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = (await c.req.json().catch(() => ({}))) as { title?: string; summary?: string };
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = PublishRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid publish request' }, 400);
+    }
+    const body = parsed.data;
 
-    // Run publish pipeline in background so UI streams live progress over WS
-    void publishService.publish(check.session, check.user, body);
-    return c.json({ ok: true });
+    // Run durable publish pipeline in background so UI can dismiss modal & stream progress over WS
+    void publishService.publish(check.session, check.user, {
+      title: body.title,
+      summary: body.summary,
+      excludePaths: body.excludePaths,
+    });
+    return c.json({ ok: true, started: true });
   });
 
   app.post('/api/sessions/:id/prompt', auth.requireAuth, async (c) => {
@@ -1576,8 +1719,12 @@ export function createControlPlane(
   });
 
   app.post('/api/admin/allowlist', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json()) as { kind: 'email' | 'domain'; value: string };
-    const entry = db.addAllowlist(body.kind, body.value, c.get('user').email);
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = AdminAllowlistCreateSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid allowlist entry' }, 400);
+    }
+    const entry = db.addAllowlist(parsed.data.kind, parsed.data.value, c.get('user').email);
     return c.json({ entry }, 201);
   });
 
@@ -1587,14 +1734,22 @@ export function createControlPlane(
   });
 
   app.post('/api/admin/cap', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json()) as { dailyCapUsd: number };
-    db.setDailyCapUsd(Number(body.dailyCapUsd));
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = AdminSpendCapSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid daily cap' }, 400);
+    }
+    db.setDailyCapUsd(parsed.data.dailyCapUsd);
     return c.json({ dailyCapUsd: db.getDailyCapUsd() });
   });
 
   app.post('/api/admin/users/:id/grant-extra', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { extraUsd?: number };
-    db.grantExtraSpend(c.req.param('id')!, Number(body.extraUsd ?? 10));
+    const rawBody = await c.req.json().catch(() => ({}));
+    const parsed = AdminGrantExtraSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid extra allowance' }, 400);
+    }
+    db.grantExtraSpend(c.req.param('id')!, parsed.data.extraUsd ?? 10);
     return c.json({ ok: true });
   });
 
@@ -1687,29 +1842,39 @@ export function createControlPlane(
     }
   });
 
-  // Preview Proxy (/p/:sessionId/*) + Referer-scoped Vite dev module proxy (/@vite/*, /@fs/*, /src/*, /node_modules/*)
-  const previewProxy = createPreviewProxy(auth, db, driver);
+  // Preview Proxy (/p/:sessionId/* + Service Worker /__halley_p/:sessionId/* + cookie-free Referer fallback)
+  const previewProxy = createPreviewProxy(auth, db, driver, config.publicUrl);
   app.all('/p/:sessionId/*', previewProxy.handleHttp);
   app.all('/p/:sessionId', previewProxy.handleHttp);
+  app.all('/__halley_p/:sessionId/*', previewProxy.handleServiceWorkerRewrite);
+  app.all('/__halley_p/:sessionId', previewProxy.handleServiceWorkerRewrite);
 
   app.all('*', async (c, next) => {
     const p = c.req.path;
     if (
+      p.startsWith('/api/') ||
+      p.startsWith('/p/') ||
+      p.startsWith('/__halley_p/') ||
+      p.startsWith('/internal/') ||
+      p === '/halley-preview-sw.js'
+    ) {
+      return next();
+    }
+    const ref = c.req.header('referer') || '';
+    const refMatch = ref.match(/\/(?:p|__halley_p)\/([^/?#]+)/);
+    const targetSessionId = refMatch?.[1] ? decodeURIComponent(refMatch[1]) : '';
+    if (targetSessionId) {
+      return previewProxy.handleHttpForSession(c, targetSessionId);
+    }
+    const isEscapedDevModule =
       p.startsWith('/@vite/') ||
       p.startsWith('/@fs/') ||
       p.startsWith('/@id/') ||
       p.startsWith('/__astro') ||
       p.startsWith('/src/') ||
-      p.startsWith('/node_modules/')
-    ) {
-      const ref = c.req.header('referer') || '';
-      const refMatch = ref.match(/\/p\/([0-9a-f-]{20,})\b/i);
-      const cookieHeader = c.req.header('cookie') || '';
-      const cookieMatch = cookieHeader.match(/(?:^|;\s*)halley_preview_session=([0-9a-f-]{20,})\b/i);
-      const targetSessionId = refMatch?.[1] || cookieMatch?.[1];
-      if (targetSessionId) {
-        return previewProxy.handleHttpForSession(c, targetSessionId);
-      }
+      p.startsWith('/node_modules/') ||
+      p.startsWith('/_astro/');
+    if (isEscapedDevModule || p.startsWith('/__editor/')) {
       // Never fall through to SPA index.html (text/html) for Vite/Astro dev module paths
       return c.notFound();
     }
@@ -1720,7 +1885,12 @@ export function createControlPlane(
   const webRoot = config.webDistDir;
   app.use('/*', serveStatic({ root: webRoot }));
   app.get('*', async (c, next) => {
-    if (c.req.path.startsWith('/api/') || c.req.path.startsWith('/p/') || c.req.path.startsWith('/internal/')) {
+    if (
+      c.req.path.startsWith('/api/') ||
+      c.req.path.startsWith('/p/') ||
+      c.req.path.startsWith('/__halley_p/') ||
+      c.req.path.startsWith('/internal/')
+    ) {
       return next();
     }
     // Never return index.html with text/html for missing static asset extensions
@@ -1735,6 +1905,8 @@ export function createControlPlane(
     }
   });
 
+  const MAX_PENDING_WS_MESSAGES = 50;
+
   const handleWsUpgrade = (
     req: import('node:http').IncomingMessage,
     socket: import('node:stream').Duplex,
@@ -1742,8 +1914,15 @@ export function createControlPlane(
     wss: WebSocketServer,
   ) => {
     const urlPath = (req.url ?? '').split('?')[0] ?? '';
-    if (urlPath.startsWith('/p/')) {
+    const wsProto = req.headers['sec-websocket-protocol'] || '';
+    if (urlPath.startsWith('/p/') || wsProto.includes('vite-hmr')) {
       void previewProxy.handleUpgrade(req, socket, head);
+      return;
+    }
+
+    if (!isAllowedWsOrigin(req, config.publicUrl)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      socket.destroy();
       return;
     }
 
@@ -1758,7 +1937,7 @@ export function createControlPlane(
       socket.destroy();
       return;
     }
-    const sessionId = chatMatch[1];
+    const sessionId = decodeURIComponent(chatMatch[1]);
     const session = db.getSession(sessionId);
     if (!session) {
       socket.destroy();
@@ -1798,20 +1977,30 @@ export function createControlPlane(
         }
       });
 
-      // Push current spend, publish status, and boot progress immediately (re-read latest DB state)
+      const buildPublishPayload = (s: import('./db.js').SessionRecord): PublishProgressPayload => ({
+        state: s.publish_state,
+        prNumber: s.pr_number,
+        prUrl: s.pr_url,
+        error: s.publish_error,
+      });
+
+      // Push current spend, publish status, state sync, and boot progress immediately
       const latestSession = db.getSession(sessionId) ?? session;
       const spend = db.getSpendStatus(latestSession.owner_user_id);
+      const initialPublishPayload = buildPublishPayload(latestSession);
+      const initialAstroReady = driver.isSessionAstroReady
+        ? driver.isSessionAstroReady(sessionId)
+        : Boolean(latestSession.astro_url && latestSession.status === 'running');
       browserWs.send(JSON.stringify({ type: 'spend_status', ...spend }));
+      browserWs.send(JSON.stringify({ type: 'publish_state', payload: initialPublishPayload }));
       browserWs.send(
         JSON.stringify({
-          type: 'publish_state',
-          payload: {
-            state: latestSession.publish_state,
-            prNumber: latestSession.pr_number,
-            prUrl: latestSession.pr_url,
-            error: latestSession.publish_error,
-          },
-        }),
+          type: 'session_state_sync',
+          workspaceLocked: false,
+          previewPaused: false,
+          astroReady: initialAstroReady,
+          publishProgress: initialPublishPayload,
+        } satisfies ChatServerMessage),
       );
       const currentBootProgress = driver.getBootProgress?.(sessionId);
       if (currentBootProgress) {
@@ -1836,11 +2025,19 @@ export function createControlPlane(
           return;
         }
         db.updateSession(sessionId, { last_active_at: new Date().toISOString() });
+        driver.touchSession?.(sessionId);
         const str = data.toString();
         if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
           runnerWs.send(str);
-        } else {
+        } else if (pendingMessages.length < MAX_PENDING_WS_MESSAGES) {
           pendingMessages.push(str);
+        } else if (browserWs.readyState === WebSocket.OPEN) {
+          browserWs.send(
+            JSON.stringify({
+              type: 'error',
+              message: 'Workspace is still starting — too many queued messages.',
+            }),
+          );
         }
       });
 
@@ -1878,9 +2075,23 @@ export function createControlPlane(
           }
         });
         runnerWs.on('message', (data) => {
-          if (browserWs.readyState === WebSocket.OPEN) {
-            browserWs.send(data.toString());
+          if (browserWs.readyState !== WebSocket.OPEN) return;
+          const raw = data.toString();
+          try {
+            const parsed = JSON.parse(raw) as { type?: string };
+            if (parsed.type === 'session_state_sync') {
+              const cur = db.getSession(sessionId);
+              const enriched = {
+                ...parsed,
+                ...(cur ? { publishProgress: buildPublishPayload(cur) } : {}),
+              };
+              browserWs.send(JSON.stringify(enriched));
+              return;
+            }
+          } catch {
+            // forward raw frame
           }
+          browserWs.send(raw);
         });
       } catch (err) {
         if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
@@ -1940,7 +2151,7 @@ if (isMain) {
     createServer,
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
     cp.handleWsUpgrade(req, socket, head, wss);
   });
@@ -1950,11 +2161,16 @@ if (isMain) {
     if (shuttingDown) return;
     shuttingDown = true;
     stopReaper();
+    wss.close();
+    server.close();
     void Promise.allSettled([
       Promise.resolve(cp.driver.stopWarmPool?.()),
       Promise.resolve(cp.driver.close?.()),
       cp.screenshotService.close(),
-    ]).finally(() => process.exit(0));
+    ]).finally(() => {
+      cp.db.close();
+      process.exit(0);
+    });
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

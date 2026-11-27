@@ -259,10 +259,14 @@ export function PublishModal({
     let active = true;
     setLoadingChanges(true);
     (async () => {
-      // Q21: Sync when opening the Publish modal so conflicts are resolved & reviewed before publishing
+      // Virtual $0 preflight: silently applies clean non-overlapping upstream merges without
+      // spending AI tokens or writing conflict markers on disk before the user clicks Publish.
       if (session.canEdit && session.kind !== 'revert') {
         try {
-          const syncRes = await api.syncSession(session.id, { kind: 'publish' });
+          const syncRes = await api.syncSession(session.id, {
+            kind: 'publish',
+            autoApplyCleanOnly: true,
+          });
           if (active && syncRes.review) {
             setMergeReview(syncRes.review);
             if (!syncRes.review.alreadyUpToDate) {
@@ -315,20 +319,19 @@ export function PublishModal({
     setSubmitting(true);
     try {
       let publishTitle = title.trim() || session.title;
-      // Q16: For partial undo, revert any unticked files back to current main before publishing
-      if (isUndoMode) {
-        const toExclude = Object.entries(excludedPaths)
-          .filter(([, excluded]) => excluded)
-          .map(([p]) => p);
-        for (const p of toExclude) {
-          await api.revertFile(session.id, p);
-        }
-        if (toExclude.length > 0 && !titleDirty && publishTitle.startsWith('Undo: ')) {
-          const base = publishTitle.slice('Undo: '.length).trim() || 'Website update';
-          publishTitle = session.parentSessionId ? `Continued: ${base}` : `Adjusted: ${base}`;
-        }
+      const toExclude = isUndoMode
+        ? Object.entries(excludedPaths)
+            .filter(([, excluded]) => excluded)
+            .map(([p]) => p)
+        : [];
+      if (toExclude.length > 0 && !titleDirty && publishTitle.startsWith('Undo: ')) {
+        const base = publishTitle.slice('Undo: '.length).trim() || 'Website update';
+        publishTitle = session.parentSessionId ? `Continued: ${base}` : `Adjusted: ${base}`;
       }
-      await api.publish(session.id, publishTitle, plainSummary);
+      await api.publish(session.id, publishTitle, plainSummary, {
+        excludePaths: toExclude.length > 0 ? toExclude : undefined,
+        background: true,
+      });
     } finally {
       setSubmitting(false);
     }
@@ -370,10 +373,6 @@ export function PublishModal({
     ['verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci', 'deploying_pages'].includes(
       state,
     );
-  const isBlockingInFlight =
-    submitting ||
-    retryingDeploy ||
-    ['verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci'].includes(state);
   const isDeployFailed =
     state === 'failed_deploy' ||
     (state === 'failed_ci' && (session.status === 'merged' || Boolean(session.mergedSha)));
@@ -430,16 +429,14 @@ export function PublishModal({
                   ? 'Review & Undo Publication'
                   : 'Review & Publish Changes'}
           </h2>
-          {!isBlockingInFlight && (
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close publish modal"
-              className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close publish modal"
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5 sm:max-h-[78vh] sm:px-6 sm:py-5">
@@ -777,7 +774,15 @@ export function PublishModal({
             </>
           ) : (
             <>
-              {!isInFlight && isUndoMode && (
+              {isInFlight ? (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="min-h-[42px] rounded-xl px-4 py-2 text-sm font-medium text-stone-600 hover:bg-stone-100"
+                >
+                  Continue in background
+                </button>
+              ) : isUndoMode ? (
                 <button
                   type="button"
                   onClick={onClose}
@@ -786,8 +791,7 @@ export function PublishModal({
                   <MessageSquare className="h-4 w-4 text-stone-500" />
                   Edit / partial undo in chat
                 </button>
-              )}
-              {!isInFlight && !isUndoMode && (
+              ) : (
                 <button
                   type="button"
                   onClick={onClose}

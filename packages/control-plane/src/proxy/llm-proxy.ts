@@ -99,9 +99,7 @@ export function isModelAllowedForPurpose(
   return false;
 }
 
-export function hashWorkspaceToken(token: string): string {
-  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
-}
+export { hashWorkspaceToken } from '@halley/shared/auth';
 
 const VALID_PURPOSES = new Set<SpendPurpose>([
   'chat',
@@ -113,6 +111,26 @@ const VALID_PURPOSES = new Set<SpendPurpose>([
 
 // Tracks in-flight spend per escalation runId so streaming responses can abort at the ceiling (F16)
 const activeRunSpendUsd = new Map<string, { spent: number; updatedAt: number }>();
+// Tracks conservative in-flight USD reservations per user to prevent parallel TOCTOU cap bypass
+const inFlightUserReservationsUsd = new Map<string, number>();
+
+function addUserReservation(userId: string, amountUsd: number): () => void {
+  if (amountUsd <= 0) return () => {};
+  const prev = inFlightUserReservationsUsd.get(userId) ?? 0;
+  inFlightUserReservationsUsd.set(userId, prev + amountUsd);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const cur = inFlightUserReservationsUsd.get(userId) ?? 0;
+    const next = cur - amountUsd;
+    if (next <= 1e-9) {
+      inFlightUserReservationsUsd.delete(userId);
+    } else {
+      inFlightUserReservationsUsd.set(userId, next);
+    }
+  };
+}
 
 function pruneStaleRuns() {
   const cutoff = Date.now() - 30 * 60_000;
@@ -136,7 +154,7 @@ export function createLlmProxyHandler(
       return c.json({ error: { message: 'Missing workspace token' } }, 401);
     }
 
-    const session = db.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    const session = db.resolveSessionByWorkspaceToken(rawToken);
     if (!session) {
       return c.json({ error: { message: 'Invalid workspace token' } }, 401);
     }
@@ -153,12 +171,37 @@ export function createLlmProxyHandler(
 
     const bodyText = await c.req.text();
     let requestedModel = config.modelId;
-    const headModelMatch = bodyText.slice(0, 4096).match(/"model"\s*:\s*"([^"]+)"/);
-    if (headModelMatch?.[1]) {
-      requestedModel = headModelMatch[1];
-    } else if (bodyText.length > 4096) {
-      const tailModelMatch = bodyText.slice(-4096).match(/"model"\s*:\s*"([^"]+)"/);
-      if (tailModelMatch?.[1]) requestedModel = tailModelMatch[1];
+    let safeBodyText = bodyText;
+
+    if (bodyText.trim().length > 0) {
+      let parsedBody: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(bodyText) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return c.json(
+            {
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Request body must be a JSON object.' },
+            },
+            400,
+          );
+        }
+        parsedBody = parsed as Record<string, unknown>;
+      } catch {
+        return c.json(
+          {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Malformed JSON request body.' },
+          },
+          400,
+        );
+      }
+
+      if (typeof parsedBody.model === 'string' && parsedBody.model.trim().length > 0) {
+        requestedModel = parsedBody.model.trim();
+      }
+      parsedBody.model = requestedModel;
+      safeBodyText = JSON.stringify(parsedBody);
     }
 
     // F15: Enforce model allowlist (count_tokens is allowed for escalation model estimation)
@@ -194,7 +237,7 @@ export function createLlmProxyHandler(
       const upstream = await fetch(upstreamUrl, {
         method: c.req.method,
         headers,
-        body: bodyText || undefined,
+        body: safeBodyText || undefined,
         signal: c.req.raw.signal
           ? AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(20_000)])
           : AbortSignal.timeout(20_000),
@@ -207,13 +250,15 @@ export function createLlmProxyHandler(
     }
 
     const spend = db.getSpendStatus(session.owner_user_id);
-    if (spend.capped) {
+    const totalAllowanceUsd = spend.dailyCapUsd + spend.extraGrantedUsd;
+    const inFlightReservedUsd = inFlightUserReservationsUsd.get(session.owner_user_id) ?? 0;
+    if (spend.capped || spend.spentTodayUsd + inFlightReservedUsd >= totalAllowanceUsd) {
       return c.json(
         {
           type: 'error',
           error: {
             type: 'rate_limit_error',
-            message: `Daily AI editing budget ($${(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}) reached for today. Ask an admin to grant extra allowance.`,
+            message: `Daily AI editing budget ($${totalAllowanceUsd.toFixed(2)}) reached for today. Ask an admin to grant extra allowance.`,
           },
         },
         429,
@@ -246,6 +291,16 @@ export function createLlmProxyHandler(
       );
     }
 
+    const approxPromptTokens = Math.ceil(safeBodyText.length / 4);
+    const reservationUsd = Math.min(
+      0.05,
+      Math.max(
+        0.002,
+        computeCostUsd(requestedModel, { input_tokens: approxPromptTokens, output_tokens: 256 }),
+      ),
+    );
+    const releaseReservation = addUserReservation(session.owner_user_id, reservationUsd);
+
     const abortController = new AbortController();
     const onClientAbort = () => abortController.abort();
     c.req.raw.signal?.addEventListener('abort', onClientAbort, { once: true });
@@ -255,10 +310,11 @@ export function createLlmProxyHandler(
       upstream = await fetch(upstreamUrl, {
         method: c.req.method,
         headers,
-        body: bodyText || undefined,
+        body: safeBodyText || undefined,
         signal: abortController.signal,
       });
     } catch (err) {
+      releaseReservation();
       c.req.raw.signal?.removeEventListener('abort', onClientAbort);
       throw err;
     }
@@ -277,6 +333,7 @@ export function createLlmProxyHandler(
       const txt = await upstream.text();
       try {
         const json = JSON.parse(txt) as {
+          model?: string;
           usage?: {
             input_tokens?: number;
             output_tokens?: number;
@@ -285,7 +342,9 @@ export function createLlmProxyHandler(
           };
         };
         if (json.usage) {
-          const cost = computeCostUsd(requestedModel, json.usage);
+          const billedModel =
+            typeof json.model === 'string' && json.model.trim() ? json.model.trim() : requestedModel;
+          const cost = computeCostUsd(billedModel, json.usage);
           recordRunCost(cost);
           db.recordSpend(
             session.owner_user_id,
@@ -295,12 +354,14 @@ export function createLlmProxyHandler(
               (json.usage.cache_read_input_tokens ?? 0),
             json.usage.output_tokens ?? 0,
             undefined,
-            { sessionId: session.id, purpose, model: requestedModel },
+            { sessionId: session.id, purpose, model: billedModel },
           );
           onSpendUpdated?.(session.owner_user_id, session.id);
         }
       } catch {
         // ignore
+      } finally {
+        releaseReservation();
       }
       return new Response(txt, {
         status: upstream.status,
@@ -309,6 +370,7 @@ export function createLlmProxyHandler(
     }
 
     // Stream SSE while tapping usage events and enforcing in-flight per-run ceiling
+    let billedModel = requestedModel;
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheWrite = 0;
@@ -321,30 +383,43 @@ export function createLlmProxyHandler(
       if (spendRecorded) return;
       spendRecorded = true;
       c.req.raw.signal?.removeEventListener('abort', onClientAbort);
-      const cost = computeCostUsd(requestedModel, {
-        input_tokens: inputTokens,
-        output_tokens: outputTokens,
-        cache_creation_input_tokens: cacheWrite,
-        cache_read_input_tokens: cacheRead,
-      });
-      if (cost > 0 || inputTokens > 0 || outputTokens > 0) {
-        recordRunCost(cost);
-        db.recordSpend(
-          session.owner_user_id,
-          cost,
-          inputTokens + cacheWrite + cacheRead,
-          outputTokens,
-          undefined,
-          { sessionId: session.id, purpose, model: requestedModel },
-        );
-        onSpendUpdated?.(session.owner_user_id, session.id);
+      try {
+        const cost = computeCostUsd(billedModel, {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          cache_creation_input_tokens: cacheWrite,
+          cache_read_input_tokens: cacheRead,
+        });
+        if (cost > 0 || inputTokens > 0 || outputTokens > 0) {
+          recordRunCost(cost);
+          db.recordSpend(
+            session.owner_user_id,
+            cost,
+            inputTokens + cacheWrite + cacheRead,
+            outputTokens,
+            undefined,
+            { sessionId: session.id, purpose, model: billedModel },
+          );
+          onSpendUpdated?.(session.owner_user_id, session.id);
+        }
+      } catch {
+        // Ignore if SQLite database was closed during graceful server shutdown
+      } finally {
+        releaseReservation();
       }
     };
 
     const reader = upstream.body.getReader();
     const stream = new ReadableStream({
       async pull(controller) {
-        const { done, value } = await reader.read();
+        let readResult: Awaited<ReturnType<typeof reader.read>>;
+        try {
+          readResult = await reader.read();
+        } catch (err) {
+          flushSpendOnce();
+          throw err;
+        }
+        const { done, value } = readResult;
         if (done) {
           flushSpendOnce();
           controller.close();
@@ -362,6 +437,7 @@ export function createLlmProxyHandler(
             const evt = JSON.parse(payload) as {
               type?: string;
               message?: {
+                model?: string;
                 usage?: {
                   input_tokens?: number;
                   output_tokens?: number;
@@ -374,11 +450,16 @@ export function createLlmProxyHandler(
                 output_tokens?: number;
               };
             };
-            if (evt.type === 'message_start' && evt.message?.usage) {
-              inputTokens = evt.message.usage.input_tokens ?? inputTokens;
-              outputTokens = evt.message.usage.output_tokens ?? outputTokens;
-              cacheWrite = evt.message.usage.cache_creation_input_tokens ?? cacheWrite;
-              cacheRead = evt.message.usage.cache_read_input_tokens ?? cacheRead;
+            if (evt.type === 'message_start') {
+              if (typeof evt.message?.model === 'string' && evt.message.model.trim()) {
+                billedModel = evt.message.model.trim();
+              }
+              if (evt.message?.usage) {
+                inputTokens = evt.message.usage.input_tokens ?? inputTokens;
+                outputTokens = evt.message.usage.output_tokens ?? outputTokens;
+                cacheWrite = evt.message.usage.cache_creation_input_tokens ?? cacheWrite;
+                cacheRead = evt.message.usage.cache_read_input_tokens ?? cacheRead;
+              }
             } else if (evt.type === 'message_delta' && evt.usage) {
               if (typeof evt.usage.output_tokens === 'number') {
                 outputTokens = evt.usage.output_tokens;
@@ -387,7 +468,7 @@ export function createLlmProxyHandler(
 
             // In-flight ceiling guard: abort stream if run exceeds its ceiling
             if (runCeilingUsd > 0) {
-              const currentCost = computeCostUsd(requestedModel, {
+              const currentCost = computeCostUsd(billedModel, {
                 input_tokens: inputTokens,
                 output_tokens: outputTokens,
                 cache_creation_input_tokens: cacheWrite,

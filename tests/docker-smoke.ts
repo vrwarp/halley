@@ -1,12 +1,15 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(path.resolve('packages/control-plane/package.json'));
+const { chromium } = require('playwright') as typeof import('playwright');
 
 async function run(cmd: string, args: string[], cwd = process.cwd()): Promise<string> {
   const { stdout } = await execFileAsync(cmd, args, { cwd, maxBuffer: 32 * 1024 * 1024 });
@@ -161,12 +164,14 @@ async function main() {
       '{{(index .IPAM.Config 0).Gateway}}',
     ]);
 
-    console.log('[docker-smoke] 3a. Starting halley-workspace container (unprivileged, zero secrets, zero docker.sock)…');
+    console.log('[docker-smoke] 3a. Starting halley-workspace container (unprivileged, ZERO secrets, --memory 3g, zero docker.sock)…');
     await run('docker', [
       'run',
       '-d',
       '--name',
       wsName,
+      '--memory',
+      '3g',
       '--network',
       netName,
       '-v',
@@ -178,8 +183,6 @@ async function main() {
       '-e',
       `CONTROL_PLANE_INTERNAL_URL=http://${cpName}:3000`,
       '-e',
-      `WORKSPACE_HOST_SECRET=${hostSecret}`,
-      '-e',
       'HALLEY_REPO=smoke/site',
       '-e',
       'HALLEY_BASE_BRANCH=main',
@@ -190,15 +193,17 @@ async function main() {
       'halley-workspace:ci-smoke',
     ]);
 
-    // Deliberately wait 2s before starting control-plane to exercise workspaces-first cold boot
+    // Deliberately wait 2s before starting control-plane to exercise workspaces-first cold boot + HKDF /api/handshake
     await new Promise((r) => setTimeout(r, 2000));
 
-    console.log('[docker-smoke] 3b. Starting halley-control-plane container (zero docker.sock)…');
+    console.log('[docker-smoke] 3b. Starting halley-control-plane container (--memory 2g, SESSION_SECRET only, zero docker.sock)…');
     await run('docker', [
       'run',
       '-d',
       '--name',
       cpName,
+      '--memory',
+      '2g',
       '--network',
       netName,
       '-p',
@@ -208,7 +213,7 @@ async function main() {
       '-e',
       `WORKSPACE_HOST_URL=http://${wsName}:4000`,
       '-e',
-      `WORKSPACE_HOST_SECRET=${hostSecret}`,
+      `SESSION_SECRET=${hostSecret}`,
       '-e',
       `CONTROL_PLANE_INTERNAL_URL=http://${cpName}:3000`,
       '-e',
@@ -230,7 +235,7 @@ async function main() {
       'halley-control-plane:ci-smoke',
     ]);
 
-    // Copy fixture git repo into control-plane ONLY (workspaces must clone via internal HTTP mirror!)
+    // Copy fixture git repo into control-plane ONLY (workspaces must clone via authenticated internal HTTP mirror!)
     await run('docker', ['cp', repoDir, `${cpName}:/tmp/fixture-repo`]);
 
     const cpUrl = `http://127.0.0.1:${hostPort}`;
@@ -245,7 +250,13 @@ async function main() {
       await new Promise((r) => setTimeout(r, 300));
     }
 
-    console.log('[docker-smoke] 4. Checking /api/health/doctor & waiting for warm standby pool (HALLEY_WARM_POOL_SIZE=1)…');
+    // Verify mandatory /internal/git/repo.git authentication (401 without HKDF Bearer token)
+    const unauthGit = await fetch(`${cpUrl}/internal/git/repo.git/info/refs?service=git-upload-pack`);
+    if (unauthGit.status !== 401) {
+      throw new Error(`Expected unauthenticated /internal/git/repo.git to return 401, got ${unauthGit.status}`);
+    }
+
+    console.log('[docker-smoke] 4. Checking /api/health/doctor (protocolVersion=2 + HKDF handshake) & waiting for warm standby pool…');
     let warmReady = false;
     const warmDeadline = Date.now() + 120_000;
     while (Date.now() < warmDeadline) {
@@ -263,8 +274,8 @@ async function main() {
       if (!docJson.ok) {
         throw new Error(`Doctor check failed: ${JSON.stringify(docJson)}`);
       }
-      if (!docJson.details.supervisor?.protocolVersion) {
-        throw new Error(`Expected supervisor protocolVersion in doctor report: ${JSON.stringify(docJson)}`);
+      if (docJson.details.supervisor?.protocolVersion !== 2) {
+        throw new Error(`Expected supervisor protocolVersion=2 in doctor report: ${JSON.stringify(docJson)}`);
       }
       if ((docJson.details.supervisor?.warmPool?.ready ?? 0) >= 1) {
         warmReady = true;
@@ -277,13 +288,18 @@ async function main() {
       throw new Error(`Timed out waiting for warm standby pool to become ready.\nWS logs:\n${wsLogs}`);
     }
 
-    console.log('[docker-smoke] 5. Verifying workspaces PID 1 dropped privileges to `node`…');
-    const pid1Owner = await run('docker', ['exec', wsName, 'stat', '-c', '%U', '/proc/1']);
-    if (pid1Owner !== 'node') {
-      throw new Error(`Expected PID 1 inside workspaces container to run as 'node', got '${pid1Owner}'`);
+    console.log('[docker-smoke] 5. Verifying BOTH containers run `tini` as unprivileged `node` PID 1…');
+    for (const cName of [wsName, cpName]) {
+      const pid1Owner = await run('docker', ['exec', cName, 'stat', '-c', '%U', '/proc/1']);
+      const pid1Comm = await run('docker', ['exec', cName, 'cat', '/proc/1/comm']);
+      if (pid1Owner !== 'node' || pid1Comm !== 'tini') {
+        throw new Error(
+          `Expected PID 1 in ${cName} to be tini owned by 'node', got comm='${pid1Comm}' owner='${pid1Owner}'`,
+        );
+      }
     }
 
-    console.log('[docker-smoke] 6. Logging in and creating session (cloning via internal Git HTTP mirror)…');
+    console.log('[docker-smoke] 6. Logging in and creating session (claiming pre-rendered warm standby)…');
     const loginRes = await fetch(`${cpUrl}/api/auth/dev-login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -306,11 +322,11 @@ async function main() {
     const bootDeadline = Date.now() + 120_000;
     while (Date.now() < bootDeadline) {
       const sRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
-      const sData = (await sRes.json()) as { session: { status: string; publishError?: string } };
+      const sData = (await sRes.json()) as { session: { status: string; astroReady?: boolean; publishError?: string } };
       if (sData.session.status === 'error') {
         throw new Error(`Session entered error state: ${sData.session.publishError}`);
       }
-      if (sData.session.status === 'running') {
+      if (sData.session.status === 'running' && sData.session.astroReady !== false) {
         const prevRes = await fetch(`${cpUrl}/p/${sessionId}/docker-site/`, {
           headers: { Cookie: cookie },
         });
@@ -331,14 +347,15 @@ async function main() {
       const wsLogs = await run('docker', ['logs', wsName]).catch(() => '');
       throw new Error(`Timed out waiting for preview.\nCP logs:\n${cpLogs}\nWS logs:\n${wsLogs}`);
     }
-    console.log('[docker-smoke] 8. Verified live preview HTML + /@vite/client + AST /__editor/inspect!');
+    console.log('[docker-smoke] 8. Verified live preview HTML + real /@vite/client + single-writer /__editor/inspect!');
 
     const viteClientRes = await fetch(`${cpUrl}/@vite/client`, {
       headers: { Cookie: cookie, Referer: `${cpUrl}/p/${sessionId}/docker-site/` },
     });
     const viteClientCt = viteClientRes.headers.get('content-type') || '';
-    if (!viteClientRes.ok || !viteClientCt.includes('javascript')) {
-      throw new Error(`Expected /@vite/client JS, got status=${viteClientRes.status} ct=${viteClientCt}`);
+    const viteClientText = await viteClientRes.text();
+    if (!viteClientRes.ok || !viteClientCt.includes('javascript') || viteClientText.includes('no-op')) {
+      throw new Error(`Expected real /@vite/client JS, got status=${viteClientRes.status} ct=${viteClientCt}`);
     }
 
     const inspectRes = await fetch(`${cpUrl}/p/${sessionId}/docker-site/__editor/inspect`, {
@@ -351,7 +368,7 @@ async function main() {
       throw new Error(`Expected p at 7:7 to be editable-static, got: ${JSON.stringify(inspectJson)}`);
     }
 
-    console.log('[docker-smoke] 9. Verifying session duplication inside shared workspaces container…');
+    console.log('[docker-smoke] 9. Verifying session duplication + real Playwright Chromium 2-tab preview isolation & inline edit…');
     const dupRes = await fetch(`${cpUrl}/api/sessions/${sessionId}/duplicate`, {
       method: 'POST',
       headers: { Cookie: cookie },
@@ -364,11 +381,13 @@ async function main() {
     let dupReady = false;
     while (Date.now() < dupDeadline) {
       const dsRes = await fetch(`${cpUrl}/api/sessions/${dupSession.id}`, { headers: { Cookie: cookie } });
-      const dsData = (await dsRes.json()) as { session: { status: string; bootProgress?: { detail?: string } } };
+      const dsData = (await dsRes.json()) as {
+        session: { status: string; astroReady?: boolean; bootProgress?: { detail?: string } };
+      };
       if (dsData.session.status === 'error') {
         throw new Error(`Duplicated session entered error state: ${JSON.stringify(dsData.session.bootProgress)}`);
       }
-      if (dsData.session.status === 'running') {
+      if (dsData.session.status === 'running' && dsData.session.astroReady !== false) {
         dupReady = true;
         break;
       }
@@ -376,6 +395,56 @@ async function main() {
     }
     if (!dupReady) {
       throw new Error('Timed out waiting for duplicated session to boot');
+    }
+
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const page1 = await context.newPage();
+      const page2 = await context.newPage();
+
+      await page1.goto(cpUrl, { waitUntil: 'networkidle' });
+      await page1.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
+      await page1.click('button:has-text("Dev Sign In")');
+      await page1.waitForSelector('h3:text-is("2-Container Smoke Session")', { timeout: 15_000 });
+
+      // Open original session on Tab 1 and duplicated session on Tab 2 concurrently
+      await page1.click('h3:text-is("2-Container Smoke Session")');
+      await page2.goto(cpUrl, { waitUntil: 'networkidle' });
+      await page2.click('h3:text-is("2-Container Smoke Session (Copy)")');
+
+      const f1 = page1.frameLocator('iframe');
+      const f2 = page2.frameLocator('iframe');
+      await f1.locator('h1:has-text("Docker Workspace Alive")').waitFor({ timeout: 45_000 });
+      await f2.locator('h1:has-text("Docker Workspace Alive")').waitFor({ timeout: 45_000 });
+
+      // Perform real inline edit inside Tab 1 (routes /__editor/patch to workspace-runner!)
+      await page1.click('button:has-text("Edit")');
+      const p1 = f1.locator('p').first();
+      await p1.click();
+      await p1.evaluate((el) => {
+        el.textContent = 'Edited live inside real Docker browser smoke test!';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await p1.evaluate((el) => el.blur());
+      await page1.waitForTimeout(800);
+
+      // Reload both tabs: Tab 1 keeps the edit, Tab 2 stays isolated with original copy!
+      await page1.reload({ waitUntil: 'networkidle' });
+      await page2.reload({ waitUntil: 'networkidle' });
+      await f1.locator('p:has-text("Edited live inside real Docker browser smoke test!")').waitFor({
+        timeout: 30_000,
+      });
+      await f2.locator('p:has-text("Static copy inside shared workspaces container.")').waitFor({
+        timeout: 30_000,
+      });
+
+      const allCookies = await context.cookies();
+      if (allCookies.some((c) => c.name === 'halley_preview_session')) {
+        throw new Error('Unexpected global halley_preview_session cookie found!');
+      }
+    } finally {
+      await browser.close();
     }
 
     console.log('[docker-smoke] 10. Restarting workspaces container and verifying state reconciliation + lazy wake…');
