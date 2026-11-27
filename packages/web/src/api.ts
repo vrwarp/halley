@@ -200,7 +200,14 @@ export const api = {
       newerCommits: Array<{ sha: string; shortSha: string; author: string; date: string; subject: string }>;
       coEditors: Array<{ sessionId: string; title: string; ownerName: string; changedFilesCount: number }>;
     }>(`/api/sessions/${id}/upstream-status`),
-  syncSession: (id: string, opts?: { kind?: 'sync' | 'publish' | 'revert'; autoSyncOnly?: boolean }) =>
+  syncSession: (
+    id: string,
+    opts?: {
+      kind?: 'sync' | 'publish' | 'revert';
+      autoSyncOnly?: boolean;
+      autoApplyCleanOnly?: boolean;
+    },
+  ) =>
     apiFetch<{
       review?: MergeReviewStateDto;
       heldForUser?: boolean;
@@ -271,11 +278,23 @@ export const api = {
     const data = (await res.json()) as { attachment: StagedAttachment };
     return data.attachment;
   },
-  publish: (id: string, title: string, summary: string) =>
-    apiFetch<{ ok: boolean }>(`/api/sessions/${id}/publish`, {
+  publish: (
+    id: string,
+    title: string,
+    summary: string,
+    opts?: { excludePaths?: string[]; background?: boolean },
+  ) =>
+    apiFetch<{ ok: boolean; started?: boolean }>(`/api/sessions/${id}/publish`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title, summary }),
+      body: JSON.stringify({
+        title,
+        summary,
+        ...(opts?.excludePaths && opts.excludePaths.length > 0
+          ? { excludePaths: opts.excludePaths }
+          : {}),
+        background: opts?.background ?? true,
+      }),
     }),
   fixWithPi: (id: string, errorSummary: string, logs?: string) =>
     apiFetch<{ ok: boolean }>(`/api/sessions/${id}/fix-with-pi`, {

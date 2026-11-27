@@ -15,14 +15,35 @@ export function App() {
     extraGrantedUsd: 0,
     capped: false,
   });
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('session') || null;
+    } catch {
+      return null;
+    }
+  });
   const [openPublishOnLoad, setOpenPublishOnLoad] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
   const [focusOptimize, setFocusOptimize] = useState(false);
 
+  const syncSessionUrl = (id: string | null) => {
+    try {
+      const next = new URL(window.location.href);
+      if (id) {
+        next.searchParams.set('session', id);
+      } else {
+        next.searchParams.delete('session');
+      }
+      window.history.replaceState(null, '', `${next.pathname}${next.search}${next.hash}`);
+    } catch {
+      // ignore
+    }
+  };
+
   const openSession = (id: string, opts?: { openPublish?: boolean }) => {
     setOpenPublishOnLoad(Boolean(opts?.openPublish));
     setActiveSessionId(id);
+    syncSessionUrl(id);
     void api
       .listSessions()
       .then((list) => {
@@ -100,6 +121,7 @@ export function App() {
         initialOpenPublish={openPublishOnLoad}
         onBack={() => {
           setActiveSessionId(null);
+          syncSessionUrl(null);
           setOpenPublishOnLoad(false);
           void refresh();
         }}
@@ -127,6 +149,7 @@ export function App() {
       onLogout={async () => {
         await api.logout();
         setActiveSessionId(null);
+        syncSessionUrl(null);
         await refresh();
       }}
     />

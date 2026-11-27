@@ -167,7 +167,7 @@ export const VerificationCheckResultSchema = z.object({
 export type VerificationCheckResult = z.infer<typeof VerificationCheckResultSchema>;
 
 /** Internal protocol version negotiated between control-plane and workspaces supervisor. */
-export const WORKSPACE_HOST_PROTOCOL_VERSION = 1;
+export const WORKSPACE_HOST_PROTOCOL_VERSION = 2;
 
 export const PublishProgressPayloadSchema = z.object({
   state: PublishStateSchema,
@@ -302,6 +302,16 @@ export type ChatServerMessage =
       type: 'session_meta_updated';
     }
   | {
+      type: 'session_state_sync';
+      workspaceLocked: boolean;
+      lockedFile?: string;
+      previewPaused: boolean;
+      previewPauseReason?: string;
+      astroReady: boolean;
+      publishProgress?: PublishProgressPayload | null;
+      mergeReview?: MergeReviewStateDto | null;
+    }
+  | {
       type: 'error';
       message: string;
     };
@@ -357,6 +367,7 @@ export interface EditorSessionDto {
   baseSha: string;
   prevBaseSha: string | null;
   status: SessionStatus;
+  astroReady?: boolean;
   bootProgress?: BootProgressDto | null;
   publishState: PublishState;
   publishError: string | null;
@@ -967,4 +978,56 @@ export interface OptimizeAiEstimateDto {
   alreadyReviewed: boolean;
 }
 
+// ============================================================================
+// API Boundary Request Schemas (Zod-validated in Control-Plane & Runner)
+// ============================================================================
 
+export const CreateSessionRequestSchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+});
+
+export const UpdateSessionRequestSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+});
+
+export const PublishRequestSchema = z.object({
+  title: z.string().trim().max(240).optional(),
+  summary: z.string().trim().max(4000).optional(),
+  excludePaths: z.array(z.string().min(1).max(500)).max(200).optional(),
+  background: z.boolean().optional(),
+});
+export type PublishRequest = z.infer<typeof PublishRequestSchema>;
+
+export const SyncStartRequestSchema = z.object({
+  kind: z.enum(['sync', 'publish', 'revert']).optional(),
+  autoSyncOnly: z.boolean().optional(),
+  autoApplyCleanOnly: z.boolean().optional(),
+  skipFetch: z.boolean().optional(),
+});
+export type SyncStartRequest = z.infer<typeof SyncStartRequestSchema>;
+
+export const RevertSessionCreateSchema = z
+  .object({
+    sessionId: z.string().trim().min(1).max(120).optional(),
+    sha: z.string().trim().min(4).max(80).optional(),
+    shas: z.array(z.string().trim().min(4).max(80)).max(50).optional(),
+    reason: z.string().trim().max(1000).optional(),
+    title: z.string().trim().max(240).optional(),
+  })
+  .refine((v) => Boolean(v.sessionId || v.sha || (v.shas && v.shas.length > 0)), {
+    message: 'Commit SHA or sessionId is required',
+  });
+
+export const AdminAllowlistCreateSchema = z.object({
+  kind: z.enum(['email', 'domain']),
+  value: z.string().trim().min(2).max(320),
+});
+
+export const AdminSpendCapSchema = z.object({
+  dailyCapUsd: z.number().finite().nonnegative().max(10_000),
+});
+
+export const AdminGrantExtraSchema = z.object({
+  userId: z.string().trim().min(1).optional(),
+  extraUsd: z.number().finite().positive().max(10_000).optional(),
+});

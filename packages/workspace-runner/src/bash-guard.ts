@@ -13,16 +13,23 @@ const DEV_SERVER_RE =
 const DIRECT_BUILD_OR_CHECK_RE =
   /(?:^|[;&|(\n`])\s*(?:(?:npx|pnpm(?:\s+(?:exec|run))?|npm\s+run|yarn)\s+)?(?:astro\s+(?:build|check)\b|(?:npm|pnpm|yarn)\s+run\s+(?:build|check)\b)/i;
 
-const PARENT_TRAVERSAL_RE = /(?:^|[\s"'=:,;({/])\.\.(?:\/|[\s"'=:,;)}]|$)/;
+// Unquoted parent-directory path arguments (e.g. `ls ../state`, `cd ..`, `cat ../../etc/passwd`)
+const UNQUOTED_PARENT_PATH_RE = /(?:^|[\s=:(;|&])\.\.(?:\/|[\s;|&)]|$)/;
+
+// Quoted parent-directory path arguments on filesystem commands (allows quoted search/filter strings on `rg`/`grep`/`jq`/`node -e`)
+const QUOTED_FS_PARENT_PATH_RE =
+  /(?:^|[;&|(\n`])\s*(?:cd|ls|cat|head|tail|rm|mv|cp|mkdir|rmdir|touch|ln|chmod|chown|sed|find)\b[^\n;|&`]*['"]\.\.(?:\/|['"])/i;
 
 const DEP_MUTATION_RE =
-  /(?:^|[;&|(\n`])\s*(?:npm\s+(?:install|i|ci|uninstall|rm|remove|update|up|dedupe|pkg)\b|pnpm\s+(?:add|install|i|remove|rm|uninstall|update|up)\b|yarn\s+(?:add|install|remove|upgrade)\b)/i;
+  /(?:^|[;&|(\n`])\s*(?:npm\s+(?:install|i|ci|uninstall|rm|remove|update|up|dedupe|pkg|exec)\b|npx\b|pnpm\s+(?:add|install|i|remove|rm|uninstall|update|up|dlx)\b|yarn\s+(?:add|install|remove|upgrade|dlx)\b|corepack\b)/i;
 
 /**
- * Checks whether a bash command is safe to run inside the shared workspaces container.
- * Blocks process-killing commands, dev-server launches, parent-directory traversal
- * outside the session repo, and direct build/check runs (which should use `run_checks`
- * so the container-wide FIFO build queue governs peak RAM).
+ * High-trust safety rails preventing accidental agent footguns on the shared workspace server:
+ * - Process-killing commands (`kill`, `pkill`, `killall`, `fuser`)
+ * - Starting duplicate dev/preview servers (`astro dev` is managed by Halley)
+ * - Running unqueued `astro build` / `astro check` directly (use `run_checks` instead)
+ * - Escaping the session working directory (`../state`, `/workspaces/sessions/other`), while
+ *   allowing quoted search/filter patterns such as `rg "../lib/url" src/` and `jq '..'`.
  */
 export function checkSharedContainerBashCommand(
   command: string,
@@ -55,17 +62,21 @@ export function checkSharedContainerBashCommand(
     };
   }
 
-  if (PARENT_TRAVERSAL_RE.test(trimmed)) {
+  // Strip quoted strings before testing UNQUOTED_PARENT_PATH_RE so `rg "../lib/url" src/` and `jq '..'` pass!
+  const withoutQuotedLiterals = trimmed
+    .replace(/"(?:\\.|[^"\\])*"/g, '""')
+    .replace(/'[^']*'/g, "''");
+
+  if (UNQUOTED_PARENT_PATH_RE.test(withoutQuotedLiterals) || QUOTED_FS_PARENT_PATH_RE.test(trimmed)) {
     return {
       allowed: false,
       reason:
-        'Parent-directory traversal (`..`) is blocked on the shared workspace server. Stay strictly within your current working directory.',
+        'Parent-directory traversal (`..`) outside the repository is blocked on the shared workspace server. Stay within your current working directory.',
     };
   }
 
-  // Block absolute references into /workspaces/ or other session directories outside repoRoot
+  // Block absolute references into /workspaces/, /halley-volume/, or /data/ outside repoRoot
   const resolvedRoot = path.resolve(repoRoot);
-  const workspacesParent = path.dirname(path.dirname(resolvedRoot)); // e.g. /workspaces/sessions -> /workspaces
   const absPathMatches = trimmed.match(/\/(?:workspaces|halley-volume|data)\/[^\s"'`|;&)]*/g) ?? [];
   for (const rawAbs of absPathMatches) {
     const resolved = path.resolve(rawAbs);
@@ -76,14 +87,13 @@ export function checkSharedContainerBashCommand(
       };
     }
   }
-  void workspacesParent;
 
   return { allowed: true };
 }
 
 /**
  * Returns true if the bash command may install, remove, or mutate packages in `node_modules`.
- * Used to trigger copy-on-change detachment before executing against a hardlinked cache.
+ * Used to trigger copy-on-change detachment before executing against a hardlinked/symlinked cache.
  */
 export function isDependencyMutationCommand(command: string): boolean {
   return DEP_MUTATION_RE.test(command.trim());

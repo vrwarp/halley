@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     jq \
     gosu \
+    tini \
   && rm -rf /var/lib/apt/lists/*
 
 # Ensure Node 22 + pnpm are available and prepare directories for unprivileged node user
@@ -41,7 +42,7 @@ ENV WORKSPACES_DIR=/workspaces
 ENV SUPERVISOR_PORT=4000
 EXPOSE 4000
 
-# Start entrypoint as root solely to self-heal /workspaces volume ownership (e.g. NAS bind mounts),
-# then immediately drop privileges to unprivileged `node` via gosu.
+# Fix top-level /workspaces bind-mount ownership if needed, drop root via gosu,
+# and exec /usr/bin/tini as unprivileged `node` PID 1 to reap reparented grandchildren.
 USER root
 ENTRYPOINT ["/usr/local/bin/halley-workspace-entrypoint.sh"]

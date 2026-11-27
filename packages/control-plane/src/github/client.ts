@@ -195,7 +195,11 @@ export class GitHubService {
     };
   }
 
-  async tryEnableNativeAutoMerge(prNodeId: string, commitHeadline: string): Promise<boolean> {
+  async tryEnableNativeAutoMerge(
+    prNodeId: string,
+    commitHeadline: string,
+    commitBody?: string,
+  ): Promise<boolean> {
     try {
       const token = await this.getAccessToken();
       const res = await fetch(`${this.config.githubApiBaseUrl}/graphql`, {
@@ -206,12 +210,21 @@ export class GitHubService {
           'User-Agent': 'halley-editor',
         },
         body: JSON.stringify({
-          query: `mutation($id: ID!, $headline: String!) {
-            enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: SQUASH, commitHeadline: $headline }) {
+          query: `mutation($id: ID!, $headline: String!, $body: String) {
+            enablePullRequestAutoMerge(input: {
+              pullRequestId: $id,
+              mergeMethod: SQUASH,
+              commitHeadline: $headline,
+              commitBody: $body
+            }) {
               pullRequest { id }
             }
           }`,
-          variables: { id: prNodeId, headline: commitHeadline },
+          variables: {
+            id: prNodeId,
+            headline: commitHeadline,
+            body: commitBody ?? null,
+          },
         }),
         signal: AbortSignal.timeout(15_000),
       });
@@ -246,49 +259,99 @@ export class GitHubService {
 
   async checkCommitStatus(headSha: string): Promise<CheckStatusSummary> {
     const { owner, repo } = this.ownerRepo;
-    const runs = await this.api<{
-      total_count: number;
-      check_runs: Array<{
-        id: number;
-        name: string;
-        status: string;
-        conclusion: string | null;
-        output?: { title?: string; summary?: string };
-      }>;
-    }>(`/repos/${owner}/${repo}/commits/${headSha}/check-runs`);
+    type CheckRunItem = {
+      id: number;
+      name: string;
+      status: string;
+      conclusion: string | null;
+      output?: { title?: string; summary?: string };
+    };
 
-    if (runs.total_count === 0) {
+    const allCheckRuns: CheckRunItem[] = [];
+    let reportedTotalRuns = 0;
+    for (let page = 1; page <= 5; page++) {
+      const runsPage = await this.api<{
+        total_count: number;
+        check_runs: CheckRunItem[];
+      }>(
+        `/repos/${owner}/${repo}/commits/${encodeURIComponent(headSha)}/check-runs?per_page=100&page=${page}`,
+      );
+      reportedTotalRuns = Math.max(reportedTotalRuns, runsPage.total_count ?? 0);
+      const batch = runsPage.check_runs ?? [];
+      allCheckRuns.push(...batch);
+      if (batch.length < 100 || allCheckRuns.length >= reportedTotalRuns) {
+        break;
+      }
+    }
+
+    // Also query legacy commit statuses (e.g. external status webhooks). Gracefully ignore 404 on minimal test mocks.
+    let latestByContext = new Map<string, { state: string; description?: string | null }>();
+    try {
+      const combined = await this.api<{
+        state?: string;
+        statuses?: Array<{ context?: string; state?: string; description?: string | null; id?: number }>;
+      }>(`/repos/${owner}/${repo}/commits/${encodeURIComponent(headSha)}/status?per_page=100`);
+      for (const st of combined.statuses ?? []) {
+        const ctx = (st.context || '').trim();
+        if (!ctx || !st.state) continue;
+        if (!latestByContext.has(ctx)) {
+          latestByContext.set(ctx, { state: st.state, description: st.description });
+        }
+      }
+    } catch (err) {
+      if (!(err instanceof GitHubApiError && err.status === 404)) {
+        // Non-404 status errors: surface only if check-runs are empty so transient status API hiccups don't mask real errors
+        if (allCheckRuns.length === 0) throw err;
+      }
+      latestByContext = new Map();
+    }
+
+    const statusEntries = [...latestByContext.entries()];
+    const totalCount = Math.max(reportedTotalRuns, allCheckRuns.length) + statusEntries.length;
+
+    if (totalCount === 0) {
       return { state: 'passed', totalCount: 0 };
     }
 
-    const failed = runs.check_runs.filter(
+    const failedRuns = allCheckRuns.filter(
       (r) =>
         r.status === 'completed' &&
         r.conclusion &&
         !['success', 'neutral', 'skipped'].includes(r.conclusion),
     );
-    if (failed.length > 0) {
-      const names = failed.map((f) => `${f.name} (${f.conclusion})`).join(', ');
-      const details = failed
-        .map((f) => `### ${f.name}\n${f.output?.title ?? ''}\n${f.output?.summary ?? ''}`)
+    const failedStatuses = statusEntries.filter(
+      ([, st]) => st.state === 'failure' || st.state === 'error',
+    );
+
+    if (failedRuns.length > 0 || failedStatuses.length > 0) {
+      const names = [
+        ...failedRuns.map((f) => `${f.name} (${f.conclusion})`),
+        ...failedStatuses.map(([ctx, st]) => `${ctx} (${st.state})`),
+      ].join(', ');
+      const details = [
+        ...failedRuns.map((f) => `### ${f.name}\n${f.output?.title ?? ''}\n${f.output?.summary ?? ''}`),
+        ...failedStatuses.map(([ctx, st]) => `### ${ctx}\n${st.description ?? st.state}`),
+      ]
         .join('\n\n')
         .slice(0, 4000);
       return {
         state: 'failed',
-        totalCount: runs.total_count,
+        totalCount,
         failedSummary: `GitHub checks failed: ${names}`,
         failedLogs: details || names,
       };
     }
 
-    const pending = runs.check_runs.some((r) => r.status !== 'completed');
-    return { state: pending ? 'pending' : 'passed', totalCount: runs.total_count };
+    const pendingRuns = allCheckRuns.some((r) => r.status !== 'completed');
+    const pendingStatuses = statusEntries.some(([, st]) => st.state === 'pending');
+    return { state: pendingRuns || pendingStatuses ? 'pending' : 'passed', totalCount };
   }
 
   async squashMergePr(input: {
     prNumber: number;
     commitTitle: string;
     commitMessage: string;
+    headSha?: string;
   }): Promise<string> {
     const { owner, repo } = this.ownerRepo;
     const res = await this.api<{ sha: string }>(`/repos/${owner}/${repo}/pulls/${input.prNumber}/merge`, {
@@ -298,6 +361,7 @@ export class GitHubService {
         merge_method: 'squash',
         commit_title: input.commitTitle,
         commit_message: input.commitMessage,
+        ...(input.headSha ? { sha: input.headSha } : {}),
       }),
     });
     return res.sha;
@@ -314,9 +378,45 @@ export class GitHubService {
       }>;
     }>(`/repos/${owner}/${repo}/actions/workflows?per_page=50`);
 
-    return (data.workflows ?? []).some(
-      (w) => w.state === 'active' && !matchesDeployWorkflow(w, this.config.deployWorkflow),
-    );
+    const active = (data.workflows ?? []).filter((w) => w.state === 'active');
+    if (active.length === 0) return false;
+
+    // Fast path: any dedicated non-deploy workflow (e.g. ci.yml / verify.yml)
+    if (active.some((w) => !matchesDeployWorkflow(w, this.config.deployWorkflow))) {
+      return true;
+    }
+
+    // Combined workflow path: inspect active deploy-named workflows (e.g. build-and-deploy.yml)
+    // to check whether they ALSO trigger on `pull_request` / `pull_request_target`.
+    for (const wf of active) {
+      if (!wf.path) continue;
+      const cleanPath = wf.path.replace(/^\/+/, '');
+      try {
+        const contentRes = await this.api<{ content?: string; encoding?: string }>(
+          `/repos/${owner}/${repo}/contents/${cleanPath
+            .split('/')
+            .map(encodeURIComponent)
+            .join('/')}?ref=${encodeURIComponent(this.config.baseBranch)}`,
+        );
+        if (contentRes.content) {
+          const decoded =
+            contentRes.encoding === 'base64'
+              ? Buffer.from(contentRes.content.replace(/\s+/g, ''), 'base64').toString('utf8')
+              : contentRes.content;
+          const uncommented = decoded
+            .split(/\r?\n/)
+            .map((line) => line.replace(/#.*$/, ''))
+            .join('\n');
+          if (/\bpull_request(?:_target)?\b/.test(uncommented)) {
+            return true;
+          }
+        }
+      } catch {
+        // Ignore missing contents endpoint (e.g. dynamic GitHub Pages workflow)
+      }
+    }
+
+    return false;
   }
 
   async hasActiveDeployWorkflow(): Promise<boolean> {
@@ -435,13 +535,17 @@ export class GitHubService {
     }
   }
 
-  async getCommitFiles(sha: string): Promise<string[]> {
+  async getCommitFilesOrThrow(sha: string): Promise<string[]> {
     const { owner, repo } = this.ownerRepo;
+    const data = await this.api<{ files?: Array<{ filename: string }> }>(
+      `/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}`,
+    );
+    return (data.files ?? []).map((f) => f.filename);
+  }
+
+  async getCommitFiles(sha: string): Promise<string[]> {
     try {
-      const data = await this.api<{ files?: Array<{ filename: string }> }>(
-        `/repos/${owner}/${repo}/commits/${encodeURIComponent(sha)}`,
-      );
-      return (data.files ?? []).map((f) => f.filename);
+      return await this.getCommitFilesOrThrow(sha);
     } catch {
       return [];
     }

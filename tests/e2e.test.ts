@@ -71,10 +71,44 @@ export default defineConfig({
 `,
   );
 
+  await fs.mkdir(path.join(repoDir, 'src/styles'), { recursive: true });
+  await fs.mkdir(path.join(repoDir, 'src/content/announcements'), { recursive: true });
+
+  await fs.writeFile(
+    path.join(repoDir, 'src/styles/site.css'),
+    `body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; color: #1c1917; }\nh1 { letter-spacing: -0.02em; }\n`,
+  );
+
+  await fs.writeFile(
+    path.join(repoDir, 'src/content.config.ts'),
+    `import { defineCollection, z } from 'astro:content';
+import { glob } from 'astro/loaders';
+
+const announcements = defineCollection({
+  loader: glob({ pattern: '**/*.json', base: './src/content/announcements' }),
+  schema: z.object({
+    title: z.string(),
+    date: z.string(),
+  }),
+});
+
+export const collections = { announcements };
+`,
+  );
+
+  await fs.writeFile(
+    path.join(repoDir, 'src/content/announcements/welcome.json'),
+    JSON.stringify({ title: 'Fall Fellowship Kickoff', date: '2026-09-13' }, null, 2) + '\n',
+  );
+
   await fs.writeFile(
     path.join(repoDir, 'src/pages/index.astro'),
     `---
+import { getCollection } from 'astro:content';
 import { url } from '../lib/url';
+import '../styles/site.css';
+
+const items = await getCollection('announcements');
 ---
 <!doctype html>
 <html lang="en">
@@ -83,6 +117,9 @@ import { url } from '../lib/url';
     <main>
       <h1>Welcome to our community</h1>
       <p>Join us every Sunday morning at 10am.</p>
+      <section data-collection="announcements">
+        {items.map((item) => <small>{item.data.title}</small>)}
+      </section>
       <a href={url('/im-new')}>I'm New</a>
       <a href={url('/events')}>Events</a>
     </main>
@@ -202,11 +239,14 @@ function sendAnthropicSse(
         index,
         content_block: { type: 'text', text: '' },
       });
-      emit('content_block_delta', {
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'text_delta', text: block.text },
-      });
+      const mid = Math.max(1, Math.floor(block.text.length / 2));
+      for (const chunk of [block.text.slice(0, mid), block.text.slice(mid)].filter(Boolean)) {
+        emit('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'text_delta', text: chunk },
+        });
+      }
       emit('content_block_stop', { type: 'content_block_stop', index });
     } else {
       hasToolUse = true;
@@ -215,11 +255,15 @@ function sendAnthropicSse(
         index,
         content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} },
       });
-      emit('content_block_delta', {
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) },
-      });
+      const fullJson = JSON.stringify(block.input);
+      const mid = Math.max(1, Math.floor(fullJson.length / 2));
+      for (const part of [fullJson.slice(0, mid), fullJson.slice(mid)].filter(Boolean)) {
+        emit('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'input_json_delta', partial_json: part },
+        });
+      }
       emit('content_block_stop', { type: 'content_block_stop', index });
     }
   });
@@ -465,16 +509,18 @@ function startFakeGitHubServer(repoDir: string): Promise<{
   isMerged: () => boolean;
   close: () => Promise<void>;
 }> {
-  let prCounter = 0;
-  let merged = false;
-  let mergeSha = 'deadbeef00000000000000000000000000000001';
-  let currentPr: {
+  interface FakePr {
     number: number;
     title: string;
     body: string;
     headBranch: string;
     headSha: string;
-  } | null = null;
+    merged: boolean;
+    mergeSha: string | null;
+  }
+  let prCounter = 0;
+  let anyMerged = false;
+  const prs = new Map<number, FakePr>();
 
   const server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -493,22 +539,23 @@ function startFakeGitHubServer(repoDir: string): Promise<{
 
     // List open PRs
     if (req.method === 'GET' && urlPath.endsWith('/pulls')) {
-      if (currentPr && !merged) {
-        res.writeHead(200);
-        res.end(
-          JSON.stringify([
-            {
-              number: currentPr.number,
-              html_url: `https://github.com/test/site/pull/${currentPr.number}`,
-              node_id: `PR_fake_${currentPr.number}`,
-              head: { sha: currentPr.headSha },
-            },
-          ]),
-        );
-      } else {
-        res.writeHead(200);
-        res.end('[]');
-      }
+      const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+      const headParam = reqUrl.searchParams.get('head') || '';
+      const headBranchFilter = headParam.includes(':') ? headParam.split(':')[1] : headParam;
+      const openPrs = [...prs.values()].filter(
+        (p) => !p.merged && (!headBranchFilter || p.headBranch === headBranchFilter),
+      );
+      res.writeHead(200);
+      res.end(
+        JSON.stringify(
+          openPrs.map((p) => ({
+            number: p.number,
+            html_url: `https://github.com/test/site/pull/${p.number}`,
+            node_id: `PR_fake_${p.number}`,
+            head: { sha: p.headSha },
+          })),
+        ),
+      );
       return;
     }
 
@@ -525,40 +572,45 @@ function startFakeGitHubServer(repoDir: string): Promise<{
       } catch {
         // fallback
       }
-      currentPr = {
+      const created: FakePr = {
         number: prCounter,
         title: body.title,
         body: body.body,
         headBranch: body.head,
         headSha,
+        merged: false,
+        mergeSha: null,
       };
+      prs.set(created.number, created);
       res.writeHead(201);
       res.end(
         JSON.stringify({
-          number: currentPr.number,
-          html_url: `https://github.com/test/site/pull/${currentPr.number}`,
-          node_id: `PR_fake_${currentPr.number}`,
-          head: { sha: currentPr.headSha },
+          number: created.number,
+          html_url: `https://github.com/test/site/pull/${created.number}`,
+          node_id: `PR_fake_${created.number}`,
+          head: { sha: created.headSha },
         }),
       );
       return;
     }
 
     // Get PR state
-    if (req.method === 'GET' && /\/pulls\/\d+$/.test(urlPath)) {
+    const prMatch = urlPath.match(/\/pulls\/(\d+)$/);
+    if (req.method === 'GET' && prMatch) {
+      const pr = prs.get(Number(prMatch[1]));
       res.writeHead(200);
       res.end(
         JSON.stringify({
-          merged,
-          merge_commit_sha: merged ? mergeSha : null,
-          state: merged ? 'closed' : 'open',
-          head: { sha: currentPr?.headSha || 'abc1234' },
+          merged: Boolean(pr?.merged),
+          merge_commit_sha: pr?.mergeSha ?? null,
+          state: pr?.merged ? 'closed' : 'open',
+          head: { sha: pr?.headSha || 'abc1234' },
         }),
       );
       return;
     }
 
-    // Check runs
+    // Check runs & combined commit status
     if (req.method === 'GET' && urlPath.endsWith('/check-runs')) {
       res.writeHead(200);
       res.end(
@@ -569,12 +621,47 @@ function startFakeGitHubServer(repoDir: string): Promise<{
       );
       return;
     }
-
-    // Squash merge
-    if (req.method === 'PUT' && /\/pulls\/\d+\/merge$/.test(urlPath)) {
-      merged = true;
+    if (req.method === 'GET' && urlPath.endsWith('/status')) {
       res.writeHead(200);
-      res.end(JSON.stringify({ sha: mergeSha, merged: true }));
+      res.end(JSON.stringify({ state: 'success', statuses: [] }));
+      return;
+    }
+
+    // Workflows list
+    if (req.method === 'GET' && urlPath.endsWith('/actions/workflows')) {
+      res.writeHead(200);
+      res.end(
+        JSON.stringify({
+          workflows: [
+            { id: 1, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' },
+            { id: 2, name: 'Deploy Pages', path: '.github/workflows/deploy.yml', state: 'active' },
+          ],
+        }),
+      );
+      return;
+    }
+
+    // Squash merge -> advance `main` in upstream repoDir so other open drafts detect real upstream updates!
+    const mergeMatch = urlPath.match(/\/pulls\/(\d+)\/merge$/);
+    if (req.method === 'PUT' && mergeMatch) {
+      const pr = prs.get(Number(mergeMatch[1]));
+      let newMergeSha = `deadbeef0000000000000000000000000000000${pr?.number ?? 1}`;
+      if (pr) {
+        try {
+          await execFileAsync('git', ['checkout', '-B', 'main', `refs/heads/${pr.headBranch}`], {
+            cwd: repoDir,
+          });
+          const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoDir });
+          newMergeSha = stdout.trim();
+        } catch {
+          // fallback if branch ref wasn't pushed to repoDir
+        }
+        pr.merged = true;
+        pr.mergeSha = newMergeSha;
+      }
+      anyMerged = true;
+      res.writeHead(200);
+      res.end(JSON.stringify({ sha: newMergeSha, merged: true }));
       return;
     }
 
@@ -583,7 +670,16 @@ function startFakeGitHubServer(repoDir: string): Promise<{
       res.writeHead(200);
       res.end(
         JSON.stringify({
-          workflow_runs: [{ id: 1, name: 'Deploy Pages', status: 'completed', conclusion: 'success' }],
+          workflow_runs: [
+            {
+              id: 1,
+              name: 'Deploy Pages',
+              path: '.github/workflows/deploy.yml',
+              event: 'push',
+              status: 'completed',
+              conclusion: 'success',
+            },
+          ],
         }),
       );
       return;
@@ -599,7 +695,7 @@ function startFakeGitHubServer(repoDir: string): Promise<{
       resolve({
         url: `http://127.0.0.1:${addr.port}`,
         getPrCount: () => prCounter,
-        isMerged: () => merged,
+        isMerged: () => anyMerged,
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -980,6 +1076,83 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       expect(thirdIframeSrc).not.toBe(secondIframeSrc);
     } catch (err) {
       console.error('=== BRANCH OFF E2E CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      throw err;
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('isolates two concurrent preview tabs via Service Worker, completes durable background publish, and syncs second session from advanced main', async () => {
+    const baseUrl = `http://127.0.0.1:${cpPort}`;
+    const browser = await chromium.launch({ headless: true });
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+      const pageA = await context.newPage();
+      const pageB = await context.newPage();
+
+      // Sign in on pageA (shares auth cookie across context)
+      await pageA.goto(baseUrl, { waitUntil: 'networkidle' });
+      await pageA.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
+      await pageA.click('button:has-text("Dev Sign In")');
+      await pageA.waitForSelector('input[placeholder*="Easter service times"]');
+
+      // Create Session B first so it starts at the current main SHA
+      await pageB.goto(baseUrl, { waitUntil: 'networkidle' });
+      await pageB.waitForSelector('input[placeholder*="Easter service times"]');
+      await pageB.fill('input[placeholder*="Easter service times"]', 'Concurrent Tab B');
+      await pageB.click('button:has-text("New edit")');
+
+      // Create Session A in parallel tab
+      await pageA.fill('input[placeholder*="Easter service times"]', 'Concurrent Tab A');
+      await pageA.click('button:has-text("New edit")');
+
+      const frameA = pageA.frameLocator('iframe');
+      const frameB = pageB.frameLocator('iframe');
+      await frameA.locator('h1').first().waitFor({ timeout: 60_000 });
+      await frameB.locator('h1').first().waitFor({ timeout: 60_000 });
+
+      // Verify Content Collection rendered on both tabs AND zero halley_preview_session cookie exists!
+      await frameA.locator('small:has-text("Fall Fellowship Kickoff")').waitFor({ timeout: 10_000 });
+      await frameB.locator('small:has-text("Fall Fellowship Kickoff")').waitFor({ timeout: 10_000 });
+      const cookies = await context.cookies();
+      expect(cookies.some((c) => c.name === 'halley_preview_session')).toBe(false);
+
+      // Edit h1 inline on Tab A ONLY
+      await pageA.click('button:has-text("Edit")');
+      const h1A = frameA.locator('h1').first();
+      await h1A.click();
+      await h1A.evaluate((el) => {
+        el.textContent = 'Welcome to Crossing — Live From Tab A';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await h1A.evaluate((el) => el.blur());
+      await pageA.waitForTimeout(800);
+
+      // Tab B must remain completely isolated with original h1!
+      await pageB.reload({ waitUntil: 'networkidle' });
+      await frameB.locator('h1:has-text("Welcome to our community")').waitFor({ timeout: 30_000 });
+
+      // Publish Tab A and dismiss modal via "Continue in background" (or close × if instant)
+      await pageA.click('button:has-text("Publish")');
+      await pageA.click('button:has-text("Publish to Live Site")');
+      const bgBtn = pageA.locator('button:has-text("Continue in background")');
+      if (await bgBtn.isVisible({ timeout: 1_500 }).catch(() => false)) {
+        await bgBtn.click();
+        await pageA.waitForSelector('header:has-text("Published"), button:has-text("Undo publication")', {
+          timeout: 30_000,
+        });
+      } else {
+        await pageA.waitForSelector('button:has-text("Start new edit")', { timeout: 30_000 });
+      }
+
+      // Now Tab B pulls latest from advanced `main` via "Get latest" and receives Tab A's published h1!
+      await pageB.click('button[title="Pull latest updates from the live site"]');
+      await frameB.locator('h1:has-text("Welcome to Crossing — Live From Tab A")').waitFor({
+        timeout: 30_000,
+      });
+    } catch (err) {
+      console.error('=== 2-TAB ISOLATION & BG PUBLISH LOGS ===\n' + cpLogs.join(''));
       throw err;
     } finally {
       await browser.close();

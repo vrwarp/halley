@@ -8,6 +8,7 @@ import type {
   UserDto,
 } from '@halley/shared';
 import { slugifyRouteSegment } from '@halley/shared';
+import { deriveWorkspaceToken } from '@halley/shared/auth';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
@@ -297,11 +298,13 @@ export class OptimizeService {
     };
 
     const usage = data.usage ?? {};
-    const costUsd = Math.min(DEEP_AI_CEILING_USD, computeCostUsd(modelId, usage));
+    const costUsd = computeCostUsd(modelId, usage);
     this.db.recordSpend(
       user.id,
       costUsd,
-      usage.input_tokens ?? 0,
+      (usage.input_tokens ?? 0) +
+        (usage.cache_creation_input_tokens ?? 0) +
+        (usage.cache_read_input_tokens ?? 0),
       usage.output_tokens ?? 0,
       undefined,
       { purpose: 'optimize', model: modelId },
@@ -416,16 +419,18 @@ export class OptimizeService {
 
     let sessionId: string = crypto.randomUUID();
     let volumeName = `halley-ws-${sessionId}`;
-    let rawToken = crypto.randomBytes(24).toString('hex');
+    let warmId: string | null = null;
 
     if (this.driver.reserveWarmWorkspace) {
       const warm = await this.driver.reserveWarmWorkspace();
       if (warm) {
         sessionId = warm.id;
         volumeName = warm.volumeName;
-        rawToken = warm.rawToken;
+        warmId = warm.id;
       }
     }
+
+    const rawToken = deriveWorkspaceToken(this.config.sessionSecret, sessionId, 0);
 
     const title =
       input.title?.trim() ||
@@ -435,18 +440,26 @@ export class OptimizeService {
     const slug = slugifyRouteSegment(title) || 'optimize-astro';
     const short = sessionId.slice(0, 6);
 
-    const session = this.db.createSession({
-      id: sessionId,
-      title,
-      slug,
-      kind: 'edit',
-      ownerUserId: user.id,
-      repo: this.config.repo,
-      baseBranch: this.config.baseBranch,
-      workingBranch: `halley/${slug}-${short}`,
-      volumeName,
-      workspaceTokenHash: hashWorkspaceToken(rawToken),
-    });
+    let session: SessionRecord;
+    try {
+      session = this.db.createSession({
+        id: sessionId,
+        title,
+        slug,
+        kind: 'edit',
+        ownerUserId: user.id,
+        repo: this.config.repo,
+        baseBranch: this.config.baseBranch,
+        workingBranch: `halley/${slug}-${short}`,
+        volumeName,
+        workspaceTokenHash: hashWorkspaceToken(rawToken),
+      });
+    } catch (err) {
+      if (warmId) {
+        await this.driver.releaseWarmWorkspace?.(warmId).catch(() => {});
+      }
+      throw err;
+    }
 
     if (useEscalation) {
       this.db.updateSession(session.id, {

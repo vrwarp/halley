@@ -86,5 +86,8 @@ jobs:
           cache-from: type=gha,scope=halley-workspace
           cache-to: type=gha,mode=max,scope=halley-workspace
 
+      - name: Install Playwright Chromium for browser smoke check
+        run: pnpm --filter @halley/control-plane exec playwright install chromium --with-deps
+
       - name: Run 2-container Docker smoke test
         run: pnpm test:docker-smoke

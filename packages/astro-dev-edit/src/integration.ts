@@ -12,6 +12,13 @@ export interface HalleyDevEditOptions {
   repoRoot: string;
   previewBase: string;
   originalBase: string;
+  /**
+   * When false (used when running under workspace-runner v2), `/__editor/inspect`,
+   * `/__editor/patch`, and `/__editor/routes` are served directly by `workspace-runner`
+   * so all file mutations share a single OS-process lock. `GET /__editor/health`
+   * remains enabled for deterministic HTTP readiness polling.
+   */
+  enableLocalEndpoints?: boolean;
   fileLock?: AsyncFileLock;
   isReadOnly?: () => boolean;
   onPatched?: (event: { file: string; loc: string }) => void;
@@ -32,7 +39,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function resolveRelFile(repoRoot: string, rawFile: string): string {
+export function resolveEditorRelFile(repoRoot: string, rawFile: string): string {
   const abs = path.isAbsolute(rawFile)
     ? path.resolve(rawFile)
     : path.resolve(repoRoot, rawFile);
@@ -71,7 +78,9 @@ export function invalidateCssModulesForFile(
     rel.startsWith('..') ||
     rel.startsWith('node_modules/') ||
     rel.startsWith('.git/') ||
+    rel.startsWith('.astro/') ||
     rel.startsWith('dist/') ||
+    rel.includes('.halley-tmp-') ||
     !TAILWIND_SCAN_FILE_RE.test(rel)
   ) {
     return 0;
@@ -100,14 +109,25 @@ export function invalidateCssModulesForFile(
 
 export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
   const fileLock = options.fileLock ?? new PerFileMutex();
+  const enableLocalEndpoints = options.enableLocalEndpoints ?? true;
   const normalizedPreviewBase =
     options.previewBase === '/' ? '' : options.previewBase.replace(/\/$/, '');
 
   return {
     name: '@halley/astro-dev-edit',
     hooks: {
-      'astro:config:setup': ({ command, injectScript }) => {
+      'astro:config:setup': ({ command, injectScript, updateConfig }) => {
         if (command !== 'dev') return;
+
+        updateConfig({
+          vite: {
+            server: {
+              watch: {
+                ignored: ['**/dist/**', '**/.git/**', '**/.halley-tmp-*'],
+              },
+            },
+          },
+        });
 
         injectScript('head-inline', EARLY_OBSERVER_SCRIPT);
         injectScript(
@@ -130,6 +150,16 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
               ? urlPath.slice(normalizedPreviewBase.length) || '/'
               : urlPath;
 
+          if (req.method === 'GET' && stripped === '/__editor/health') {
+            sendJson(res, 200, { ok: true });
+            return;
+          }
+
+          if (!enableLocalEndpoints) {
+            next();
+            return;
+          }
+
           if (req.method === 'GET' && stripped === '/__editor/routes') {
             const routes = await discoverSiteRoutes(options.repoRoot);
             sendJson(res, 200, { routes });
@@ -139,7 +169,7 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
           if (req.method === 'POST' && stripped === '/__editor/inspect') {
             try {
               const body = await readJsonBody<{ file: string; loc: string }>(req);
-              const relFile = resolveRelFile(options.repoRoot, body.file);
+              const relFile = resolveEditorRelFile(options.repoRoot, body.file);
               if (relFile.startsWith('..') || relFile === '.github' || relFile.startsWith('.github/')) {
                 sendJson(res, 200, { editability: 'dynamic', reason: 'Protected path' });
                 return;
@@ -178,7 +208,7 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 expectedHash: string;
                 newHtml: string;
               }>(req);
-              const relFile = resolveRelFile(options.repoRoot, body.file);
+              const relFile = resolveEditorRelFile(options.repoRoot, body.file);
               const result = await patchStaticSpan({
                 repoRoot: options.repoRoot,
                 relFile,
@@ -193,20 +223,24 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 sendJson(res, result.code, { error: result.error });
                 return;
               }
-              options.onPatched?.({ file: relFile, loc: body.loc });
+              options.onPatched?.({ file: relFile, loc: result.newLoc });
               if (options.onPatchedWebhookUrl) {
                 void fetch(options.onPatchedWebhookUrl, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ file: relFile, loc: body.loc }),
+                  body: JSON.stringify({ file: relFile, loc: result.newLoc }),
                 }).catch(() => {});
               }
               sendJson(res, 200, {
                 ok: true,
                 updatedSource: result.updatedSource,
+                newHash: result.newHash,
+                newLoc: result.newLoc,
                 topLineDelta: result.topLineDelta,
                 afterLine: result.afterLine,
                 afterLineDelta: result.afterLineDelta,
+                sameLineEndCol: result.sameLineEndCol,
+                sameLineByteDelta: result.sameLineByteDelta,
               });
             } catch (err) {
               sendJson(res, 500, {

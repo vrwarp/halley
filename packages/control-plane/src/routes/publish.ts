@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import type {
   PublishProgressPayload,
   PublishState,
@@ -5,7 +6,7 @@ import type {
   VerificationCheckResult,
 } from '@halley/shared';
 import type { HalleyConfig } from '../config.js';
-import type { ControlPlaneDb, SessionRecord } from '../db.js';
+import type { ControlPlaneDb, PublishRunRecord, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
 import { GitHubApiError, type GitHubService } from '../github/client.js';
 
@@ -29,6 +30,13 @@ const DEFAULT_DEPLOY_POLL_OPTIONS: Required<DeployPollOptions> = {
   ciRegistrationGraceMs: 15_000,
 };
 
+const PRE_PR_STEPS = new Set<PublishState>([
+  'rebasing',
+  'resolving_conflicts',
+  'verifying',
+  'pushing_pr',
+]);
+
 export class PublishService {
   private activePublishes = new Set<string>();
   private activeDeployChecks = new Set<string>();
@@ -46,6 +54,10 @@ export class PublishService {
     this.deployPollOptions = { ...DEFAULT_DEPLOY_POLL_OPTIONS, ...deployPollOptions };
   }
 
+  isPublishActive(sessionId: string): boolean {
+    return this.activePublishes.has(sessionId) || this.activeDeployChecks.has(sessionId);
+  }
+
   private setState(
     sessionId: string,
     state: PublishState,
@@ -60,20 +72,215 @@ export class PublishService {
     this.broadcastPublish(sessionId, { state, ...extra });
   }
 
+  private async rollbackExcludedPathsIfNeeded(
+    runnerUrl: string | null,
+    preExcludeSha: string | null,
+  ): Promise<void> {
+    if (!runnerUrl || !preExcludeSha) return;
+    await fetch(`${runnerUrl}/internal/git/restore-sha`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sha: preExcludeSha }),
+      signal: AbortSignal.timeout(15_000),
+    }).catch(() => {});
+  }
+
+  /**
+   * Resumes in-flight `waiting_ci` and `deploying_pages` runs after a `control-plane` restart
+   * instead of wiping active PR/deploy pipelines back to `idle`.
+   */
+  resumeIncompletePublishes(): void {
+    const activeRuns = this.db.listActivePublishRuns();
+    const handledIds = new Set<string>();
+
+    for (const run of activeRuns) {
+      handledIds.add(run.session_id);
+      const session = this.db.getSession(run.session_id);
+      if (!session) {
+        this.db.deletePublishRun(run.session_id);
+        continue;
+      }
+
+      if (session.status === 'published') {
+        this.db.deletePublishRun(run.session_id);
+        continue;
+      }
+
+      if (
+        (run.step === 'deploying_pages' || session.status === 'merged') &&
+        (run.merged_sha || session.merged_sha) &&
+        (run.pr_number || session.pr_number) &&
+        (run.pr_url || session.pr_url)
+      ) {
+        const mergeSha = (run.merged_sha || session.merged_sha)!;
+        const prNumber = (run.pr_number || session.pr_number)!;
+        const prUrl = (run.pr_url || session.pr_url)!;
+        void this.waitForPagesDeploy(session.id, mergeSha, prNumber, prUrl, { initialDelayMs: 0 });
+        continue;
+      }
+
+      if (run.step === 'waiting_ci' && run.pr_number && run.pr_url) {
+        void this.resumeWaitingCiRun(session, run);
+        continue;
+      }
+
+      // Interrupted before a PR was created: clean up run record and reset publish_state to idle
+      this.db.deletePublishRun(session.id);
+      if (session.status !== 'merged') {
+        this.db.updateSession(session.id, { publish_state: 'idle', publish_error: null });
+      }
+    }
+
+    // Reconcile any legacy sessions without a publish_runs row
+    for (const s of this.db.listSessions()) {
+      if (handledIds.has(s.id)) continue;
+      if (
+        s.status === 'merged' &&
+        s.publish_state === 'deploying_pages' &&
+        s.merged_sha &&
+        s.pr_number &&
+        s.pr_url
+      ) {
+        void this.waitForPagesDeploy(s.id, s.merged_sha, s.pr_number, s.pr_url, {
+          initialDelayMs: 0,
+        });
+      } else if (
+        PRE_PR_STEPS.has(s.publish_state) &&
+        s.status !== 'merged' &&
+        s.status !== 'published'
+      ) {
+        this.db.updateSession(s.id, { publish_state: 'idle', publish_error: null });
+      }
+    }
+  }
+
+  private async resumeWaitingCiRun(session: SessionRecord, run: PublishRunRecord): Promise<void> {
+    if (this.activePublishes.has(session.id)) return;
+    this.activePublishes.add(session.id);
+    try {
+      const actor = this.db.getUserById(run.actor_user_id) ?? {
+        id: session.owner_user_id,
+        email: session.owner_email || 'editor@example.com',
+        name: session.owner_name || 'Editor',
+        picture: null,
+        isAdmin: false,
+        persona: 'non-technical' as const,
+      };
+      const prTitle = (run.title || session.title || 'Website update').trim();
+      const prBody = [
+        run.summary?.trim() || `Updates from Halley editing session **${session.title}**.`,
+        '',
+        `Edited by ${actor.name} (${actor.email}) via Halley.`,
+      ].join('\n');
+      const commitMsg = `${prBody}\n\nCo-authored-by: ${actor.name} <${actor.email}>`;
+
+      const mergedSha = await this.waitForCiAndMerge({
+        session,
+        prNumber: run.pr_number!,
+        prUrl: run.pr_url!,
+        headSha: run.local_head_sha || '',
+        commitTitle: prTitle,
+        commitMessage: commitMsg,
+        nativeAutoMerge: run.native_auto_merge === 1,
+      });
+      if (!mergedSha) return;
+
+      await this.finalizeMergeAndAwaitDeploy(
+        session,
+        session.runner_url,
+        mergedSha,
+        run.pr_number!,
+        run.pr_url!,
+        run.run_id,
+        actor.id,
+      );
+    } catch (err) {
+      this.db.deletePublishRun(session.id);
+      this.setState(session.id, 'failed_ci', {
+        prNumber: run.pr_number,
+        prUrl: run.pr_url,
+        error: err instanceof Error ? err.message : 'Failed resuming CI check after restart',
+      });
+    } finally {
+      this.activePublishes.delete(session.id);
+    }
+  }
+
+  private async finalizeMergeAndAwaitDeploy(
+    session: SessionRecord,
+    runnerUrl: string | null,
+    mergedSha: string,
+    prNumber: number,
+    prUrl: string,
+    runId: string,
+    actorUserId: string,
+  ): Promise<void> {
+    const mergedAt = new Date().toISOString();
+    this.db.updateSession(session.id, {
+      status: 'merged',
+      merged_sha: mergedSha,
+      merged_at: mergedAt,
+    });
+    this.driver.notifyMirrorUpdated?.(session.base_branch);
+    if (runnerUrl) {
+      await fetch(`${runnerUrl}/internal/read-only`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ readOnly: true }),
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => {});
+    }
+    await this.archiveSessionDeterministically(
+      session.id,
+      runnerUrl,
+      session.base_branch,
+      mergedSha,
+      prUrl,
+    );
+
+    this.db.upsertPublishRun({
+      sessionId: session.id,
+      runId,
+      actorUserId,
+      step: 'deploying_pages',
+      prNumber,
+      prUrl,
+      mergedSha,
+    });
+    this.setState(session.id, 'deploying_pages', { prNumber, prUrl });
+    this.onSessionMetaUpdated?.(session.id);
+
+    await this.waitForPagesDeploy(session.id, mergedSha, prNumber, prUrl);
+  }
+
   async publish(
     sessionInput: SessionRecord,
     actor: UserDto,
-    input: { title?: string; summary?: string },
+    input: { title?: string; summary?: string; excludePaths?: string[] },
   ): Promise<void> {
     if (this.activePublishes.has(sessionInput.id)) {
       return;
     }
     this.activePublishes.add(sessionInput.id);
 
+    const runId = crypto.randomUUID();
+    let runnerUrl: string | null = null;
+    let preExcludeSha: string | null = null;
+
+    this.db.upsertPublishRun({
+      sessionId: sessionInput.id,
+      runId,
+      actorUserId: actor.id,
+      title: input.title ?? null,
+      summary: input.summary ?? null,
+      excludePathsJson: input.excludePaths?.length ? JSON.stringify(input.excludePaths) : null,
+      step: 'rebasing',
+    });
+
     try {
       let session = this.db.getSession(sessionInput.id) ?? sessionInput;
       const endpoint = await this.driver.ensureRunning(session);
-      const runnerUrl = endpoint.runnerUrl;
+      runnerUrl = endpoint.runnerUrl;
 
       // 0. Commit any pending inline/working-tree edits so HEAD has the exact draft state
       const ckptRes = await fetch(`${runnerUrl}/internal/git/checkpoint`, {
@@ -93,16 +300,58 @@ export class PublishService {
         }
       }
 
-      // 1. Q21: Sync with latest base branch FIRST so we never run verification twice when main moved
-      //    cleanly and we catch overlapping conflicts immediately before spending build time.
+      // 0b. Transactionally exclude unchecked paths (restored automatically if pre-push checks fail)
+      if (input.excludePaths && input.excludePaths.length > 0) {
+        const exclRes = await fetch(`${runnerUrl}/internal/git/exclude-paths`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            paths: input.excludePaths,
+            baseRef: `origin/${session.base_branch}`,
+          }),
+          signal: AbortSignal.timeout(25_000),
+        });
+        if (!exclRes.ok) {
+          const errBody = (await exclRes.json().catch(() => ({}))) as { error?: string };
+          throw new Error(errBody.error || 'Failed to apply excluded file selection');
+        }
+        const exclData = (await exclRes.json()) as {
+          preExcludeSha?: string | null;
+          changedFilesCount?: number;
+        };
+        preExcludeSha = exclData.preExcludeSha ?? null;
+        if (typeof exclData.changedFilesCount === 'number') {
+          this.db.updateSession(session.id, { changed_files_count: exclData.changedFilesCount });
+        }
+        if (session.kind === 'revert') {
+          const converted = this.db.convertRevertSession(session.id);
+          if (converted) {
+            session = converted;
+            this.onSessionMetaUpdated?.(session.id);
+          }
+        }
+        this.db.upsertPublishRun({
+          sessionId: session.id,
+          runId,
+          actorUserId: actor.id,
+          step: 'rebasing',
+          preExcludeSha,
+        });
+      }
+
+      // 1. Sync with latest base branch FIRST (fail closed if fetch fails!)
       this.setState(session.id, 'rebasing');
       const ghToken = await this.github.getAccessToken().catch(() => '');
       let fetchedByDriver = false;
-      if (ghToken) {
-        fetchedByDriver = await this.driver
-          .fetchIntoSession(session, ghToken)
-          .then(() => true)
-          .catch(() => false);
+      if (ghToken || this.config.devLocalRepo) {
+        try {
+          await this.driver.fetchIntoSession(session, ghToken);
+          fetchedByDriver = true;
+        } catch (fetchErr) {
+          throw new Error(
+            `Could not sync latest changes from GitHub before publishing: ${fetchErr instanceof Error ? fetchErr.message : String(fetchErr)}`,
+          );
+        }
       }
 
       const syncRes = await fetch(`${runnerUrl}/internal/sync/start`, {
@@ -129,7 +378,8 @@ export class PublishService {
       };
 
       if (syncData.heldForUser) {
-        // Prepare full conflict resolution / decision cards for the Publish modal
+        await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha);
+        preExcludeSha = null;
         const fullSyncRes = await fetch(`${runnerUrl}/internal/sync/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -159,6 +409,7 @@ export class PublishService {
             });
           }
         }
+        this.db.deletePublishRun(session.id);
         this.setState(session.id, 'failed_conflict', {
           error:
             'Someone else updated the same page while you were publishing. Please review the combined changes before publishing.',
@@ -177,6 +428,9 @@ export class PublishService {
         syncData.review &&
         (syncData.review.status === 'ready_for_review' || syncData.review.status === 'needs_choices')
       ) {
+        await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha);
+        preExcludeSha = null;
+        this.db.deletePublishRun(session.id);
         this.setState(session.id, 'failed_conflict', {
           conflictedFiles: syncData.review.touchedUserFiles,
           error:
@@ -185,8 +439,13 @@ export class PublishService {
         return;
       }
 
-      // 2. Hard-gate verification checks ONCE on the synced tree (hits tree-SHA cache / coalesces
-      //    speculative build immediately when alreadyUpToDate).
+      // 2. Hard-gate verification checks ONCE on the synced tree (hits verify-sandbox / tree-SHA cache)
+      this.db.upsertPublishRun({
+        sessionId: session.id,
+        runId,
+        actorUserId: actor.id,
+        step: 'verifying',
+      });
       this.setState(session.id, 'verifying');
       const verifyRes = await fetch(`${runnerUrl}/internal/verify`, {
         method: 'POST',
@@ -199,7 +458,10 @@ export class PublishService {
         results: VerificationCheckResult[];
       };
       if (!verifyData.allPassed) {
+        await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha);
+        preExcludeSha = null;
         const failed = verifyData.results.filter((r) => !r.passed);
+        this.db.deletePublishRun(session.id);
         this.setState(session.id, 'failed_checks', {
           checks: verifyData.results,
           error: `Checks failed: ${failed.map((f) => f.name).join(', ')}`,
@@ -214,6 +476,9 @@ export class PublishService {
       );
       const protData = (await protRes.json()) as { clean: boolean; protectedFiles: string[] };
       if (!protData.clean) {
+        await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha);
+        preExcludeSha = null;
+        this.db.deletePublishRun(session.id);
         this.setState(session.id, 'failed_checks', {
           error: `Blocked: protected .github/** files were modified (${protData.protectedFiles.join(', ')}).`,
         });
@@ -221,11 +486,18 @@ export class PublishService {
       }
 
       // 4. Push branch & open/update PR
+      this.db.upsertPublishRun({
+        sessionId: session.id,
+        runId,
+        actorUserId: actor.id,
+        step: 'pushing_pr',
+      });
       this.setState(session.id, 'pushing_pr');
-      if (!ghToken) {
+      if (!ghToken && !this.config.devLocalRepo) {
         throw new Error('GitHub credentials are not configured for pushing');
       }
       await this.driver.pushSessionBranch(session, ghToken);
+      preExcludeSha = null; // Branch pushed cleanly; do not roll back exclude commit anymore
 
       const prTitle = (input.title || session.title || 'Website update').trim();
       if (prTitle && prTitle !== session.title) {
@@ -245,13 +517,29 @@ export class PublishService {
         body: prBody,
       });
 
+      const commitMsg = `${prBody}\n\nCo-authored-by: ${actor.name} <${actor.email}>`;
+      const nativeAutoMerge = await this.github.tryEnableNativeAutoMerge(
+        pr.nodeId,
+        prTitle,
+        commitMsg,
+      );
+
+      this.db.upsertPublishRun({
+        sessionId: session.id,
+        runId,
+        actorUserId: actor.id,
+        title: prTitle,
+        summary: input.summary ?? null,
+        step: 'waiting_ci',
+        localHeadSha: pr.headSha,
+        prNumber: pr.number,
+        prUrl: pr.url,
+        nativeAutoMerge,
+      });
       this.setState(session.id, 'waiting_ci', {
         prNumber: pr.number,
         prUrl: pr.url,
       });
-
-      const commitMsg = `${prBody}\n\nCo-authored-by: ${actor.name} <${actor.email}>`;
-      const nativeAutoMerge = await this.github.tryEnableNativeAutoMerge(pr.nodeId, prTitle);
 
       // 5. Watch CI & auto-merge (squash) when checks pass
       const mergedSha = await this.waitForCiAndMerge({
@@ -263,30 +551,24 @@ export class PublishService {
         commitMessage: commitMsg,
         nativeAutoMerge,
       });
-      if (!mergedSha) return;
+      if (!mergedSha) {
+        this.db.deletePublishRun(session.id);
+        return;
+      }
 
-      // 6. Freeze editing immediately in 'merged' state and archive transcript deterministically ($0 AI)
-      const mergedAt = new Date().toISOString();
-      this.db.updateSession(session.id, {
-        status: 'merged',
-        merged_sha: mergedSha,
-        merged_at: mergedAt,
-      });
-      await fetch(`${runnerUrl}/internal/read-only`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ readOnly: true }),
-        signal: AbortSignal.timeout(10_000),
-      }).catch(() => {});
-      await this.archiveSessionDeterministically(session.id, runnerUrl, session.base_branch, mergedSha, pr.url);
-
-      this.setState(session.id, 'deploying_pages', {
-        prNumber: pr.number,
-        prUrl: pr.url,
-      });
-
-      await this.waitForPagesDeploy(session.id, mergedSha, pr.number, pr.url);
+      // 6. Freeze editing immediately in 'merged' state and watch GitHub Pages deploy
+      await this.finalizeMergeAndAwaitDeploy(
+        session,
+        runnerUrl,
+        mergedSha,
+        pr.number,
+        pr.url,
+        runId,
+        actor.id,
+      );
     } catch (err) {
+      await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha);
+      this.db.deletePublishRun(sessionInput.id);
       const rawMsg = err instanceof Error ? err.message : 'Publish failed unexpectedly';
       const crashInfo = this.driver.getCrashInfo?.(sessionInput.id);
       const isRunnerDisconnect =
@@ -371,6 +653,15 @@ export class PublishService {
     if (this.activeDeployChecks.has(session.id)) {
       return;
     }
+    this.db.upsertPublishRun({
+      sessionId: session.id,
+      runId: crypto.randomUUID(),
+      actorUserId: session.owner_user_id,
+      step: 'deploying_pages',
+      prNumber: session.pr_number,
+      prUrl: session.pr_url,
+      mergedSha: session.merged_sha,
+    });
     this.setState(session.id, 'deploying_pages', {
       prNumber: session.pr_number,
       prUrl: session.pr_url,
@@ -409,7 +700,17 @@ export class PublishService {
         return null;
       }
 
-      const ci = await this.github.checkCommitStatus(prState.headSha);
+      if (opts.headSha && prState.headSha && prState.headSha !== opts.headSha) {
+        this.setState(opts.session.id, 'failed_ci', {
+          prNumber: opts.prNumber,
+          prUrl: opts.prUrl,
+          error: `Pull Request branch head changed unexpectedly (${prState.headSha.slice(0, 7)} vs verified ${opts.headSha.slice(0, 7)}). Please click Publish again.`,
+        });
+        return null;
+      }
+
+      const targetSha = opts.headSha || prState.headSha;
+      const ci = await this.github.checkCommitStatus(targetSha);
       if (ci.state === 'failed') {
         this.setState(opts.session.id, 'failed_ci', {
           prNumber: opts.prNumber,
@@ -437,6 +738,7 @@ export class PublishService {
             prNumber: opts.prNumber,
             commitTitle: opts.commitTitle,
             commitMessage: opts.commitMessage,
+            headSha: targetSha || undefined,
           });
         } catch {
           // GitHub may still be settling branch protection; retry next poll
@@ -460,6 +762,7 @@ export class PublishService {
     prUrl: string,
     deployUrl?: string,
   ): Promise<void> {
+    this.db.deletePublishRun(sessionId);
     const session = this.db.getSession(sessionId);
     this.db.updateSession(sessionId, {
       status: 'published',
@@ -482,6 +785,7 @@ export class PublishService {
       prUrl,
       ...(deployUrl ? { deployUrl } : {}),
     });
+    this.onSessionMetaUpdated?.(sessionId);
   }
 
   private failDeploy(
@@ -491,6 +795,7 @@ export class PublishService {
     error: string,
     deployUrl?: string,
   ): void {
+    this.db.deletePublishRun(sessionId);
     this.db.updateSession(sessionId, { status: 'merged' });
     this.setState(sessionId, 'failed_deploy', {
       prNumber,
@@ -498,6 +803,7 @@ export class PublishService {
       error,
       ...(deployUrl ? { deployUrl } : {}),
     });
+    this.onSessionMetaUpdated?.(sessionId);
   }
 
   private async waitForPagesDeploy(

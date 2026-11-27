@@ -6,6 +6,7 @@
 services:
   control-plane:
     image: vrwarp/halley-control-plane:${HALLEY_TAG:-latest}
+    mem_limit: ${CONTROL_PLANE_MEMORY_LIMIT:-3g}
     ports:
       - "${HOST_PORT:-3000}:3000"
     env_file:
@@ -23,7 +24,7 @@ services:
 
   workspaces:
     image: vrwarp/halley-workspace:${HALLEY_TAG:-latest}
-    mem_limit: ${WORKSPACES_MEMORY_LIMIT:-6g}
+    mem_limit: ${WORKSPACES_MEMORY_LIMIT:-8g}
     environment:
       - WORKSPACES_DIR=/workspaces
       - SUPERVISOR_PORT=4000

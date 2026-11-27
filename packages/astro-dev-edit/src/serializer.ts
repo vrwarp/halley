@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { parse } from '@astrojs/compiler';
 import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
-import { inspectAstroElement } from './ast-classifier.js';
+import { inspectAstroElement, parseLoc, sha256 } from './ast-classifier.js';
 import type { AsyncFileLock } from './file-lock.js';
 
 type Node = DefaultTreeAdapterMap['node'];
@@ -17,6 +18,46 @@ export interface SerializeOptions {
 export interface SerializeResult {
   astroSource: string;
   needsUrlImport: boolean;
+}
+
+const SAFE_PASSTHROUGH_ATTRS = new Set([
+  'id',
+  'class',
+  'style',
+  'title',
+  'lang',
+  'dir',
+  'download',
+  'hreflang',
+  'type',
+]);
+
+function isSafePassthroughAttr(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower.startsWith('data-astro-source-')) return false;
+  if (lower === 'contenteditable' || lower === 'spellcheck') return false;
+  if (lower.startsWith('on')) return false;
+  if (SAFE_PASSTHROUGH_ATTRS.has(lower)) return true;
+  if (lower.startsWith('aria-') || lower.startsWith('data-')) return true;
+  return false;
+}
+
+function serializePassthroughAttrs(
+  el: Element,
+  skipLowerNames: Set<string> = new Set(),
+): string[] {
+  const out: string[] = [];
+  for (const attr of el.attrs) {
+    const lower = attr.name.toLowerCase();
+    if (skipLowerNames.has(lower)) continue;
+    if (!isSafePassthroughAttr(lower)) continue;
+    if (attr.value === '') {
+      out.push(`${lower}=""`);
+    } else {
+      out.push(`${lower}="${escapeAttr(attr.value)}"`);
+    }
+  }
+  return out;
 }
 
 function escapeText(text: string): string {
@@ -48,7 +89,12 @@ function normalizeHref(rawHref: string, previewBase: string, originalBase: strin
   if (!trimmed) return { kind: 'invalid', value: '' };
 
   const lower = trimmed.toLowerCase();
-  if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:')) {
+  if (
+    lower.startsWith('javascript:') ||
+    lower.startsWith('data:') ||
+    lower.startsWith('vbscript:') ||
+    lower.startsWith('file:')
+  ) {
     return { kind: 'invalid', value: '' };
   }
 
@@ -74,10 +120,13 @@ function normalizeHref(rawHref: string, previewBase: string, originalBase: strin
   if (
     originalBase !== '/' &&
     candidate.startsWith(originalBase) &&
-    (candidate.length === originalBase.length || candidate[originalBase.length] === '/')
+    (candidate.length === originalBase.length ||
+      candidate[originalBase.length] === '/' ||
+      candidate[originalBase.length] === '?' ||
+      candidate[originalBase.length] === '#')
   ) {
     const rest = candidate.slice(originalBase.length);
-    candidate = rest.startsWith('/') ? rest : `/${rest}`;
+    candidate = !rest || rest.startsWith('/') ? rest || '/' : `/${rest}`;
     return { kind: 'internal', value: candidate || '/' };
   }
 
@@ -90,7 +139,9 @@ function normalizeHref(rawHref: string, previewBase: string, originalBase: strin
     lower.startsWith('http://') ||
     lower.startsWith('mailto:') ||
     lower.startsWith('tel:') ||
-    candidate.startsWith('#')
+    candidate.startsWith('#') ||
+    candidate.startsWith('?') ||
+    /^(?:\.\.?\/|[a-zA-Z0-9][a-zA-Z0-9._~/-]*)(?:[?#].*)?$/.test(candidate)
   ) {
     return { kind: 'external', value: candidate };
   }
@@ -126,22 +177,24 @@ export function serializeHtmlToAstro(
       }
 
       if (tag === 'strong' || tag === 'b') {
+        const attrs = serializePassthroughAttrs(el);
         const inner = serializeChildren(el.childNodes);
-        out += `<strong>${inner}</strong>`;
+        out += `<strong${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</strong>`;
         continue;
       }
 
       if (tag === 'em' || tag === 'i') {
+        const attrs = serializePassthroughAttrs(el);
         const inner = serializeChildren(el.childNodes);
-        out += `<em>${inner}</em>`;
+        out += `<em${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</em>`;
         continue;
       }
 
       if (tag === 'span') {
-        const cls = getAttr(el, 'class');
+        const attrs = serializePassthroughAttrs(el);
         const inner = serializeChildren(el.childNodes);
-        if (cls) {
-          out += `<span class="${escapeAttr(cls)}">${inner}</span>`;
+        if (attrs.length > 0) {
+          out += `<span ${attrs.join(' ')}>${inner}</span>`;
         } else {
           out += inner;
         }
@@ -158,17 +211,20 @@ export function serializeHtmlToAstro(
         }
         const target = getAttr(el, 'target');
         const rel = getAttr(el, 'rel');
-        const cls = getAttr(el, 'class');
-        const extraAttrs: string[] = [];
-        if (cls) extraAttrs.push(`class="${escapeAttr(cls)}"`);
+        const extraAttrs = serializePassthroughAttrs(el, new Set(['href', 'target', 'rel']));
         if (target === '_blank') {
           extraAttrs.push('target="_blank"');
           extraAttrs.push(`rel="${escapeAttr(rel || 'noopener noreferrer')}"`);
+        } else if (target) {
+          extraAttrs.push(`target="${escapeAttr(target)}"`);
+          if (rel) extraAttrs.push(`rel="${escapeAttr(rel)}"`);
+        } else if (rel) {
+          extraAttrs.push(`rel="${escapeAttr(rel)}"`);
         }
 
         if (norm.kind === 'internal' && options.hasUrlHelperFile) {
           needsUrlImport = true;
-          const safePath = norm.value.replace(/'/g, "\\'");
+          const safePath = norm.value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
           const attrsStr = extraAttrs.length ? ' ' + extraAttrs.join(' ') : '';
           out += `<a href={url('${safePath}')}${attrsStr}>${inner}</a>`;
         } else {
@@ -201,23 +257,61 @@ export function serializeHtmlToAstro(
   return { astroSource, needsUrlImport };
 }
 
-function injectUrlImportIfMissing(
+const URL_HELPER_CANDIDATES = [
+  ['src', 'lib', 'url.ts'],
+  ['src', 'lib', 'url.js'],
+  ['src', 'utils', 'url.ts'],
+  ['src', 'utils', 'url.js'],
+  ['src', 'helpers', 'url.ts'],
+];
+
+async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
+  for (const parts of URL_HELPER_CANDIDATES) {
+    const candidate = path.join(repoRoot, ...parts);
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
+async function injectUrlImportIfMissing(
   source: string,
   filePath: string,
-  repoRoot: string,
-): string {
+  urlHelperAbs: string,
+): Promise<string> {
   if (/\bimport\s+\{[^}]*\burl\b[^}]*\}\s+from\s+['"][^'"]+['"]/.test(source)) {
     return source;
   }
-  const urlHelperAbs = path.join(repoRoot, 'src', 'lib', 'url.ts');
   let relImport = path.relative(path.dirname(filePath), urlHelperAbs).split(path.sep).join('/');
-  relImport = relImport.replace(/\.ts$/, '');
+  relImport = relImport.replace(/\.(?:ts|js)$/, '');
   if (!relImport.startsWith('.')) relImport = `./${relImport}`;
   const importLine = `import { url } from '${relImport}';\n`;
 
-  if (source.startsWith('---\n') || source.startsWith('---\r\n')) {
-    const firstNewline = source.indexOf('\n');
-    return source.slice(0, firstNewline + 1) + importLine + source.slice(firstNewline + 1);
+  try {
+    const parsed = await parse(source, { position: true });
+    const children = (parsed.ast as { children?: Array<{ type: string; position?: { start?: { offset?: number } } }> })
+      .children ?? [];
+    const fmNode = children.find((c) => c.type === 'frontmatter');
+    if (fmNode?.position?.start?.offset !== undefined) {
+      const buf = Buffer.from(source, 'utf8');
+      const fmStartChar = buf.subarray(0, fmNode.position.start.offset).toString('utf8').length;
+      const firstNewline = source.indexOf('\n', fmStartChar);
+      if (firstNewline !== -1) {
+        return source.slice(0, firstNewline + 1) + importLine + source.slice(firstNewline + 1);
+      }
+    }
+  } catch {
+    // Fall back to safe frontmatter fence detection below
+  }
+
+  const trimmedFenceMatch = /^(\s*---[ \t]*\r?\n)/.exec(source);
+  if (trimmedFenceMatch) {
+    const insertAt = trimmedFenceMatch[1]!.length;
+    return source.slice(0, insertAt) + importLine + source.slice(insertAt);
   }
   return `---\n${importLine}---\n${source}`;
 }
@@ -238,9 +332,12 @@ export type PatchStaticSpanResult =
       ok: true;
       updatedSource: string;
       newHash: string;
+      newLoc: string;
       topLineDelta: number;
       afterLine: number;
       afterLineDelta: number;
+      sameLineEndCol: number;
+      sameLineByteDelta: number;
     }
   | { ok: false; code: 400 | 404 | 409 | 422; error: string };
 
@@ -250,6 +347,12 @@ function countNewlines(text: string): number {
     if (text.charCodeAt(i) === 10) n++;
   }
   return n;
+}
+
+function byteColumnInLastLine(text: string): number {
+  const lastNl = text.lastIndexOf('\n');
+  const tail = lastNl === -1 ? text : text.slice(lastNl + 1);
+  return Buffer.byteLength(tail, 'utf8') + 1;
 }
 
 export async function patchStaticSpan(
@@ -263,13 +366,8 @@ export async function patchStaticSpan(
     return { ok: false, code: 400, error: '.github/** is protected' };
   }
 
-  let hasUrlHelperFile = false;
-  try {
-    await fs.access(path.join(input.repoRoot, 'src', 'lib', 'url.ts'));
-    hasUrlHelperFile = true;
-  } catch {
-    hasUrlHelperFile = false;
-  }
+  const urlHelperAbs = await resolveUrlHelperAbs(input.repoRoot);
+  const hasUrlHelperFile = Boolean(urlHelperAbs);
 
   return input.fileLock.withLock(input.relFile, async () => {
     let source: string;
@@ -301,21 +399,38 @@ export async function patchStaticSpan(
     });
 
     const originalInner = source.slice(inspected.innerStartOffset, inspected.innerEndOffset);
-    const afterLine = countNewlines(source.slice(0, inspected.innerEndOffset)) + 1;
+    const prefixBeforeEnd = source.slice(0, inspected.innerEndOffset);
+    const afterLine = countNewlines(prefixBeforeEnd) + 1;
+    const sameLineEndCol = byteColumnInLastLine(prefixBeforeEnd);
     const afterLineDelta = countNewlines(astroSource) - countNewlines(originalInner);
 
-    // Preserve leading/trailing whitespace if the original template had formatting indentation
+    let sameLineByteDelta = 0;
+    if (afterLineDelta === 0 && countNewlines(astroSource) === 0 && countNewlines(originalInner) === 0) {
+      sameLineByteDelta = Buffer.byteLength(astroSource, 'utf8') - Buffer.byteLength(originalInner, 'utf8');
+    } else {
+      const newEndCol = byteColumnInLastLine(source.slice(0, inspected.innerStartOffset) + astroSource);
+      sameLineByteDelta = newEndCol - sameLineEndCol;
+    }
+
     let patched =
       source.slice(0, inspected.innerStartOffset) +
       astroSource +
       source.slice(inspected.innerEndOffset);
 
     let topLineDelta = 0;
-    if (needsUrlImport) {
+    if (needsUrlImport && urlHelperAbs) {
       const beforeImportLines = countNewlines(patched);
-      patched = injectUrlImportIfMissing(patched, absPath, input.repoRoot);
+      patched = await injectUrlImportIfMissing(patched, absPath, urlHelperAbs);
       topLineDelta = countNewlines(patched) - beforeImportLines;
     }
+
+    const parsedInputLoc = parseLoc(input.loc);
+    const newLoc = parsedInputLoc
+      ? `${parsedInputLoc.line + topLineDelta}:${parsedInputLoc.column}`
+      : input.loc;
+
+    const reInspected = await inspectAstroElement(patched, newLoc).catch(() => null);
+    const newHash = reInspected?.snapshotHash || sha256(astroSource);
 
     const tmpPath = `${absPath}.halley-tmp-${process.pid}-${Date.now()}`;
     await fs.writeFile(tmpPath, patched, 'utf8');
@@ -324,10 +439,13 @@ export async function patchStaticSpan(
     return {
       ok: true,
       updatedSource: astroSource,
-      newHash: inspected.snapshotHash,
+      newHash,
+      newLoc,
       topLineDelta,
       afterLine,
       afterLineDelta,
+      sameLineEndCol,
+      sameLineByteDelta,
     };
   });
 }

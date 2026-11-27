@@ -18,7 +18,10 @@ const MAX_FULL_PAGE_HEIGHT = 3600;
 const MAX_REVIEW_CAPTURE_HEIGHT = 10_000;
 const REVIEW_IMAGE_QUALITY = 88;
 const DEFAULT_IDLE_TIMEOUT_MS = 60 * 60_000; // 1 hour
-const DEFAULT_MAX_CONCURRENCY = 3;
+const DEFAULT_MAX_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.HALLEY_SCREENSHOT_CONCURRENCY || 2) || 2,
+);
 const DEFAULT_SETTLE_WAIT_MS = 40;
 const DEFAULT_LIVE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const DEFAULT_LIVE_CACHE_TTL_MS = 10 * 60_000;
@@ -50,7 +53,7 @@ export interface ScreenshotServiceOptions {
   launchBrowser?: () => Promise<Browser>;
   /** Extra settle wait after load + font/image readiness (ms, default: 40). */
   settleWaitMs?: number;
-  /** Maximum concurrent browser pages across all captures (default: 3). */
+  /** Maximum concurrent browser pages across all captures (default: 2). */
   maxConcurrency?: number;
   /** Byte budget for LRU-cached Live site compressed captures (default: 24 MB). */
   liveCacheMaxBytes?: number;
@@ -197,14 +200,27 @@ export class ScreenshotService {
 
     if (!this.launchPromise) {
       let launchTimer: ReturnType<typeof setTimeout> | null = null;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        launchTimer = setTimeout(
-          () => reject(new Error('Timed out launching Chromium browser after 30s')),
-          30_000,
-        );
-      });
-      this.launchPromise = Promise.race([this.launchBrowser(), timeoutPromise])
+      let timedOut = false;
+      const rawLaunch = this.launchBrowser();
+      rawLaunch
         .then((b) => {
+          if (timedOut || this.closed) {
+            void b.close().catch(() => {});
+          }
+        })
+        .catch(() => {});
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        launchTimer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error('Timed out launching Chromium browser after 30s'));
+        }, 30_000);
+      });
+      this.launchPromise = Promise.race([rawLaunch, timeoutPromise])
+        .then((b) => {
+          if (this.closed) {
+            void b.close().catch(() => {});
+            throw new Error('ScreenshotService has been closed');
+          }
           this.browser = b;
           b.on('disconnected', () => {
             if (this.browser === b) {

@@ -8,6 +8,7 @@ import type {
   MergeReviewStateDto,
   PageRequestMetadata,
   PostMessageFromPreview,
+  PostMessageToPreview,
   PreviewMode,
   PreviewRect,
   PublishProgressPayload,
@@ -18,6 +19,7 @@ import type {
   UserDto,
 } from '@halley/shared';
 import {
+  AlertTriangle,
   ArrowLeft,
   Bug,
   CheckCircle2,
@@ -265,6 +267,16 @@ export function EditorPage({
     return () => mq.removeEventListener('change', onChange);
   }, []);
 
+  const [astroReady, setAstroReady] = useState(false);
+
+  const postToPreview = (payload: PostMessageToPreview) => {
+    try {
+      iframeRef.current?.contentWindow?.postMessage(payload, window.location.origin);
+    } catch {
+      // Cross-origin frame navigated externally; ignore
+    }
+  };
+
   const reloadPreview = (force = false) => {
     const now = Date.now();
     if (!force) {
@@ -273,12 +285,57 @@ export function EditorPage({
       if (now - lastPreviewReloadAtRef.current < 1200) return;
     }
     lastPreviewReloadAtRef.current = now;
-    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload', force }, '*');
+    const frame = iframeRef.current;
+    if (!frame) return;
+    if (force && session) {
+      try {
+        const href = frame.contentWindow?.location?.href;
+        if (!href || !href.includes(`/p/${session.id}`)) {
+          const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
+          const clean = currentRouteRef.current.startsWith('/')
+            ? currentRouteRef.current
+            : `/${currentRouteRef.current}`;
+          frame.src = `/p/${session.id}${baseSuffixVal}${clean}`;
+          return;
+        }
+      } catch {
+        // Cross-origin frame navigated to external link in Browse mode: reset src back to preview!
+        const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
+        const clean = currentRouteRef.current.startsWith('/')
+          ? currentRouteRef.current
+          : `/${currentRouteRef.current}`;
+        frame.src = `/p/${session.id}${baseSuffixVal}${clean}`;
+        return;
+      }
+    }
+    postToPreview({ type: 'halley:reload', force });
+  };
+
+  const clearStaleFailedPublish = () => {
+    setPublishProgress((prev) => {
+      if (!prev) return prev;
+      if (['failed_checks', 'failed_conflict', 'failed_ci'].includes(prev.state)) {
+        return { state: 'idle' };
+      }
+      return prev;
+    });
+    setSession((prev) => {
+      if (!prev) return prev;
+      if (['failed_checks', 'failed_conflict', 'failed_ci'].includes(prev.publishState)) {
+        return { ...prev, publishState: 'idle', publishError: null };
+      }
+      return prev;
+    });
   };
 
   const loadSessionMeta = async (): Promise<Array<{ route: string; label: string; unlisted?: boolean }> | null> => {
     const res = await api.getSession(sessionId);
     setSession(res.session);
+    if (res.session.astroReady !== undefined) {
+      setAstroReady(Boolean(res.session.astroReady));
+    } else if (res.session.status === 'running') {
+      setAstroReady(true);
+    }
     if (res.session.bootProgress) {
       setBootProgress(res.session.bootProgress);
       if (res.session.bootProgress.crashLoop) {
@@ -309,6 +366,7 @@ export function EditorPage({
       ? await api.restartSession(sessionId)
       : await api.wakeSession(sessionId);
     setSession(woken);
+    if (woken.astroReady !== undefined) setAstroReady(Boolean(woken.astroReady));
     if (woken.bootProgress) setBootProgress(woken.bootProgress);
     setWsReconnectNonce((n) => n + 1);
   };
@@ -321,6 +379,7 @@ export function EditorPage({
   useEffect(() => {
     wakeRequestedRef.current = false;
     crashLoopHaltedRef.current = false;
+    setAstroReady(false);
     setBootProgress(null);
     setPreviewPaused({ paused: false });
     void loadSessionMeta();
@@ -344,21 +403,33 @@ export function EditorPage({
     if (!session) return;
     if (session.status === 'sleeping' && !wakeRequestedRef.current) {
       wakeRequestedRef.current = true;
+      let retryTimer: ReturnType<typeof setTimeout> | null = null;
       void api
         .wakeSession(sessionId)
         .then(({ session: woken }) => {
           setSession(woken);
+          if (woken.astroReady !== undefined) setAstroReady(Boolean(woken.astroReady));
           if (woken.bootProgress) setBootProgress(woken.bootProgress);
         })
-        .catch(() => {});
-      return;
+        .catch(() => {
+          retryTimer = setTimeout(() => {
+            wakeRequestedRef.current = false;
+            void loadSessionMeta();
+          }, 2500);
+        });
+      return () => {
+        if (retryTimer) clearTimeout(retryTimer);
+      };
     }
-    if (session.status !== 'starting') return;
+    const waitingForAstro =
+      session.status === 'starting' ||
+      (session.status === 'running' && session.astroReady === false && !astroReady);
+    if (!waitingForAstro) return;
     const timer = setInterval(() => {
       void loadSessionMeta();
     }, 1500);
     return () => clearInterval(timer);
-  }, [sessionId, session?.status]);
+  }, [sessionId, session?.status, session?.astroReady, astroReady]);
 
   // Q8 / Q12: Safe-moment auto-sync & proactive upstream/co-editor banner
   const handleManualSync = async () => {
@@ -455,11 +526,28 @@ export function EditorPage({
           if (msg.progress.crashLoop) {
             crashLoopHaltedRef.current = true;
           }
+          if (msg.progress.stage === 'ready') {
+            setAstroReady(true);
+          }
           if (
             (msg.progress.stage === 'ready' && sessionStatusRef.current !== 'running') ||
             (msg.progress.stage === 'error' && sessionStatusRef.current !== 'error')
           ) {
             void loadSessionMeta();
+          }
+        } else if (msg.type === 'session_state_sync') {
+          setAstroReady(msg.astroReady);
+          setPreviewPaused({ paused: msg.previewPaused, reason: msg.previewPauseReason });
+          postToPreview({
+            type: 'halley:lock',
+            locked: msg.workspaceLocked,
+            reason: msg.lockedFile,
+          });
+          if (msg.publishProgress) {
+            setPublishProgress(msg.publishProgress);
+          }
+          if (msg.mergeReview) {
+            setSyncReview(msg.mergeReview);
           }
         } else if (msg.type === 'preview_paused') {
           setPreviewPaused({ paused: msg.paused, reason: msg.reason });
@@ -467,13 +555,11 @@ export function EditorPage({
           setEntries(msg.entries);
           setLive(msg.live);
         } else if (msg.type === 'workspace_lock') {
-          iframeRef.current?.contentWindow?.postMessage(
-            { type: 'halley:lock', locked: msg.locked, reason: msg.file },
-            '*',
-          );
+          postToPreview({ type: 'halley:lock', locked: msg.locked, reason: msg.file });
         } else if (msg.type === 'checkpoint_created') {
           setChangedCount(msg.changedFilesCount);
           setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
+          clearStaleFailedPublish();
           if (!msg.checkpoint.summary.startsWith('Inline edit in ')) {
             reloadPreview();
           }
@@ -484,7 +570,7 @@ export function EditorPage({
           void loadSessionMeta();
         } else if (msg.type === 'publish_state') {
           setPublishProgress(msg.payload);
-          if (msg.payload.state === 'published') {
+          if (msg.payload.state === 'published' || msg.payload.state === 'deploying_pages') {
             void loadSessionMeta();
           }
         } else if (msg.type === 'spend_status') {
@@ -497,15 +583,12 @@ export function EditorPage({
         } else if (msg.type === 'page_request_state') {
           const pr = msg.pageRequest;
           setPageRequestsMap((prev) => ({ ...prev, [pr.pageRequestId]: pr }));
-          iframeRef.current?.contentWindow?.postMessage(
-            {
-              type: 'halley:page-progress',
-              route: pr.route,
-              status: pr.status,
-              message: pageStatusText(pr.status),
-            },
-            '*',
-          );
+          postToPreview({
+            type: 'halley:page-progress',
+            route: pr.route,
+            status: pr.status,
+            message: pageStatusText(pr.status),
+          });
           if (msg.autoNavigate) {
             navigatePreviewRef.current(pr.route);
             void api
@@ -697,31 +780,35 @@ export function EditorPage({
 
   useEffect(() => {
     if (!session) return;
-    iframeRef.current?.contentWindow?.postMessage(
-      { type: 'halley:set-mode', mode, readOnly: !session.canEdit, persona, touchLayout: isMobile },
-      '*',
-    );
+    postToPreview({
+      type: 'halley:set-mode',
+      mode,
+      readOnly: !session.canEdit,
+      persona,
+      touchLayout: isMobile,
+    });
   }, [mode, session?.canEdit, persona, isMobile]);
 
   // Numbered markers in the preview for attached elements on the *current* route
-  // (keeps global chip numbers consistent even across multi-page selections).
+  // (keeps global element group numbers sequential without skipping when multiple phrases share an element).
   const pinsRef = useRef<Array<{ key: string; n: number }>>([]);
   useEffect(() => {
+    const uniqueElements = [...new Set(chips.map((x) => elementKey(x)))];
     const seen = new Set<string>();
     const pins: Array<{ key: string; n: number }> = [];
-    chips.forEach((c, i) => {
-      if (c.route !== currentRoute) return;
+    for (const c of chips) {
+      if (c.route !== currentRoute) continue;
       const key = elementKey(c);
-      if (seen.has(key)) return;
+      if (seen.has(key)) continue;
       seen.add(key);
-      pins.push({ key, n: i + 1 });
-    });
+      pins.push({ key, n: uniqueElements.indexOf(key) + 1 });
+    }
     pinsRef.current = pins;
-    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:pins', pins }, '*');
+    postToPreview({ type: 'halley:pins', pins });
   }, [chips, currentRoute]);
 
   const highlightInPreview = (key: string | null) => {
-    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key }, '*');
+    postToPreview({ type: 'halley:highlight', key });
   };
 
   // Play the fly-to-chat animation once the (new or existing) chip is in the DOM.
@@ -745,6 +832,9 @@ export function EditorPage({
 
   useEffect(() => {
     const onMsg = (e: MessageEvent) => {
+      if (e.source !== iframeRef.current?.contentWindow || e.origin !== window.location.origin) {
+        return;
+      }
       const data = e.data as PostMessageFromPreview;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'halley:ready') {
@@ -756,24 +846,21 @@ export function EditorPage({
         setCurrentRoute(data.route);
         setPreviewSelectionActive(false);
         if (session) {
-          iframeRef.current?.contentWindow?.postMessage(
-            {
-              type: 'halley:set-mode',
-              mode,
-              readOnly: !session.canEdit,
-              persona,
-              touchLayout: isMobile,
-            },
-            '*',
-          );
+          postToPreview({
+            type: 'halley:set-mode',
+            mode,
+            readOnly: !session.canEdit,
+            persona,
+            touchLayout: isMobile,
+          });
         }
-        iframeRef.current?.contentWindow?.postMessage({ type: 'halley:pins', pins: pinsRef.current }, '*');
+        postToPreview({ type: 'halley:pins', pins: pinsRef.current });
         if (pendingHighlightKeyRef.current) {
           const k = pendingHighlightKeyRef.current;
           pendingHighlightKeyRef.current = null;
-          iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key: k }, '*');
+          postToPreview({ type: 'halley:highlight', key: k });
           setTimeout(() => {
-            iframeRef.current?.contentWindow?.postMessage({ type: 'halley:highlight', key: null }, '*');
+            postToPreview({ type: 'halley:highlight', key: null });
           }, 1400);
         }
       } else if (data.type === 'halley:route-changed') {
@@ -812,6 +899,7 @@ export function EditorPage({
         }
         setFlightNonce((n) => n + 1);
       } else if (data.type === 'halley:patch-saved') {
+        clearStaleFailedPublish();
         void loadSessionMeta();
       }
     };
@@ -855,15 +943,12 @@ export function EditorPage({
       .filter((pr) => pr.route === currentRoute)
       .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
     if (!active) return;
-    iframeRef.current?.contentWindow?.postMessage(
-      {
-        type: 'halley:page-progress',
-        route: active.route,
-        status: active.status,
-        message: pageStatusText(active.status),
-      },
-      '*',
-    );
+    postToPreview({
+      type: 'halley:page-progress',
+      route: active.route,
+      status: active.status,
+      message: pageStatusText(active.status),
+    });
   }, [currentRoute, pageRequestsMap]);
 
   const handleRetryPageRequest = async (pageRequestId: string) => {
@@ -945,16 +1030,18 @@ export function EditorPage({
     const target = checkpoints[1]?.sha || session.baseSha;
     if (!target) return;
     await api.undoCheckpoint(sessionId, target);
+    clearStaleFailedPublish();
     await loadSessionMeta();
-    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload' }, '*');
+    reloadPreview(true);
   };
 
   const handleRestoreCheckpoint = async (sha: string) => {
     if (!session?.canEdit) return;
     await api.undoCheckpoint(sessionId, sha);
     setShowHistory(false);
+    clearStaleFailedPublish();
     await loadSessionMeta();
-    iframeRef.current?.contentWindow?.postMessage({ type: 'halley:reload' }, '*');
+    reloadPreview(true);
   };
 
   if (!session) {
@@ -969,7 +1056,23 @@ export function EditorPage({
   const isWorkspaceBooting =
     session.status === 'starting' ||
     session.status === 'sleeping' ||
-    session.status === 'error';
+    session.status === 'error' ||
+    (session.status === 'running' && session.astroReady === false && !astroReady);
+  const effectivePublishState = publishProgress?.state ?? session.publishState;
+  const isBackgroundPublishRunning = [
+    'rebasing',
+    'resolving_conflicts',
+    'verifying',
+    'pushing_pr',
+    'waiting_ci',
+    'deploying_pages',
+  ].includes(effectivePublishState);
+  const isBackgroundPublishFailed = [
+    'failed_checks',
+    'failed_conflict',
+    'failed_ci',
+    'failed_deploy',
+  ].includes(effectivePublishState);
   const baseSuffix = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
   const previewSrc = `/p/${session.id}${baseSuffix}/`;
   const spendPct = Math.min(100, (spend.spentTodayUsd / Math.max(0.01, spend.dailyCapUsd + spend.extraGrantedUsd)) * 100);
@@ -1154,13 +1257,37 @@ export function EditorPage({
               setMobileChatOpen(false);
               setShowPublish(true);
             }}
-            className="inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-stone-900 px-2 py-1 text-[11px] font-semibold text-white"
+            className={`inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1 text-[11px] font-semibold text-white ${
+              isBackgroundPublishFailed ? 'bg-amber-700' : 'bg-stone-900'
+            }`}
           >
-            {session.publishState === 'published' ? (
+            {effectivePublishState === 'published' ? (
               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+            ) : isBackgroundPublishRunning ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-300" />
+                {effectivePublishState === 'deploying_pages' ? 'Deploying…' : 'Publishing…'}
+              </>
+            ) : isBackgroundPublishFailed ? (
+              <>
+                <AlertTriangle className="h-3.5 w-3.5 text-amber-200" />
+                Review
+              </>
             ) : (
               <>Publish{changedCount > 0 ? ` · ${changedCount}` : ''}</>
             )}
+          </button>
+        ) : session.status === 'merged' && isBackgroundPublishRunning ? (
+          <button
+            type="button"
+            onClick={() => {
+              setMobileChatOpen(false);
+              setShowPublish(true);
+            }}
+            className="inline-flex min-h-[34px] shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-stone-900 px-2 py-1 text-[11px] font-semibold text-white"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-300" />
+            Deploying…
           </button>
         ) : session.status === 'published' || session.status === 'merged' ? (
           <button
@@ -1248,17 +1375,28 @@ export function EditorPage({
                 </button>
               )}
               {session.status === 'merged' && (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    await api.retryDeploy(session.id);
-                    await loadSessionMeta();
-                  }}
-                  className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  Retry deploy check
-                </button>
+                isBackgroundPublishRunning ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowPublish(true)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-stone-800"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-300" />
+                    Deploying…
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await api.retryDeploy(session.id);
+                      await loadSessionMeta();
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Retry deploy check
+                  </button>
+                )
               )}
             </>
           )}
@@ -1393,11 +1531,25 @@ export function EditorPage({
               <button
                 type="button"
                 onClick={() => setShowPublish(true)}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-stone-800"
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold text-white transition ${
+                  isBackgroundPublishFailed
+                    ? 'bg-amber-700 hover:bg-amber-800'
+                    : 'bg-stone-900 hover:bg-stone-800'
+                }`}
               >
-                {session.publishState === 'published' ? (
+                {effectivePublishState === 'published' ? (
                   <>
                     <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> Published
+                  </>
+                ) : isBackgroundPublishRunning ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-300" />
+                    {effectivePublishState === 'deploying_pages' ? 'Deploying…' : 'Publishing…'}
+                  </>
+                ) : isBackgroundPublishFailed ? (
+                  <>
+                    <AlertTriangle className="h-3.5 w-3.5 text-amber-200" />
+                    Publish · Needs review
                   </>
                 ) : (
                   <>
@@ -1854,7 +2006,7 @@ export function EditorPage({
                             className="inline-flex items-center gap-1 hover:underline"
                           >
                             <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-600 px-1 text-[10px] font-bold text-white">
-                              {chips.findIndex((x) => elementKey(x) === elementKey(c)) + 1}
+                              {[...new Set(chips.map((x) => elementKey(x)))].indexOf(elementKey(c)) + 1}
                             </span>
                             <span className="truncate max-w-[170px]">{chipLabelOf(c, persona)}</span>
                             {onOtherPage && (

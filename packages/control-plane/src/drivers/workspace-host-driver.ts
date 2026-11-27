@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
@@ -10,11 +9,15 @@ import {
   type BootProgressDto,
   type BootStage,
 } from '@halley/shared';
+import {
+  deriveInternalHostToken,
+  deriveWorkspaceToken,
+  hashWorkspaceToken,
+} from '@halley/shared/auth';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import { configureBareMirrorForHttp } from '../git-http.js';
 import type { GitHubService } from '../github/client.js';
-import { hashWorkspaceToken } from '../proxy/llm-proxy.js';
 import {
   CrashLoopTracker,
   WorkspaceCrashLoopError,
@@ -45,6 +48,7 @@ interface SupervisorHealthResponse {
   protocolVersion: number;
   instanceId: string;
   activeSessionIds: string[];
+  astroReadySessionIds?: string[];
   activeCount: number;
   maxActiveWorkspaces: number;
   warmPool: WarmPoolStatus;
@@ -78,7 +82,8 @@ async function getFreeLoopbackPort(): Promise<number> {
 }
 
 export class WorkspaceHostDriver implements WorkspaceDriver {
-  private sessionTokens = new Map<string, string>();
+  private readonly internalHostToken: string;
+  private customSessionTokens = new Map<string, string>();
   private booting = new Map<string, Promise<WorkspaceEndpoint>>();
   private bootProgress = new Map<string, BootProgressDto>();
   private bootProgressListener: BootProgressListener | null = null;
@@ -88,6 +93,9 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   private resolvedHostUrl: string | null = null;
   private startingSupervisor: Promise<string> | null = null;
   private lastSupervisorInstanceId: string | null = null;
+  private handshookInstanceId: string | null = null;
+  private astroReadySet = new Set<string>();
+  private lastTouchedAt = new Map<string, number>();
   private cachedHealth: { data: SupervisorHealthResponse; at: number } | null = null;
   private mirrorSyncInflight: Promise<string> | null = null;
   private lastMirrorSyncAt = 0;
@@ -103,22 +111,78 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     private db: ControlPlaneDb,
     private github: GitHubService,
   ) {
+    this.internalHostToken =
+      config.workspaceHostSecret || deriveInternalHostToken(config.sessionSecret);
     if (config.workspaceHostUrl) {
       this.resolvedHostUrl = config.workspaceHostUrl.replace(/\/+$/, '');
     }
   }
 
   setRawWorkspaceToken(sessionId: string, token: string): void {
-    this.sessionTokens.set(sessionId, token);
+    if (token && token.trim().length > 0) {
+      this.customSessionTokens.set(sessionId, token);
+    }
   }
 
   ensureSessionToken(sessionId: string): string {
-    const existing = this.sessionTokens.get(sessionId);
-    if (existing && existing.trim().length > 0) return existing;
-    const rawToken = crypto.randomBytes(24).toString('hex');
-    this.db.updateSession(sessionId, { workspace_token_hash: hashWorkspaceToken(rawToken) });
-    this.sessionTokens.set(sessionId, rawToken);
+    const custom = this.customSessionTokens.get(sessionId);
+    if (custom && custom.trim().length > 0) return custom;
+    const row = this.db.getSession(sessionId);
+    const rawToken = deriveWorkspaceToken(
+      this.config.sessionSecret,
+      sessionId,
+      row?.token_epoch ?? 0,
+    );
+    const expectedHash = hashWorkspaceToken(rawToken);
+    if (row && row.workspace_token_hash !== expectedHash) {
+      this.db.updateSession(sessionId, { workspace_token_hash: expectedHash });
+    }
     return rawToken;
+  }
+
+  isSessionAstroReady(sessionId: string): boolean {
+    if (this.astroReadySet.has(sessionId)) return true;
+    if (!this.cachedHealth) {
+      const s = this.db.getSession(sessionId);
+      return Boolean(s?.astro_url && s.status === 'running');
+    }
+    return false;
+  }
+
+  touchSession(sessionId: string): void {
+    const now = Date.now();
+    const prev = this.lastTouchedAt.get(sessionId) ?? 0;
+    if (now - prev < 15_000) return;
+    this.lastTouchedAt.set(sessionId, now);
+    const hostUrl = this.resolvedHostUrl;
+    if (!hostUrl) return;
+    void fetch(`${hostUrl}/api/sessions/${encodeURIComponent(sessionId)}/touch`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => {});
+  }
+
+  notifyMirrorUpdated(baseBranch: string): void {
+    const hostUrl = this.resolvedHostUrl;
+    if (!hostUrl) return;
+    void fetch(`${hostUrl}/api/mirror/notify-updated`, {
+      method: 'POST',
+      headers: this.authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ baseBranch }),
+      signal: AbortSignal.timeout(3000),
+    }).catch(() => {});
+  }
+
+  deferSpeculativeBuilds(durationMs: number): void {
+    const hostUrl = this.resolvedHostUrl;
+    if (!hostUrl) return;
+    void fetch(`${hostUrl}/internal/build-lock/defer-speculative`, {
+      method: 'POST',
+      headers: this.authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ durationMs }),
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => {});
   }
 
   setBootProgressListener(listener: BootProgressListener): void {
@@ -169,11 +233,24 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   }
 
   private authHeaders(extra?: Record<string, string>): Record<string, string> {
-    const headers: Record<string, string> = { ...extra };
-    if (this.config.workspaceHostSecret) {
-      headers['Authorization'] = `Bearer ${this.config.workspaceHostSecret}`;
+    return {
+      ...extra,
+      Authorization: `Bearer ${this.internalHostToken}`,
+    };
+  }
+
+  private async performHandshake(hostUrl: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${hostUrl}/api/handshake`, {
+        method: 'POST',
+        headers: this.authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ internalHostToken: this.internalHostToken }),
+        signal: AbortSignal.timeout(3000),
+      });
+      return res.ok;
+    } catch {
+      return false;
     }
-    return headers;
   }
 
   private resolveSupervisorEntry(): string {
@@ -215,9 +292,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
           WORKSPACES_DIR: workspacesDir,
           CONTROL_PLANE_INTERNAL_URL:
             this.config.controlPlaneInternalUrl || `http://127.0.0.1:${this.config.port}`,
-          ...(this.config.workspaceHostSecret
-            ? { WORKSPACE_HOST_SECRET: this.config.workspaceHostSecret }
-            : {}),
+          WORKSPACE_HOST_SECRET: this.internalHostToken,
           HALLEY_REPO: this.config.repo,
           HALLEY_BASE_BRANCH: this.config.baseBranch,
           HALLEY_MODEL_ID: this.config.modelId,
@@ -269,13 +344,27 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
   }
 
   private async fetchSupervisorHealth(hostUrl: string): Promise<SupervisorHealthResponse> {
-    const res = await fetch(`${hostUrl}/health`, {
+    // Ensure zero-config HKDF handshake is pushed when connecting to remote workspaces container
+    if (this.config.workspaceHostUrl && !this.config.workspaceHostSecret && !this.handshookInstanceId) {
+      await this.performHandshake(hostUrl);
+    }
+
+    let res = await fetch(`${hostUrl}/health`, {
       headers: this.authHeaders(),
       signal: AbortSignal.timeout(4000),
     });
+    if (res.status === 401 && this.config.workspaceHostUrl && !this.config.workspaceHostSecret) {
+      const ok = await this.performHandshake(hostUrl);
+      if (ok) {
+        res = await fetch(`${hostUrl}/health`, {
+          headers: this.authHeaders(),
+          signal: AbortSignal.timeout(4000),
+        });
+      }
+    }
     if (res.status === 401) {
       throw new Error(
-        'Unauthorized contacting workspaces supervisor — ensure WORKSPACE_HOST_SECRET matches on both control-plane and workspaces.',
+        'Unauthorized contacting workspaces supervisor — ensure SESSION_SECRET / WORKSPACE_HOST_SECRET matches on control-plane and workspaces.',
       );
     }
     if (!res.ok) {
@@ -287,9 +376,14 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         `Workspace host protocol version mismatch (control-plane expects v${WORKSPACE_HOST_PROTOCOL_VERSION}, workspaces is v${data.protocolVersion}). Please update both halley-control-plane and halley-workspace images to the same version.`,
       );
     }
+    if (this.config.workspaceHostUrl && this.handshookInstanceId !== data.instanceId) {
+      const ok = await this.performHandshake(hostUrl);
+      if (ok) this.handshookInstanceId = data.instanceId;
+    }
     if (data.warmPool) {
       this.lastWarmPoolStatus = data.warmPool;
     }
+    this.astroReadySet = new Set(data.astroReadySessionIds ?? data.activeSessionIds ?? []);
     this.cachedHealth = { data, at: Date.now() };
     return data;
   }
@@ -321,8 +415,12 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       this.lastSupervisorInstanceId !== null &&
       this.lastSupervisorInstanceId !== health.instanceId;
     this.lastSupervisorInstanceId = health.instanceId;
+    if (restarted) {
+      this.handshookInstanceId = null;
+    }
 
     const activeSet = new Set(health.activeSessionIds ?? []);
+    this.astroReadySet = new Set(health.astroReadySessionIds ?? health.activeSessionIds ?? []);
     const sessions = this.db.listSessions();
     let reconciled = 0;
     for (const s of sessions) {
@@ -334,10 +432,14 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         ((s.status === 'published' || s.status === 'merged') && hasLiveUrls);
       if (isMarkedActive && !activeSet.has(s.id)) {
         const isFrozen = s.status === 'published' || s.status === 'merged';
-        this.db.updateSession(s.id, {
-          status: isFrozen ? s.status : 'sleeping',
-          runner_url: null,
-          astro_url: null,
+        this.db.transitionSession(s.id, {
+          expectedEpoch: s.lease_epoch,
+          allowUnfreeze: isFrozen,
+          patch: {
+            status: isFrozen ? s.status : 'sleeping',
+            runner_url: null,
+            astro_url: null,
+          },
         });
         reconciled++;
       }
@@ -388,6 +490,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       );
       await configureBareMirrorForHttp(mirrorDir);
       this.lastMirrorSyncAt = Date.now();
+      this.notifyMirrorUpdated(baseBranch);
       return mirrorDir;
     })().finally(() => {
       if (this.mirrorSyncInflight === syncPromise) {
@@ -430,23 +533,39 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     }
   }
 
+  async releaseWarmWorkspace(id: string): Promise<void> {
+    this.bootProgress.delete(id);
+    try {
+      const hostUrl = await this.getHostUrl();
+      await fetch(`${hostUrl}/api/warm/release/${encodeURIComponent(id)}`, {
+        method: 'POST',
+        headers: this.authHeaders(),
+        signal: AbortSignal.timeout(5000),
+      }).catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
+
   async ensureRunning(session: SessionRecord): Promise<WorkspaceEndpoint> {
     const pending = this.booting.get(session.id);
     if (pending) return pending;
 
-    // Fast path: if the session already has live URLs, a valid in-memory workspace token,
-    // and the supervisor confirms it is active, return immediately without hitting GitHub,
-    // emitting boot_progress, polling /progress, or writing to SQLite.
-    if (session.runner_url && session.astro_url && this.sessionTokens.has(session.id)) {
+    const latest = this.db.getSession(session.id) ?? session;
+
+    // Fast path: if the session already has live URLs and the supervisor confirms it is active,
+    // return immediately without hitting GitHub, emitting boot_progress, or writing to SQLite.
+    if (latest.runner_url && latest.astro_url) {
+      this.ensureSessionToken(latest.id);
       try {
         const hostUrl = await this.getHostUrl();
         const health = await this.getCachedSupervisorHealth(hostUrl);
-        if (health.activeSessionIds?.includes(session.id)) {
+        if (health.activeSessionIds?.includes(latest.id)) {
           return {
-            runnerUrl: session.runner_url,
-            astroUrl: session.astro_url,
-            astroBase: session.astro_base || '/',
-            baseSha: session.base_sha,
+            runnerUrl: latest.runner_url,
+            astroUrl: latest.astro_url,
+            astroBase: latest.astro_base || '/',
+            baseSha: latest.base_sha,
           };
         }
         // Supervisor no longer has this session active (e.g. LRU eviction or restart)
@@ -458,11 +577,11 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     }
 
     try {
-      this.crashTracker.assertCanAttempt(session.id);
+      this.crashTracker.assertCanAttempt(latest.id);
     } catch (err) {
       if (err instanceof WorkspaceCrashLoopError) {
         this.emitProgress(
-          session.id,
+          latest.id,
           'error',
           err.oom ? 'Workspace ran out of memory' : 'Workspace paused after repeated crashes',
           {
@@ -476,13 +595,19 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       throw err;
     }
 
-    const p = this.startOrWake(session).finally(() => this.booting.delete(session.id));
-    this.booting.set(session.id, p);
+    const p: Promise<WorkspaceEndpoint> = this.startOrWake(latest).finally(() => {
+      if (this.booting.get(latest.id) === p) {
+        this.booting.delete(latest.id);
+      }
+    });
+    this.booting.set(latest.id, p);
     return p;
   }
 
   private async startOrWake(session: SessionRecord): Promise<WorkspaceEndpoint> {
-    const isFrozen = session.status === 'published' || session.status === 'merged';
+    const startRow = this.db.getSession(session.id) ?? session;
+    const leaseEpoch = startRow.lease_epoch ?? 0;
+    const initialFrozen = startRow.status === 'published' || startRow.status === 'merged';
     try {
       const hostUrl = await this.getHostUrl();
       let health: SupervisorHealthResponse;
@@ -513,11 +638,19 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         await this.ensureControlPlaneMirror(session.base_branch, { allowStaleOnError: true });
       }
 
+      const currentRow = this.db.getSession(session.id) ?? startRow;
+      const isFrozenNow = currentRow.status === 'published' || currentRow.status === 'merged';
       const workspaceToken = this.ensureSessionToken(session.id);
-      const persona = this.db.getUserById(session.owner_user_id)?.persona ?? 'non-technical';
+      const persona = this.db.getUserById(currentRow.owner_user_id)?.persona ?? 'non-technical';
+      const activeRunIds = new Set(this.db.listActivePublishRuns().map((r) => r.session_id));
       const protectedSessionIds = this.db
         .listSessions()
-        .filter((s) => IN_FLIGHT_PUBLISH_STATES.has(s.publish_state))
+        .filter(
+          (s) =>
+            activeRunIds.has(s.id) ||
+            IN_FLIGHT_PUBLISH_STATES.has(s.publish_state) ||
+            s.publish_state === 'failed_conflict',
+        )
         .map((s) => s.id);
 
       // Poll supervisor boot progress while /start runs
@@ -569,14 +702,14 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
             method: 'POST',
             headers: this.authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
-              baseBranch: session.base_branch,
-              workingBranch: session.working_branch,
-              baseSha: session.base_sha,
+              baseBranch: currentRow.base_branch,
+              workingBranch: currentRow.working_branch,
+              baseSha: currentRow.base_sha,
               workspaceToken,
               persona,
-              editorName: session.owner_name || 'Editor',
-              editorEmail: session.owner_email || 'editor@example.com',
-              readOnly: isFrozen,
+              editorName: currentRow.owner_name || 'Editor',
+              editorEmail: currentRow.owner_email || 'editor@example.com',
+              readOnly: isFrozenNow,
               protectedSessionIds,
             }),
             signal: AbortSignal.timeout(120_000),
@@ -603,19 +736,37 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
       const hostHostname = new URL(hostUrl).hostname;
       const runnerUrl = `http://${hostHostname}:${started.runnerPort}`;
       const astroUrl = `http://${hostHostname}:${started.astroPort}`;
-      const astroBase = started.astroBase || session.astro_base || '/';
-      const baseSha = started.baseSha || session.base_sha;
+      const astroBase = started.astroBase || currentRow.astro_base || '/';
+      const baseSha = started.baseSha || currentRow.base_sha;
 
-      this.db.updateSession(session.id, {
-        status: isFrozen ? session.status : 'running',
-        base_sha: baseSha,
-        runner_url: runnerUrl,
-        astro_url: astroUrl,
-        astro_base: astroBase,
-        node_modules_pruned_at: null,
-        last_active_at: new Date().toISOString(),
+      const afterStartRow = this.db.getSession(session.id);
+      if (!afterStartRow) {
+        // Session was deleted while booting; tear down immediately
+        await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}`, {
+          method: 'DELETE',
+          headers: this.authHeaders(),
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+        throw new Error('Session was deleted during startup');
+      }
+
+      const frozenAfter =
+        initialFrozen || afterStartRow.status === 'published' || afterStartRow.status === 'merged';
+      this.db.transitionSession(session.id, {
+        expectedEpoch: leaseEpoch,
+        allowUnfreeze: frozenAfter,
+        patch: {
+          status: frozenAfter ? afterStartRow.status : 'running',
+          base_sha: baseSha,
+          runner_url: runnerUrl,
+          astro_url: astroUrl,
+          astro_base: astroBase,
+          node_modules_pruned_at: null,
+          last_active_at: new Date().toISOString(),
+        },
       });
 
+      this.astroReadySet.add(session.id);
       this.cachedHealth = null;
       this.crashTracker.recordSuccess(session.id);
       if (!alreadyActiveOnSupervisor) {
@@ -638,7 +789,10 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
         },
       );
       if (info.crashLoop) {
-        this.db.updateSession(session.id, { status: 'error', runner_url: null, astro_url: null });
+        this.db.transitionSession(session.id, {
+          expectedEpoch: leaseEpoch,
+          patch: { status: 'error', runner_url: null, astro_url: null },
+        });
       }
       throw err;
     }
@@ -646,6 +800,7 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
 
   async stop(session: SessionRecord): Promise<void> {
     this.bootProgress.delete(session.id);
+    this.astroReadySet.delete(session.id);
     this.cachedHealth = null;
     try {
       const hostUrl = await this.getHostUrl();
@@ -657,19 +812,36 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     } catch {
       // supervisor unavailable
     }
-    const isFrozen = session.status === 'published' || session.status === 'merged';
-    this.db.updateSession(session.id, {
-      status: isFrozen ? session.status : 'sleeping',
-      runner_url: null,
-      astro_url: null,
+    const latest = this.db.getSession(session.id) ?? session;
+    const isFrozen = latest.status === 'published' || latest.status === 'merged';
+    this.db.transitionSession(session.id, {
+      bumpEpoch: true,
+      allowUnfreeze: isFrozen,
+      patch: {
+        status: isFrozen ? latest.status : 'sleeping',
+        runner_url: null,
+        astro_url: null,
+      },
     });
   }
 
   async restart(session: SessionRecord): Promise<WorkspaceEndpoint> {
     this.crashTracker.reset(session.id);
     this.bootProgress.delete(session.id);
+    this.astroReadySet.delete(session.id);
     this.booting.delete(session.id);
     this.cachedHealth = null;
+    const latestBefore = this.db.getSession(session.id) ?? session;
+    const isFrozen = latestBefore.status === 'published' || latestBefore.status === 'merged';
+    this.db.transitionSession(session.id, {
+      bumpEpoch: true,
+      allowUnfreeze: isFrozen,
+      patch: {
+        status: isFrozen ? latestBefore.status : 'starting',
+        runner_url: null,
+        astro_url: null,
+      },
+    });
     try {
       const hostUrl = await this.getHostUrl();
       await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}/restart`, {
@@ -680,18 +852,21 @@ export class WorkspaceHostDriver implements WorkspaceDriver {
     } catch {
       // ignore
     }
-    this.db.updateSession(session.id, {
-      status: 'starting',
-      runner_url: null,
-      astro_url: null,
-    });
     const fresh = this.db.getSession(session.id) ?? session;
     return this.ensureRunning(fresh);
   }
 
   async destroy(session: SessionRecord): Promise<void> {
     this.bootProgress.delete(session.id);
+    this.astroReadySet.delete(session.id);
+    this.customSessionTokens.delete(session.id);
+    this.booting.delete(session.id);
     this.cachedHealth = null;
+    this.db.transitionSession(session.id, {
+      bumpEpoch: true,
+      allowUnfreeze: true,
+      patch: { runner_url: null, astro_url: null },
+    });
     try {
       const hostUrl = await this.getHostUrl();
       await fetch(`${hostUrl}/api/sessions/${encodeURIComponent(session.id)}`, {

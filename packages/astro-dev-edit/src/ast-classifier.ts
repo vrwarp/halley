@@ -154,6 +154,20 @@ function lineByteColToByteOffset(buf: Buffer, line: number, byteCol: number): nu
   return Math.min(buf.length, i + Math.max(0, byteCol - 1));
 }
 
+function isByteEscaped(buf: Buffer, index: number): boolean {
+  let backslashes = 0;
+  let k = index - 1;
+  while (k >= 0 && buf[k] === 0x5c) {
+    backslashes++;
+    k--;
+  }
+  return backslashes % 2 === 1;
+}
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function findOpeningTagEndByteOffset(buf: Buffer, startOffset: number, endOffset: number): number | null {
   let i = startOffset;
   let inSingle = false;
@@ -163,13 +177,12 @@ function findOpeningTagEndByteOffset(buf: Buffer, startOffset: number, endOffset
   const max = Math.min(endOffset, buf.length);
   while (i < max) {
     const ch = buf[i]!;
-    const prev = i > 0 ? buf[i - 1]! : 0;
     if (inSingle) {
-      if (ch === 0x27 && prev !== 0x5c) inSingle = false; // ' and \
+      if (ch === 0x27 && !isByteEscaped(buf, i)) inSingle = false; // '
     } else if (inDouble) {
-      if (ch === 0x22 && prev !== 0x5c) inDouble = false; // " and \
+      if (ch === 0x22 && !isByteEscaped(buf, i)) inDouble = false; // "
     } else if (inBacktick) {
-      if (ch === 0x60 && prev !== 0x5c) inBacktick = false; // ` and \
+      if (ch === 0x60 && !isByteEscaped(buf, i)) inBacktick = false; // `
     } else {
       if (ch === 0x27) inSingle = true;
       else if (ch === 0x22) inDouble = true;
@@ -186,7 +199,7 @@ function findOpeningTagEndByteOffset(buf: Buffer, startOffset: number, endOffset
 /**
  * Finds the JS string index immediately after the opening tag `>` and immediately before `</tagName>`,
  * converting from @astrojs/compiler's UTF-8 byte offsets so multi-byte characters (em-dashes, quotes,
- * non-ASCII text) never shift spans. Returns null for self-closing/void tags.
+ * non-ASCII text) never shift spans. Returns null for self-closing/void/unclosed tags.
  */
 function computeInnerSpan(
   buf: Buffer,
@@ -205,14 +218,14 @@ function computeInnerSpan(
 
   const innerStartByte = gtByte + 1;
   const elementUtf8 = buf.subarray(innerStartByte, endByte).toString('utf8');
-  const closingTag = `</${node.name}`;
-  const closingRelCharIdx = elementUtf8.lastIndexOf(closingTag);
-  if (closingRelCharIdx < 0) return null;
+  const closingTagRe = new RegExp(`</${escapeRegExp(node.name)}\\s*>$`, 'i');
+  const match = closingTagRe.exec(elementUtf8);
+  if (!match) return null;
 
   const prefixChars = buf.subarray(0, innerStartByte).toString('utf8').length;
   return {
     innerStartOffset: prefixChars,
-    innerEndOffset: prefixChars + closingRelCharIdx,
+    innerEndOffset: prefixChars + match.index,
   };
 }
 

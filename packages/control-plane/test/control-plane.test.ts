@@ -551,7 +551,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
   it('rotates/persists session token, detects protocol version mismatch, and reconciles sessions after workspaces restart', async () => {
     const http = await import('node:http');
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-cp-host-test-'));
-    let fakeProtocolVersion = 1;
+    let fakeProtocolVersion = 2;
     let fakeInstanceId = 'inst-1';
     let fakeActiveIds: string[] = [];
     const fakeServer = http.createServer((req, res) => {
@@ -1029,7 +1029,7 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         res.end(
           JSON.stringify({
             ok: true,
-            protocolVersion: 1,
+            protocolVersion: 2,
             instanceId: 'sup-same-instance',
             activeSessionIds: activeIds,
             activeCount: activeIds.length,

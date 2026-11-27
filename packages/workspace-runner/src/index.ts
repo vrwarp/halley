@@ -1,12 +1,17 @@
-import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
-import { promisify } from 'node:util';
-import { discoverSiteRoutes, PerFileMutex } from '@halley/astro-dev-edit';
+import {
+  discoverSiteRoutes,
+  inspectAstroElement,
+  patchStaticSpan,
+  PerFileMutex,
+  resolveEditorRelFile,
+} from '@halley/astro-dev-edit';
 import {
   ChatClientMessageSchema,
+  SyncStartRequestSchema,
   type ChatServerMessage,
   type ConflictResolutionRecordDto,
   type MergeReviewStateDto,
@@ -21,6 +26,7 @@ import {
   runDeterministicOptimizationPrePass,
 } from './astro-optimizer.js';
 import {
+  commitVirtualMergeResolution,
   createCheckpoint,
   ensureGitRerere,
   getGitChanges,
@@ -29,21 +35,24 @@ import {
   mergeWithBase,
   resetToRef,
   revertSingleFile,
+  runLockedGit,
   startRevertCommits,
   undoToCheckpoint,
+  virtualMergeWithBase,
   type GitIdentity,
 } from './checkpoints-and-git.js';
 import {
   applyResolvedFile,
   buildConflictEvidencePack,
+  buildContradictionRecord,
   estimateEscalationCost,
   getUpstreamCommits,
   resolvePackWithLlm,
   tryDeterministicResolve,
   type ConflictEvidencePack,
 } from './conflict-protocol.js';
+import { NodeModulesCacheManager } from './nm-cache.js';
 import { PageCreationService, PageValidationError } from './pages.js';
-import { detachHardlinkedNodeModules } from './nm-cache.js';
 import { HalleyPiRuntime } from './pi-runtime.js';
 import { UploadManager } from './uploads.js';
 import {
@@ -52,8 +61,6 @@ import {
   runSpeculativeVerification,
 } from './verify.js';
 import { buildChangeCards, resolveVisualReviewRoutes } from './visual-diff.js';
-
-const execFileAsync = promisify(execFile);
 
 const REPO_ROOT = process.env.HALLEY_WORKSPACE_DIR || '/workspace';
 const STATE_DIR = process.env.HALLEY_STATE_DIR || '/halley-state';
@@ -65,12 +72,18 @@ const ASTRO_PORT = Number(process.env.ASTRO_PORT || 4321);
 const CONTROL_PLANE_INTERNAL_URL =
   process.env.CONTROL_PLANE_INTERNAL_URL || 'http://127.0.0.1:3000';
 const SUPERVISOR_URL = process.env.HALLEY_SUPERVISOR_URL || '';
-const WORKSPACE_HOST_SECRET = process.env.WORKSPACE_HOST_SECRET || '';
+let activeHostSecret = process.env.WORKSPACE_HOST_SECRET || '';
 let workspaceToken = process.env.WORKSPACE_TOKEN || 'dev-token';
-// Scrub WORKSPACE_TOKEN and WORKSPACE_HOST_SECRET from process.env immediately so child processes
-// (astro dev SSR code, agent bash commands, verification scripts) never inherit them.
+
+const explicitEnvPersona = process.env.HALLEY_PERSONA;
+const explicitEnvEditorName = process.env.HALLEY_EDITOR_NAME;
+const explicitEnvEditorEmail = process.env.HALLEY_EDITOR_EMAIL;
+const explicitEnvReadOnly = process.env.HALLEY_READ_ONLY;
+
+// Scrub secrets from process.env immediately so child processes (astro dev SSR, agent bash, build scripts) never inherit them
 delete process.env.WORKSPACE_TOKEN;
 delete process.env.WORKSPACE_HOST_SECRET;
+
 const MODEL_ID = process.env.HALLEY_MODEL_ID || 'haiku-latest';
 const THINKING_LEVEL = (process.env.HALLEY_THINKING_LEVEL || 'high') as
   | 'off'
@@ -78,19 +91,20 @@ const THINKING_LEVEL = (process.env.HALLEY_THINKING_LEVEL || 'high') as
   | 'medium'
   | 'high';
 let persona: 'non-technical' | 'developer' =
-  process.env.HALLEY_PERSONA === 'developer' ? 'developer' : 'non-technical';
+  explicitEnvPersona === 'developer' ? 'developer' : 'non-technical';
 
-let readOnly = process.env.HALLEY_READ_ONLY === 'true';
+let readOnly = explicitEnvReadOnly === 'true';
 let prevBaseSha = '';
 
 const gitIdentity: GitIdentity = {
   botName: process.env.HALLEY_GIT_BOT_NAME || 'Halley Bot',
   botEmail: process.env.HALLEY_GIT_BOT_EMAIL || 'halley-bot@users.noreply.github.com',
-  editorName: process.env.HALLEY_EDITOR_NAME || 'Halley Editor',
-  editorEmail: process.env.HALLEY_EDITOR_EMAIL || 'editor@example.com',
+  editorName: explicitEnvEditorName || 'Halley Editor',
+  editorEmail: explicitEnvEditorEmail || 'editor@example.com',
 };
 
 const SESSION_META_PATH = path.join(STATE_DIR, 'session-meta.json');
+const MERGE_REVIEW_STATE_PATH = path.join(STATE_DIR, 'merge-review.json');
 
 interface PersistedSessionMeta {
   editorName?: string;
@@ -101,18 +115,28 @@ interface PersistedSessionMeta {
   readOnly?: boolean;
 }
 
+interface PersistedMergeReviewDiskState {
+  review: MergeReviewStateDto;
+  packs: Array<[string, ConflictEvidencePack]>;
+  virtualTreeSha?: string;
+  needsLlmPass?: boolean;
+}
+
 async function loadPersistedSessionMeta(): Promise<void> {
   try {
     const raw = await fs.readFile(SESSION_META_PATH, 'utf8');
     const meta = JSON.parse(raw) as PersistedSessionMeta;
-    if (meta.editorName) gitIdentity.editorName = meta.editorName;
-    if (meta.editorEmail) gitIdentity.editorEmail = meta.editorEmail;
-    if (meta.persona === 'developer' || meta.persona === 'non-technical') {
+    // Authoritative env vars from control-plane SQLite win on wake; fallback to persisted meta only when omitted
+    if (!explicitEnvEditorName && meta.editorName) gitIdentity.editorName = meta.editorName;
+    if (!explicitEnvEditorEmail && meta.editorEmail) gitIdentity.editorEmail = meta.editorEmail;
+    if (!explicitEnvPersona && (meta.persona === 'developer' || meta.persona === 'non-technical')) {
       persona = meta.persona;
     }
     if (meta.baseSha) baseSha = meta.baseSha;
     if (meta.prevBaseSha) prevBaseSha = meta.prevBaseSha;
-    if (typeof meta.readOnly === 'boolean') readOnly = meta.readOnly;
+    if (explicitEnvReadOnly === undefined && typeof meta.readOnly === 'boolean') {
+      readOnly = meta.readOnly;
+    }
   } catch {
     // no persisted meta yet
   }
@@ -128,14 +152,21 @@ async function savePersistedSessionMeta(): Promise<void> {
     ...(prevBaseSha ? { prevBaseSha } : {}),
     readOnly,
   };
-  await fs.writeFile(SESSION_META_PATH, JSON.stringify(meta, null, 2), 'utf8');
+  const tmp = `${SESSION_META_PATH}.tmp-${process.pid}`;
+  await fs.writeFile(tmp, JSON.stringify(meta, null, 2), 'utf8');
+  await fs.rename(tmp, SESSION_META_PATH);
 }
 
+// Single OS-process PerFileMutex shared across inline `/__editor/patch`, Pi `edit`/`write`/`bash`, and `PageCreationService`
 const fileLock = new PerFileMutex();
 const uploadManager = new UploadManager(path.join(STATE_DIR, 'uploads'));
 
 const wsClients = new Set<WebSocket>();
 let latestTranscript: Extract<ChatServerMessage, { type: 'transcript_state' }> | null = null;
+let currentWorkspaceLocked = false;
+let currentLockedFile: string | undefined;
+let currentPreviewPaused = false;
+let currentPreviewPauseReason: string | undefined;
 
 function broadcast(msg: ChatServerMessage): void {
   const payload = JSON.stringify(msg);
@@ -193,7 +224,7 @@ function triggerImmediateSpeculativeVerify(): void {
   if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
   void runSpeculativeVerification(REPO_ROOT, {
     supervisorUrl: SUPERVISOR_URL || undefined,
-    hostSecret: WORKSPACE_HOST_SECRET || undefined,
+    hostSecret: activeHostSecret || undefined,
     sessionId: SESSION_ID,
   });
 }
@@ -212,7 +243,7 @@ function scheduleIdleSpeculativeVerify(delayMs = IDLE_SPECULATIVE_DELAY_MS): voi
     }
     void runSpeculativeVerification(REPO_ROOT, {
       supervisorUrl: SUPERVISOR_URL || undefined,
-      hostSecret: WORKSPACE_HOST_SECRET || undefined,
+      hostSecret: activeHostSecret || undefined,
       sessionId: SESSION_ID,
     });
   }, delayMs);
@@ -271,7 +302,6 @@ const shutdown = async () => {
   shuttingDown = true;
   cancelSpeculativeVerify();
   cancelInlineEditTimer();
-  // Stop astro dev first/in parallel so SIGKILL timeout never leaves an orphaned astro process
   await Promise.allSettled([
     astroManager.stop().catch(() => {}),
     piRuntime?.stop().catch(() => {}),
@@ -283,6 +313,9 @@ process.on('SIGTERM', () => void shutdown());
 
 async function main() {
   await loadPersistedSessionMeta();
+  // Persist authoritative env metadata immediately so disk matches control-plane SQLite
+  await savePersistedSessionMeta().catch(() => {});
+
   console.log('[halley-boot] starting_preview');
   const { originalBase, previewBase } = await astroManager.start();
 
@@ -302,7 +335,9 @@ async function main() {
     },
   });
   await pageService.load();
-  await pageService.syncPageRequestsFromDisk({ reconcileInterrupted: true, broadcast: false }).catch(() => {});
+  await pageService
+    .syncPageRequestsFromDisk({ reconcileInterrupted: true, broadcast: false })
+    .catch(() => {});
 
   console.log('[halley-boot] starting_ai');
   piRuntime = new HalleyPiRuntime({
@@ -315,7 +350,7 @@ async function main() {
     workspaceToken,
     getWorkspaceToken: () => workspaceToken,
     supervisorUrl: SUPERVISOR_URL || undefined,
-    hostSecret: WORKSPACE_HOST_SECRET || undefined,
+    hostSecret: activeHostSecret || undefined,
     modelId: MODEL_ID,
     thinkingLevel: THINKING_LEVEL,
     getPersona: () => persona,
@@ -323,6 +358,8 @@ async function main() {
     uploadManager,
     pageService,
     onLockChange: (locked, file) => {
+      currentWorkspaceLocked = locked;
+      currentLockedFile = locked ? file : undefined;
       broadcast({ type: 'workspace_lock', locked, file });
     },
     onRunFinishedWithEdits: async (summary) => {
@@ -341,11 +378,15 @@ async function main() {
       }
     },
     pauseAstroForBuild: async () => {
+      currentPreviewPaused = true;
+      currentPreviewPauseReason = 'Running site checks…';
       broadcast({ type: 'preview_paused', paused: true, reason: 'Running site checks…' });
       await astroManager.pause();
     },
     resumeAstroAfterBuild: async () => {
       await astroManager.resume();
+      currentPreviewPaused = false;
+      currentPreviewPauseReason = undefined;
       broadcast({ type: 'preview_paused', paused: false });
     },
     onTranscriptUpdate: (snapshot) => {
@@ -359,10 +400,52 @@ async function main() {
 
   await piRuntime.start();
 
-  // Track active conflict/merge review state and in-flight sync/escalation ops
+  // Persistent virtual merge review state (survives sleep/wake with zero working-tree markers)
   let activeMergeState: MergeReviewStateDto | null = null;
   let activeConflictPacks = new Map<string, ConflictEvidencePack>();
+  let activeVirtualTreeSha: string | undefined;
+  let activeMergeNeedsLlmPass = false;
   let activeSyncOps = 0;
+
+  const persistMergeReviewState = async () => {
+    try {
+      await fs.mkdir(STATE_DIR, { recursive: true });
+      if (!activeMergeState) {
+        await fs.rm(MERGE_REVIEW_STATE_PATH, { force: true });
+        return;
+      }
+      const payload: PersistedMergeReviewDiskState = {
+        review: activeMergeState,
+        packs: Array.from(activeConflictPacks.entries()),
+        ...(activeVirtualTreeSha ? { virtualTreeSha: activeVirtualTreeSha } : {}),
+        ...(activeMergeNeedsLlmPass ? { needsLlmPass: true } : {}),
+      };
+      const tmp = `${MERGE_REVIEW_STATE_PATH}.tmp-${process.pid}`;
+      await fs.writeFile(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      await fs.rename(tmp, MERGE_REVIEW_STATE_PATH);
+    } catch {
+      // non-fatal
+    }
+  };
+
+  try {
+    const rawMerge = await fs.readFile(MERGE_REVIEW_STATE_PATH, 'utf8');
+    const parsed = JSON.parse(rawMerge) as PersistedMergeReviewDiskState;
+    if (parsed?.review) {
+      activeMergeState = parsed.review;
+      activeConflictPacks = new Map(parsed.packs ?? []);
+      activeVirtualTreeSha = parsed.virtualTreeSha;
+      activeMergeNeedsLlmPass = Boolean(parsed.needsLlmPass);
+    }
+  } catch {
+    // no persisted merge state
+  }
+
+  const nmCacheDir =
+    process.env.HALLEY_NM_CACHE_DIR || path.join(path.dirname(path.dirname(STATE_DIR)), 'nm-cache');
+  const pkgCacheDir =
+    process.env.HALLEY_PKG_CACHE_DIR || path.join(path.dirname(path.dirname(STATE_DIR)), 'pkg-cache');
+  const runnerNmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
 
   const app = new Hono();
 
@@ -388,8 +471,113 @@ async function main() {
     });
   });
 
+  // ==========================================================================
+  // Single-Writer Inline Editor Endpoints (`/__editor/*` or `/p/:id/.../__editor/*`)
+  // ==========================================================================
+  let routesInflight: Promise<Awaited<ReturnType<typeof discoverSiteRoutes>>> | null = null;
+  const loadRoutesDedup = () => {
+    if (!routesInflight) {
+      routesInflight = discoverSiteRoutes(REPO_ROOT).finally(() => {
+        routesInflight = null;
+      });
+    }
+    return routesInflight;
+  };
+
+  app.use('*', async (c, next) => {
+    const pathname = new URL(c.req.url).pathname;
+    if (c.req.method === 'GET' && pathname.endsWith('/__editor/health')) {
+      return c.json({ ok: true, astroReady: astroManager.getStatus().ready });
+    }
+    if (c.req.method === 'GET' && pathname.endsWith('/__editor/routes')) {
+      const routes = await loadRoutesDedup();
+      return c.json({ routes });
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/inspect')) {
+      try {
+        const body = (await c.req.json()) as { file?: string; loc?: string };
+        const relFile = resolveEditorRelFile(REPO_ROOT, String(body.file ?? ''));
+        if (relFile.startsWith('..') || relFile === '.github' || relFile.startsWith('.github/')) {
+          return c.json({ editability: 'dynamic', reason: 'Protected path' });
+        }
+        const abs = path.resolve(REPO_ROOT, relFile);
+        const source = await fs.readFile(abs, 'utf8');
+        const inspected = await inspectAstroElement(source, String(body.loc ?? ''));
+        if (!inspected) {
+          return c.json({ editability: 'dynamic', reason: 'Unmapped AST node' });
+        }
+        return c.json({
+          editability: inspected.editability,
+          reason: inspected.reason,
+          snapshotHash: inspected.snapshotHash,
+          tagName: inspected.tagName,
+        });
+      } catch (err) {
+        return c.json(
+          {
+            editability: 'dynamic',
+            error: err instanceof Error ? err.message : 'Inspect failed',
+          },
+          400,
+        );
+      }
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/patch')) {
+      if (readOnly) {
+        return c.json({ error: 'Session is read-only' }, 403);
+      }
+      try {
+        const body = (await c.req.json()) as {
+          file?: string;
+          loc?: string;
+          expectedHash?: string;
+          newHtml?: string;
+        };
+        const relFile = resolveEditorRelFile(REPO_ROOT, String(body.file ?? ''));
+        const astroStatus = astroManager.getStatus();
+        const result = await patchStaticSpan({
+          repoRoot: REPO_ROOT,
+          relFile,
+          loc: String(body.loc ?? ''),
+          expectedHash: String(body.expectedHash ?? ''),
+          newHtml: String(body.newHtml ?? ''),
+          previewBase: astroStatus.previewBase || previewBase,
+          originalBase: astroStatus.originalBase || originalBase,
+          fileLock,
+        });
+        if (!result.ok) {
+          return c.json({ error: result.error }, result.code);
+        }
+        scheduleInlineCheckpoint(`Inline edit in ${relFile}`);
+        return c.json({
+          ok: true,
+          updatedSource: result.updatedSource,
+          newHash: result.newHash,
+          newLoc: result.newLoc,
+          topLineDelta: result.topLineDelta,
+          afterLine: result.afterLine,
+          afterLineDelta: result.afterLineDelta,
+          sameLineEndCol: result.sameLineEndCol,
+          sameLineByteDelta: result.sameLineByteDelta,
+        });
+      } catch (err) {
+        return c.json(
+          { error: err instanceof Error ? err.message : 'Patch failed' },
+          500,
+        );
+      }
+    }
+    return next();
+  });
+
   app.post('/internal/token', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { workspaceToken?: string };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      workspaceToken?: string;
+      hostSecret?: string;
+    };
+    if (body.hostSecret?.trim()) {
+      activeHostSecret = body.hostSecret.trim();
+    }
     if (!body.workspaceToken || !body.workspaceToken.trim()) {
       return c.json({ error: 'Missing workspaceToken' }, 400);
     }
@@ -408,9 +596,10 @@ async function main() {
   });
 
   /**
-   * Binds a pre-warmed standby workspace container to a real user session.
-   * Updates git branch (optionally fast-forwarding from the local bare mirror if baseBranch moved),
-   * sets editor identity/persona, and persists session-meta.json for future sleep/wake cycles.
+   * Binds a pre-warmed standby workspace to a real user session.
+   * When `syncFromMirror` is false (normal case since supervisor recycles standby slots when
+   * `origin/main` advances), performs a zero-file-churn `git symbolic-ref` branch rename so
+   * Chokidar fires zero events and pre-rendered Vite/Tailwind JIT caches stay hot!
    */
   app.post('/internal/claim', async (c) => {
     const body = (await c.req.json()) as {
@@ -423,10 +612,14 @@ async function main() {
       syncFromMirror?: boolean;
       mirrorPath?: string;
       workspaceToken?: string;
+      hostSecret?: string;
     };
 
     if (body.workspaceToken?.trim()) {
       workspaceToken = body.workspaceToken.trim();
+    }
+    if (body.hostSecret?.trim()) {
+      activeHostSecret = body.hostSecret.trim();
     }
 
     const targetBaseBranch = body.baseBranch || BASE_BRANCH;
@@ -439,56 +632,54 @@ async function main() {
         .then(() => true)
         .catch(() => false);
       if (hasMirror) {
-        const oldHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT }))
-          .stdout.trim();
-        await execFileAsync(
-          'git',
+        const oldHead = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
+        await runLockedGit(
+          REPO_ROOT,
           ['fetch', mirrorPath, `+refs/heads/${targetBaseBranch}:refs/remotes/origin/${targetBaseBranch}`],
-          { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024, timeout: 30_000 },
+          undefined,
+          30_000,
         );
-        const changedFilesOut = await execFileAsync(
-          'git',
-          ['diff', '--name-only', oldHead, `origin/${targetBaseBranch}`],
-          { cwd: REPO_ROOT },
-        ).catch(() => ({ stdout: '' }));
+        const changedFilesOut = await runLockedGit(REPO_ROOT, [
+          'diff',
+          '--name-only',
+          oldHead,
+          `origin/${targetBaseBranch}`,
+        ]);
         const changedList = changedFilesOut.stdout.split(/\r?\n/).filter(Boolean);
 
-        await execFileAsync(
-          'git',
-          ['checkout', '-B', body.workingBranch, `origin/${targetBaseBranch}`],
-          { cwd: REPO_ROOT },
+        const changedLocks = changedList.some(
+          (f) => f === 'package.json' || f === 'package-lock.json' || f === 'pnpm-lock.yaml',
         );
-
-        const changedLocks = changedList.filter(
-          (f) => f === 'package-lock.json' || f === 'pnpm-lock.yaml',
-        );
-        if (changedLocks.length > 0) {
+        if (changedLocks || changedList.some((f) => f.startsWith('astro.config.'))) {
           needsAstroRestart = true;
           await astroManager.pause().catch(() => {});
-          await detachHardlinkedNodeModules(REPO_ROOT, STATE_DIR).catch(() => {});
-          const pkgCache = process.env.HALLEY_PKG_CACHE_DIR || '/workspaces/pkg-cache';
-          if (changedLocks.includes('package-lock.json')) {
-            await execFileAsync(
-              'npm',
-              ['ci', '--cache', path.join(pkgCache, 'npm'), '--prefer-offline', '--ignore-scripts'],
-              { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
-            );
-          } else if (changedLocks.includes('pnpm-lock.yaml')) {
-            await execFileAsync(
-              'pnpm',
-              ['install', '--store-dir', path.join(pkgCache, 'pnpm'), '--frozen-lockfile'],
-              { cwd: REPO_ROOT, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 },
-            );
-          }
-        } else if (changedList.some((f) => f.startsWith('astro.config.'))) {
-          needsAstroRestart = true;
+        }
+
+        await runLockedGit(REPO_ROOT, [
+          'checkout',
+          '-B',
+          body.workingBranch,
+          `origin/${targetBaseBranch}`,
+        ]);
+
+        if (changedLocks) {
+          await runnerNmCache.ensureSessionNodeModules({
+            workspaceDir: REPO_ROOT,
+            stateDir: STATE_DIR,
+            devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
+          });
         }
         await piRuntime?.reloadAgentsMd().catch(() => {});
       } else {
-        await execFileAsync('git', ['checkout', '-B', body.workingBranch], { cwd: REPO_ROOT });
+        const curSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
+        await runLockedGit(REPO_ROOT, ['update-ref', `refs/heads/${body.workingBranch}`, curSha]);
+        await runLockedGit(REPO_ROOT, ['symbolic-ref', 'HEAD', `refs/heads/${body.workingBranch}`]);
       }
     } else {
-      await execFileAsync('git', ['checkout', '-B', body.workingBranch], { cwd: REPO_ROOT });
+      // Zero working-tree churn branch rename
+      const curSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
+      await runLockedGit(REPO_ROOT, ['update-ref', `refs/heads/${body.workingBranch}`, curSha]);
+      await runLockedGit(REPO_ROOT, ['symbolic-ref', 'HEAD', `refs/heads/${body.workingBranch}`]);
     }
 
     if (needsAstroRestart) {
@@ -496,7 +687,7 @@ async function main() {
     }
 
     await ensureGitRerere(REPO_ROOT).catch(() => {});
-    baseSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
+    baseSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
     if (body.editorName) gitIdentity.editorName = body.editorName;
     if (body.editorEmail) gitIdentity.editorEmail = body.editorEmail;
     if (body.persona === 'developer' || body.persona === 'non-technical') {
@@ -531,14 +722,23 @@ async function main() {
     return c.json({ ok: true, persona });
   });
 
-  let routesInflight: Promise<Awaited<ReturnType<typeof discoverSiteRoutes>>> | null = null;
-  app.get('/internal/routes', async (c) => {
-    if (!routesInflight) {
-      routesInflight = discoverSiteRoutes(REPO_ROOT).finally(() => {
-        routesInflight = null;
-      });
+  app.post('/internal/owner', async (c) => {
+    const body = (await c.req.json()) as {
+      editorName?: string;
+      editorEmail?: string;
+      persona?: string;
+    };
+    if (body.editorName?.trim()) gitIdentity.editorName = body.editorName.trim();
+    if (body.editorEmail?.trim()) gitIdentity.editorEmail = body.editorEmail.trim();
+    if (body.persona === 'developer' || body.persona === 'non-technical') {
+      persona = body.persona;
     }
-    const routes = await routesInflight;
+    await savePersistedSessionMeta().catch(() => {});
+    return c.json({ ok: true });
+  });
+
+  app.get('/internal/routes', async (c) => {
+    const routes = await loadRoutesDedup();
     return c.json({ routes });
   });
 
@@ -558,8 +758,9 @@ async function main() {
       const result = await pageService.createPage(body, { capped, isBusy });
 
       if (!capped && piRuntime) {
-        const reqViewport = (body.editorContext as { viewport?: 'desktop' | 'tablet' | 'mobile' } | undefined)
-          ?.viewport;
+        const reqViewport = (
+          body.editorContext as { viewport?: 'desktop' | 'tablet' | 'mobile' } | undefined
+        )?.viewport;
         await piRuntime.submitPageCreationRequest(
           result.pageRequest,
           result.instructions,
@@ -625,7 +826,9 @@ async function main() {
   app.delete('/internal/pages', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     cancelSpeculativeVerify();
-    const route = c.req.query('route') || ((await c.req.json().catch(() => ({}))) as { route?: string }).route;
+    const route =
+      c.req.query('route') ||
+      ((await c.req.json().catch(() => ({}))) as { route?: string }).route;
     if (!route) return c.json({ error: 'Missing route' }, 400);
     try {
       const res = await pageService.deletePage(route);
@@ -728,12 +931,60 @@ async function main() {
     const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     const checkpoints = await listCheckpoints(REPO_ROOT, baseSha).catch(() => []);
     if (checkpoints[0]) {
-      broadcast({ type: 'checkpoint_created', checkpoint: checkpoints[0], changedFilesCount: changes.length });
+      broadcast({
+        type: 'checkpoint_created',
+        checkpoint: checkpoints[0],
+        changedFilesCount: changes.length,
+      });
     }
     notifySessionDiverged(changes.length);
     if (changes.length > 0) {
       scheduleIdleSpeculativeVerify();
     }
+    return c.json({ ok: true, changedFilesCount: changes.length });
+  });
+
+  /**
+   * Transactionally excludes unticked Undo paths right before verification, returning
+   * `preExcludeSha` so `PublishService` can restore the unticked files if checks fail.
+   */
+  app.post('/internal/git/exclude-paths', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    cancelSpeculativeVerify();
+    cancelInlineEditTimer();
+    const body = (await c.req.json()) as { paths?: string[]; baseRef?: string };
+    const paths = (body.paths ?? []).filter((p) => p && !p.startsWith('.github'));
+    if (paths.length === 0) {
+      return c.json({ ok: true, preExcludeSha: null });
+    }
+    await createCheckpoint(REPO_ROOT, 'Before partial-undo selection', gitIdentity);
+    const preExcludeSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
+    const baseRef = body.baseRef || `origin/${BASE_BRANCH}`;
+    for (const relPath of paths) {
+      const inBase = await runLockedGit(REPO_ROOT, ['cat-file', '-e', `${baseRef}:${relPath}`]);
+      if (inBase.code === 0) {
+        await runLockedGit(REPO_ROOT, ['checkout', baseRef, '--', relPath]);
+      } else {
+        await fs.rm(path.join(REPO_ROOT, relPath), { force: true });
+        await runLockedGit(REPO_ROOT, ['rm', '-f', '--ignore-unmatch', relPath]);
+      }
+    }
+    await createCheckpoint(
+      REPO_ROOT,
+      `Exclude ${paths.length} unselected file${paths.length === 1 ? '' : 's'} from Undo`,
+      gitIdentity,
+    );
+    const changes = await getGitChanges(REPO_ROOT, baseRef).catch(() => []);
+    return c.json({ ok: true, preExcludeSha, changedFilesCount: changes.length });
+  });
+
+  app.post('/internal/git/restore-sha', async (c) => {
+    if (readOnly) return c.json({ error: 'Read-only' }, 403);
+    const body = (await c.req.json()) as { targetSha?: string };
+    if (!body.targetSha) return c.json({ error: 'Missing targetSha' }, 400);
+    const ok = await resetToRef(REPO_ROOT, body.targetSha);
+    if (!ok) return c.json({ error: 'Failed to restore SHA' }, 500);
+    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     return c.json({ ok: true, changedFilesCount: changes.length });
   });
 
@@ -802,21 +1053,27 @@ async function main() {
     if (upstreamSummary) {
       piRuntime?.addSystemContextNote(`Live site updates merged into this draft: ${upstreamSummary}`);
     }
-    // Check if dependencies or astro config changed in prevSha..newSha
     if (prevSha && newSha && prevSha !== newSha) {
-      const diffFiles = await execFileAsync('git', ['diff', '--name-only', `${prevSha}..${newSha}`], {
-        cwd: REPO_ROOT,
-      })
-        .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
-        .catch(() => [] as string[]);
-      const needsRestart = diffFiles.some(
-        (f) =>
-          f === 'package.json' ||
-          f === 'package-lock.json' ||
-          f === 'pnpm-lock.yaml' ||
-          f.startsWith('astro.config.'),
+      const diffFiles = (
+        await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${prevSha}..${newSha}`])
+      ).stdout
+        .split(/\r?\n/)
+        .filter(Boolean);
+      const changedDeps = diffFiles.some(
+        (f) => f === 'package.json' || f === 'package-lock.json' || f === 'pnpm-lock.yaml',
       );
-      if (needsRestart) {
+      const changedConfig = diffFiles.some((f) => f.startsWith('astro.config.'));
+      if (changedDeps) {
+        await astroManager.pause().catch(() => {});
+        await runnerNmCache
+          .ensureSessionNodeModules({
+            workspaceDir: REPO_ROOT,
+            stateDir: STATE_DIR,
+            devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
+          })
+          .catch(() => {});
+        await astroManager.restart().catch(() => {});
+      } else if (changedConfig) {
         await astroManager.restart().catch(() => {});
       }
     }
@@ -842,36 +1099,34 @@ async function main() {
     cancelInlineEditTimer();
     activeSyncOps += 1;
     try {
-      const body = (await c.req.json().catch(() => ({}))) as {
+      const rawBody = await c.req.json().catch(() => ({}));
+      const parsedBody = SyncStartRequestSchema.safeParse(rawBody);
+      const body = (parsedBody.success ? parsedBody.data : rawBody) as {
         baseBranch?: string;
         kind?: 'sync' | 'publish' | 'revert';
         autoSyncOnly?: boolean;
+        autoApplyCleanOnly?: boolean;
         skipFetch?: boolean;
       };
       const baseBranch = body.baseBranch || BASE_BRANCH;
       const kind = body.kind ?? 'sync';
+      const baseRef = `origin/${baseBranch}`;
 
-      await ensureGitRerere(REPO_ROOT);
-      // Snapshot uncommitted edits into a checkpoint before merging
-      await createCheckpoint(REPO_ROOT, 'Before live-site update', gitIdentity).catch(() => null);
+      // If we already deferred an LLM conflict pass from PublishModal open (`autoApplyCleanOnly: true`)
+      // and now the user clicked Publish/Resolve (`!autoApplyCleanOnly && !autoSyncOnly`), run the LLM pass on those virtual packs!
+      const vres = await virtualMergeWithBase(REPO_ROOT, {
+        baseBranch,
+        identity: gitIdentity,
+        skipFetch: body.skipFetch,
+        fetchAuthBearer: activeHostSecret || workspaceToken || undefined,
+      });
 
-      if (!body.skipFetch) {
-        const fetchArgs = WORKSPACE_HOST_SECRET
-          ? ['-c', `http.extraHeader=Authorization: Bearer ${WORKSPACE_HOST_SECRET}`, 'fetch', 'origin', baseBranch]
-          : ['fetch', 'origin', baseBranch];
-        await execFileAsync('git', fetchArgs, { cwd: REPO_ROOT, timeout: 30_000 }).catch(() => {});
+      if (vres.status === 'error') {
+        return c.json({ error: vres.error || 'Failed to sync with live site' }, 502);
       }
 
-      const baseRef = `origin/${baseBranch}`;
-      const preSyncSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
-      const newBaseSha = (await execFileAsync('git', ['rev-parse', baseRef], { cwd: REPO_ROOT })).stdout.trim();
-      const mergeBaseSha = await execFileAsync('git', ['merge-base', 'HEAD', baseRef], { cwd: REPO_ROOT })
-        .then((r) => r.stdout.trim())
-        .catch(() => baseSha);
-
-      if (mergeBaseSha === newBaseSha) {
-        // Preserve existing activeMergeState (conflict badges & prevBaseSha) if already synced to this SHA
-        if (activeMergeState && activeMergeState.newBaseSha === newBaseSha) {
+      if (vres.status === 'clean' && vres.alreadyUpToDate) {
+        if (activeMergeState && activeMergeState.newBaseSha === vres.newBaseSha) {
           return c.json({
             review: {
               ...activeMergeState,
@@ -883,9 +1138,9 @@ async function main() {
           mergeId: crypto.randomUUID(),
           kind,
           status: 'clean',
-          preSyncSha,
-          prevBaseSha: prevBaseSha || mergeBaseSha,
-          newBaseSha,
+          preSyncSha: vres.preSyncSha,
+          prevBaseSha: prevBaseSha || vres.prevBaseSha,
+          newBaseSha: vres.newBaseSha,
           alreadyUpToDate: true,
           summary: 'Your draft is already up to date with the live site.',
           records: [],
@@ -897,86 +1152,84 @@ async function main() {
 
       cancelSpeculativeVerify();
 
-      const upstreamCommits = await getUpstreamCommits(REPO_ROOT, mergeBaseSha, baseRef);
-      const userChanged = (await getGitChanges(REPO_ROOT, mergeBaseSha)).map((ch) => ch.path);
-      const upstreamChanged = await execFileAsync('git', ['diff', '--name-only', `${mergeBaseSha}..${baseRef}`], {
-        cwd: REPO_ROOT,
-      })
-        .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
-        .catch(() => [] as string[]);
-      const overlap = userChanged.filter((f) => upstreamChanged.includes(f));
+      const upstreamCommits = await getUpstreamCommits(REPO_ROOT, vres.prevBaseSha, baseRef);
 
-      // Attempt standard git merge
-      let mergeClean = false;
-      try {
-        await execFileAsync(
-          'git',
-          [
-            '-c',
-            `user.name=${gitIdentity.botName}`,
-            '-c',
-            `user.email=${gitIdentity.botEmail}`,
-            'merge',
-            '--no-ff',
-            '-m',
-            `halley-sync: Updated from live site (${newBaseSha.slice(0, 7)})`,
-            baseRef,
-          ],
-          { cwd: REPO_ROOT },
-        );
-        mergeClean = true;
-      } catch {
-        mergeClean = false;
-      }
+      if (vres.status === 'clean') {
+        const userChanged = (await getGitChanges(REPO_ROOT, vres.prevBaseSha)).map((ch) => ch.path);
+        const upstreamChanged = (
+          await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${vres.prevBaseSha}..${baseRef}`])
+        ).stdout
+          .split(/\r?\n/)
+          .filter(Boolean);
+        const overlap = userChanged.filter((f) => upstreamChanged.includes(f));
 
-      if (mergeClean) {
         const summary =
           overlap.length > 0
             ? `Merged ${upstreamCommits.length} live update${upstreamCommits.length === 1 ? '' : 's'} into ${overlap.length} file${overlap.length === 1 ? '' : 's'} you edited — please review.`
             : `Updated with ${upstreamCommits.length} change${upstreamCommits.length === 1 ? '' : 's'} from the live site.`;
         await runPostSyncTasks(
           upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-          newBaseSha,
-          mergeBaseSha,
+          vres.newBaseSha,
+          vres.prevBaseSha,
         );
         const review: MergeReviewStateDto = {
           mergeId: crypto.randomUUID(),
           kind,
           status: overlap.length > 0 ? 'ready_for_review' : 'applied',
-          preSyncSha,
-          prevBaseSha: mergeBaseSha,
-          newBaseSha,
+          preSyncSha: vres.preSyncSha,
+          prevBaseSha: vres.prevBaseSha,
+          newBaseSha: vres.newBaseSha,
           summary,
           records: [],
           upstreamCommits,
           touchedUserFiles: overlap,
         };
         activeMergeState = review;
+        activeConflictPacks.clear();
+        activeVirtualTreeSha = undefined;
+        activeMergeNeedsLlmPass = false;
+        await persistMergeReviewState();
         return c.json({ review });
       }
 
-      // Conflicts occurred: collect unmerged files and build evidence packs
-      const unmergedOut = await execFileAsync('git', ['diff', '--name-only', '--diff-filter=U'], {
-        cwd: REPO_ROOT,
-      })
-        .then((r) => r.stdout.trim().split(/\r?\n/).filter(Boolean))
-        .catch(() => [] as string[]);
-
+      // Virtual merge hit conflicts — `/workspace` is completely untouched and free of `<<<<<<<` markers!
       activeConflictPacks = new Map();
+      activeVirtualTreeSha = vres.virtualTreeSha;
       const records: ConflictResolutionRecordDto[] = [];
       let firstPassUsageUsd = 0;
       let needsAi = false;
 
-      for (const relPath of unmergedOut) {
-        const pack = await buildConflictEvidencePack(REPO_ROOT, relPath, mergeBaseSha, baseBranch, kind);
+      for (const relPath of vres.conflictedFiles) {
+        const pack = await buildConflictEvidencePack(
+          REPO_ROOT,
+          relPath,
+          vres.prevBaseSha,
+          baseBranch,
+          kind,
+          {
+            baseSha: vres.prevBaseSha,
+            oursSha: vres.preSyncSha,
+            theirsSha: vres.newBaseSha,
+            virtualTreeSha: vres.virtualTreeSha,
+          },
+        );
         activeConflictPacks.set(relPath, pack);
 
         const det = tryDeterministicResolve(pack);
         if (det) {
           records.push(det);
         } else if (body.autoSyncOnly) {
-          // Auto-sync NEVER spends AI budget without the user clicking (Q8)
           needsAi = true;
+        } else if (body.autoApplyCleanOnly) {
+          // PublishModal open preflight: $0 cost, zero disk mutation, build clear choice card until Publish/Resolve
+          needsAi = true;
+          records.push(
+            buildContradictionRecord(pack, {
+              explanation:
+                'Both your draft and the live site changed this section. Click Publish to combine automatically, or pick a version below.',
+              modelUsed: 'deferred',
+            }),
+          );
         } else {
           const res = await resolvePackWithLlm(REPO_ROOT, pack, {
             controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
@@ -991,73 +1244,70 @@ async function main() {
       }
 
       if (body.autoSyncOnly && (needsAi || records.some((r) => r.status === 'needs_choice'))) {
-        await execFileAsync('git', ['merge', '--abort'], { cwd: REPO_ROOT }).catch(() => {});
+        activeConflictPacks.clear();
+        activeVirtualTreeSha = undefined;
         return c.json({
           heldForUser: true,
-          overlapCount: unmergedOut.length,
+          overlapCount: vres.conflictedFiles.length,
           upstreamCommits,
         });
       }
 
       const needsChoices = records.some((r) => r.status === 'needs_choice');
       if (!needsChoices) {
-        // Apply all auto-resolved files and commit the merge
-        let allApplied = true;
-        for (const rec of records) {
-          const applied = await applyResolvedFile(REPO_ROOT, rec.path, rec.resolvedContent ?? '');
-          if (!applied.ok) allApplied = false;
-        }
-        if (allApplied) {
-          await execFileAsync(
-            'git',
-            [
-              '-c',
-              `user.name=${gitIdentity.botName}`,
-              '-c',
-              `user.email=${gitIdentity.botEmail}`,
-              'commit',
-              '--no-edit',
-            ],
-            { cwd: REPO_ROOT, env: { ...process.env, GIT_EDITOR: 'true' } },
-          );
+        const committed = await commitVirtualMergeResolution(REPO_ROOT, {
+          virtualTreeSha: vres.virtualTreeSha,
+          preSyncSha: vres.preSyncSha,
+          newBaseSha: vres.newBaseSha,
+          resolvedFiles: records.map((rec) => ({
+            path: rec.path,
+            content: rec.resolvedContent ?? '',
+          })),
+          identity: gitIdentity,
+        });
+        if (committed.ok) {
           await runPostSyncTasks(
             upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-            newBaseSha,
-            mergeBaseSha,
+            vres.newBaseSha,
+            vres.prevBaseSha,
           );
           const review: MergeReviewStateDto = {
             mergeId: crypto.randomUUID(),
             kind,
             status: 'ready_for_review',
-            preSyncSha,
-            prevBaseSha: mergeBaseSha,
-            newBaseSha,
+            preSyncSha: vres.preSyncSha,
+            prevBaseSha: vres.prevBaseSha,
+            newBaseSha: vres.newBaseSha,
             summary: `Combined ${records.length} overlapping change${records.length === 1 ? '' : 's'} automatically — please review.`,
             records,
             upstreamCommits,
-            touchedUserFiles: unmergedOut,
+            touchedUserFiles: vres.conflictedFiles,
             firstPassUsageUsd,
           };
           activeMergeState = review;
+          activeVirtualTreeSha = undefined;
+          activeMergeNeedsLlmPass = false;
+          await persistMergeReviewState();
           return c.json({ review });
         }
       }
 
-      // Keep merge paused waiting for user choices (or abort on cancel)
       const review: MergeReviewStateDto = {
         mergeId: crypto.randomUUID(),
         kind,
         status: 'needs_choices',
-        preSyncSha,
-        prevBaseSha: mergeBaseSha,
-        newBaseSha,
+        preSyncSha: vres.preSyncSha,
+        prevBaseSha: vres.prevBaseSha,
+        newBaseSha: vres.newBaseSha,
         summary: `${records.filter((r) => r.status === 'needs_choice').length} conflict${records.filter((r) => r.status === 'needs_choice').length === 1 ? '' : 's'} need your choice.`,
         records,
         upstreamCommits,
-        touchedUserFiles: unmergedOut,
+        touchedUserFiles: vres.conflictedFiles,
         firstPassUsageUsd,
       };
       activeMergeState = review;
+      activeMergeNeedsLlmPass = Boolean(body.autoApplyCleanOnly && needsAi);
+      await persistMergeReviewState();
       return c.json({ review });
     } finally {
       activeSyncOps = Math.max(0, activeSyncOps - 1);
@@ -1120,41 +1370,67 @@ async function main() {
 
       const stillPending = activeMergeState.records.some((r) => r.status === 'needs_choice');
       if (!stillPending) {
-        for (const rec of activeMergeState.records) {
+        const resolvedList = activeMergeState.records.map((rec) => {
           const pack = activeConflictPacks.get(rec.path);
-          const contentToWrite =
+          const content =
             rec.chosenOptionId === 'theirs'
               ? (pack?.theirsContent ?? null)
               : rec.chosenOptionId === 'ours'
                 ? (pack?.oursContent ?? null)
                 : (rec.resolvedContent ?? pack?.oursContent ?? '');
-          const applied = await applyResolvedFile(REPO_ROOT, rec.path, contentToWrite);
-          if (!applied.ok) {
-            return c.json({ error: applied.error || `Failed to apply ${rec.path}` }, 400);
-          }
-        }
-        await execFileAsync(
-          'git',
-          [
-            '-c',
-            `user.name=${gitIdentity.botName}`,
-            '-c',
-            `user.email=${gitIdentity.botEmail}`,
-            'commit',
-            '--no-edit',
-          ],
-          { cwd: REPO_ROOT, env: { ...process.env, GIT_EDITOR: 'true' } },
-        ).catch(() => {});
+          return { path: rec.path, content };
+        });
 
-        await runPostSyncTasks(
-          activeMergeState.upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-          activeMergeState.newBaseSha,
-          activeMergeState.prevBaseSha,
-        );
+        if (activeMergeState.kind !== 'revert' || activeVirtualTreeSha) {
+          const committed = await commitVirtualMergeResolution(REPO_ROOT, {
+            virtualTreeSha: activeVirtualTreeSha,
+            preSyncSha: activeMergeState.preSyncSha,
+            newBaseSha: activeMergeState.newBaseSha,
+            resolvedFiles: resolvedList,
+            identity: gitIdentity,
+            commitMessage:
+              activeMergeState.kind === 'revert'
+                ? 'halley-checkpoint: Undo published edit (resolved conflicts)'
+                : undefined,
+          });
+          if (!committed.ok) {
+            return c.json({ error: committed.error }, 400);
+          }
+        } else {
+          for (const item of resolvedList) {
+            const applied = await applyResolvedFile(REPO_ROOT, item.path, item.content);
+            if (!applied.ok) {
+              return c.json({ error: applied.error || `Failed to apply ${item.path}` }, 400);
+            }
+          }
+          await runLockedGit(
+            REPO_ROOT,
+            [
+              '-c',
+              `user.name=${gitIdentity.botName}`,
+              '-c',
+              `user.email=${gitIdentity.botEmail}`,
+              'commit',
+              '--no-edit',
+            ],
+            { GIT_EDITOR: 'true' },
+          );
+        }
+
+        if (activeMergeState.kind !== 'revert') {
+          await runPostSyncTasks(
+            activeMergeState.upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
+            activeMergeState.newBaseSha,
+            activeMergeState.prevBaseSha,
+          );
+        }
         activeMergeState.status = 'ready_for_review';
         activeMergeState.summary = 'All conflicts resolved — review the result below.';
+        activeVirtualTreeSha = undefined;
+        activeMergeNeedsLlmPass = false;
       }
 
+      await persistMergeReviewState();
       return c.json({ review: activeMergeState });
     } finally {
       activeSyncOps = Math.max(0, activeSyncOps - 1);
@@ -1168,14 +1444,20 @@ async function main() {
     const body = (await c.req.json().catch(() => ({}))) as { targetSha?: string };
     const targetSha = body.targetSha || activeMergeState?.preSyncSha;
     if (!targetSha) return c.json({ error: 'No pre-sync snapshot to restore' }, 400);
-    const ok = await resetToRef(REPO_ROOT, targetSha);
-    if (!ok) return c.json({ error: 'Failed to undo update' }, 500);
-    if (activeMergeState?.prevBaseSha) {
-      baseSha = activeMergeState.prevBaseSha;
-      await savePersistedSessionMeta().catch(() => {});
+    // If the conflict was purely virtual (`needs_choices`), HEAD wasn't even moved unless the user edited later!
+    if (activeMergeState?.status !== 'needs_choices' || body.targetSha) {
+      const ok = await resetToRef(REPO_ROOT, targetSha);
+      if (!ok) return c.json({ error: 'Failed to undo update' }, 500);
+      if (activeMergeState?.prevBaseSha) {
+        baseSha = activeMergeState.prevBaseSha;
+        await savePersistedSessionMeta().catch(() => {});
+      }
     }
     activeMergeState = null;
     activeConflictPacks.clear();
+    activeVirtualTreeSha = undefined;
+    activeMergeNeedsLlmPass = false;
+    await persistMergeReviewState();
     await pageService.syncPageRequestsFromDisk().catch(() => {});
     const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     return c.json({ ok: true, changedFilesCount: changes.length });
@@ -1196,7 +1478,8 @@ async function main() {
         if (pack) selectedPacks.push(pack);
       }
     }
-    const resolvedEscModel = piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
+    const resolvedEscModel =
+      piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
     const estimate = await estimateEscalationCost({
       packs: selectedPacks,
       controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
@@ -1222,7 +1505,8 @@ async function main() {
         escalationThinking?: 'off' | 'low' | 'medium' | 'high';
         ceilingUsd?: number;
       };
-      const resolvedEscModel = piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
+      const resolvedEscModel =
+        piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
       const runId = crypto.randomUUID();
       const ceilingUsd = Math.min(body.ceilingUsd ?? 2, 2);
 
@@ -1279,6 +1563,7 @@ async function main() {
             ? 'The Advanced model reached the same result.'
             : 'Compare First vs Advanced below and choose which to keep.',
       };
+      await persistMergeReviewState();
       return c.json({ review: activeMergeState });
     } finally {
       activeSyncOps = Math.max(0, activeSyncOps - 1);
@@ -1287,7 +1572,9 @@ async function main() {
 
   app.post('/internal/sync/apply-advanced', async (c) => {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    if (!activeMergeState?.advancedAttempt) return c.json({ error: 'No advanced attempt available' }, 404);
+    if (!activeMergeState?.advancedAttempt) {
+      return c.json({ error: 'No advanced attempt available' }, 404);
+    }
     cancelSpeculativeVerify();
     cancelInlineEditTimer();
     const body = (await c.req.json()) as {
@@ -1308,12 +1595,21 @@ async function main() {
         orig.status = 'chosen';
       }
     }
-    const ckpt = await createCheckpoint(REPO_ROOT, 'Applied Advanced merge improvements', gitIdentity).catch(() => null);
+    const ckpt = await createCheckpoint(
+      REPO_ROOT,
+      'Applied Advanced merge improvements',
+      gitIdentity,
+    ).catch(() => null);
     const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     if (ckpt) {
-      broadcast({ type: 'checkpoint_created', checkpoint: ckpt, changedFilesCount: changes.length });
+      broadcast({
+        type: 'checkpoint_created',
+        checkpoint: ckpt,
+        changedFilesCount: changes.length,
+      });
     }
     notifySessionDiverged(changes.length);
+    await persistMergeReviewState();
     scheduleIdleSpeculativeVerify();
     return c.json({ review: activeMergeState });
   });
@@ -1325,12 +1621,30 @@ async function main() {
     activeSyncOps += 1;
     try {
       const body = (await c.req.json()) as { shas: string[] };
-      const result = await startRevertCommits(REPO_ROOT, body.shas ?? [], gitIdentity);
+      const targetShas = body.shas ?? [];
+      const result = await startRevertCommits(REPO_ROOT, targetShas, gitIdentity);
       if (result.status === 'conflict' && result.conflictedFiles.length > 0) {
         activeConflictPacks = new Map();
+        activeVirtualTreeSha = result.virtualTreeSha;
         const records: ConflictResolutionRecordDto[] = [];
         for (const relPath of result.conflictedFiles) {
-          const pack = await buildConflictEvidencePack(REPO_ROOT, relPath, baseSha, BASE_BRANCH, 'revert');
+          const virtualRefs =
+            result.virtualTreeSha && result.preRevertSha && result.targetParentSha && targetShas[0]
+              ? {
+                  baseSha: targetShas[0],
+                  oursSha: result.preRevertSha,
+                  theirsSha: result.targetParentSha,
+                  virtualTreeSha: result.virtualTreeSha,
+                }
+              : undefined;
+          const pack = await buildConflictEvidencePack(
+            REPO_ROOT,
+            relPath,
+            baseSha,
+            BASE_BRANCH,
+            'revert',
+            virtualRefs,
+          );
           activeConflictPacks.set(relPath, pack);
           const det = tryDeterministicResolve(pack);
           if (det) {
@@ -1346,34 +1660,82 @@ async function main() {
             records.push(res.record);
           }
         }
-        const headSha = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })).stdout.trim();
+        const headSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
         const needsChoices = records.some((r) => r.status === 'needs_choice');
         let resolvedAndCommitted = false;
         if (!needsChoices) {
-          let allApplied = true;
-          for (const rec of records) {
-            const applied = await applyResolvedFile(REPO_ROOT, rec.path, rec.resolvedContent ?? '');
-            if (!applied.ok) allApplied = false;
-          }
-          if (allApplied) {
-            await execFileAsync(
-              'git',
-              [
-                '-c',
-                `user.name=${gitIdentity.botName}`,
-                '-c',
-                `user.email=${gitIdentity.botEmail}`,
-                'commit',
-                '--no-edit',
-              ],
-              { cwd: REPO_ROOT, env: { ...process.env, GIT_EDITOR: 'true' } },
-            ).catch(() => {});
-            const newHead = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })
-              .then((r) => r.stdout.trim())
-              .catch(() => '');
-            if (newHead && newHead !== headSha) {
-              result.revertCheckpointSha = newHead;
+          if (result.virtualTreeSha && result.targetParentSha) {
+            const committed = await commitVirtualMergeResolution(REPO_ROOT, {
+              virtualTreeSha: result.virtualTreeSha,
+              preSyncSha: headSha,
+              newBaseSha: result.targetParentSha,
+              resolvedFiles: records.map((rec) => ({
+                path: rec.path,
+                content: rec.resolvedContent ?? '',
+              })),
+              identity: gitIdentity,
+              commitMessage: `halley-checkpoint: Undo published edit (${targetShas.map((s) => s.slice(0, 7)).join(', ')})\n\nCo-authored-by: ${gitIdentity.editorName} <${gitIdentity.editorEmail}>`,
+            });
+            if (committed.ok) {
+              // Convert commit to single-parent checkpoint on HEAD so history stays linear
+              const treeSha = (
+                await runLockedGit(REPO_ROOT, ['rev-parse', `${committed.mergeCommitSha}^{tree}`])
+              ).stdout.trim();
+              const linearRes = await runLockedGit(
+                REPO_ROOT,
+                [
+                  'commit-tree',
+                  treeSha,
+                  '-p',
+                  headSha,
+                  '-m',
+                  `halley-checkpoint: Undo published edit (${targetShas.map((s) => s.slice(0, 7)).join(', ')})\n\nCo-authored-by: ${gitIdentity.editorName} <${gitIdentity.editorEmail}>`,
+                ],
+                {
+                  GIT_AUTHOR_NAME: gitIdentity.botName,
+                  GIT_AUTHOR_EMAIL: gitIdentity.botEmail,
+                  GIT_COMMITTER_NAME: gitIdentity.botName,
+                  GIT_COMMITTER_EMAIL: gitIdentity.botEmail,
+                },
+              );
+              const linearSha = linearRes.stdout.trim();
+              if (linearRes.code === 0 && /^[0-9a-f]{40}$/i.test(linearSha)) {
+                await runLockedGit(REPO_ROOT, ['update-ref', 'HEAD', linearSha]);
+                result.revertCheckpointSha = linearSha;
+              } else {
+                result.revertCheckpointSha = committed.mergeCommitSha;
+              }
               resolvedAndCommitted = true;
+              activeVirtualTreeSha = undefined;
+            }
+          } else {
+            let allApplied = true;
+            for (const rec of records) {
+              const applied = await applyResolvedFile(
+                REPO_ROOT,
+                rec.path,
+                rec.resolvedContent ?? '',
+              );
+              if (!applied.ok) allApplied = false;
+            }
+            if (allApplied) {
+              await runLockedGit(
+                REPO_ROOT,
+                [
+                  '-c',
+                  `user.name=${gitIdentity.botName}`,
+                  '-c',
+                  `user.email=${gitIdentity.botEmail}`,
+                  'commit',
+                  '--no-edit',
+                ],
+                { GIT_EDITOR: 'true' },
+              );
+              const newHead = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
+              if (newHead && newHead !== headSha) {
+                result.revertCheckpointSha = newHead;
+                resolvedAndCommitted = true;
+              }
             }
           }
         }
@@ -1385,7 +1747,7 @@ async function main() {
           status: !needsChoices && resolvedAndCommitted ? 'ready_for_review' : 'needs_choices',
           preSyncSha: headSha,
           prevBaseSha: baseSha,
-          newBaseSha: baseSha,
+          newBaseSha: result.targetParentSha || baseSha,
           summary:
             !needsChoices && resolvedAndCommitted
               ? 'Combined your undo with newer live-site updates — please review.'
@@ -1394,6 +1756,7 @@ async function main() {
           upstreamCommits: [],
           touchedUserFiles: result.conflictedFiles,
         };
+        await persistMergeReviewState();
         return c.json({ ...result, changedFilesCount: changes.length, review: activeMergeState });
       }
       await pageService.syncPageRequestsFromDisk().catch(() => {});
@@ -1417,11 +1780,10 @@ async function main() {
     const targetRoutes = resolveVisualReviewRoutes(cards, activeRoute);
     const mergedFromLiveFiles =
       prevBaseSha && baseSha && prevBaseSha !== baseSha
-        ? await execFileAsync('git', ['diff', '--name-only', `${prevBaseSha}..${baseSha}`], {
-            cwd: REPO_ROOT,
-          })
-            .then((r) => r.stdout.split(/\r?\n/).filter(Boolean))
-            .catch(() => [] as string[])
+        ? (await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${prevBaseSha}..${baseSha}`]))
+            .stdout
+            .split(/\r?\n/)
+            .filter(Boolean)
         : [];
 
     const liveSiteUrl = await detectAstroSiteUrl(REPO_ROOT);
@@ -1449,8 +1811,11 @@ async function main() {
 
   app.post('/internal/verify', async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { pausePreview?: boolean };
-    const shouldPause = Boolean(body.pausePreview);
+    // Never need to pause live astro dev when isolated verify-sandbox is active
+    const shouldPause = Boolean(body.pausePreview) && !process.env.HALLEY_VERIFY_SANDBOX_DIR;
     if (shouldPause) {
+      currentPreviewPaused = true;
+      currentPreviewPauseReason = 'Running pre-publish checks…';
       broadcast({
         type: 'preview_paused',
         paused: true,
@@ -1461,7 +1826,7 @@ async function main() {
     try {
       const result = await runAllVerificationChecks(REPO_ROOT, {
         supervisorUrl: SUPERVISOR_URL || undefined,
-        hostSecret: WORKSPACE_HOST_SECRET || undefined,
+        hostSecret: activeHostSecret || undefined,
         sessionId: SESSION_ID,
         priority: 'foreground',
         onQueued: (position, message) => {
@@ -1509,6 +1874,8 @@ async function main() {
         } catch (err) {
           console.error('[halley-runner] Failed to resume astro dev after verify:', err);
         }
+        currentPreviewPaused = false;
+        currentPreviewPauseReason = undefined;
         broadcast({ type: 'preview_paused', paused: false });
       }
     }
@@ -1617,7 +1984,7 @@ async function main() {
     createServer,
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
     if ((req.url ?? '').startsWith('/ws')) {
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -1638,6 +2005,17 @@ async function main() {
         type: 'page_requests_sync',
         pageRequests: pageService.listPageRequests(),
       }),
+    );
+    ws.send(
+      JSON.stringify({
+        type: 'session_state_sync',
+        workspaceLocked: currentWorkspaceLocked,
+        lockedFile: currentLockedFile,
+        previewPaused: currentPreviewPaused,
+        previewPauseReason: currentPreviewPauseReason,
+        astroReady: astroManager.getStatus().ready,
+        mergeReview: activeMergeState,
+      } satisfies ChatServerMessage),
     );
     ws.on('message', async (raw) => {
       if (readOnly) {

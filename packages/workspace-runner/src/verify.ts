@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,8 +14,11 @@ import {
 } from '@halley/shared';
 import { detectAstroBase } from './astro-manager.js';
 import type { BuildPriority } from './build-queue.js';
+import { withRepoGitLock } from './checkpoints-and-git.js';
+import { NodeModulesCacheManager } from './nm-cache.js';
 
 const execFileAsync = promisify(execFile);
+const HAS_NICE_BIN = fsSync.existsSync('/usr/bin/nice') || fsSync.existsSync('/bin/nice');
 
 const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 
@@ -94,59 +98,61 @@ export async function ensureBuildArtifactsExcluded(repoRoot: string): Promise<vo
  * Returns `null` when `repoRoot` is not a Git repository.
  */
 export async function computeWorkingTreeKey(repoRoot: string): Promise<string | null> {
-  try {
-    const inside = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: repoRoot,
-    });
-    if (inside.stdout.trim() !== 'true') return null;
-  } catch {
-    return null;
-  }
-
-  await ensureBuildArtifactsExcluded(repoRoot);
-
-  // Fast path: clean working tree -> HEAD^{tree}
-  try {
-    const status = await execFileAsync('git', ['status', '--porcelain'], {
-      cwd: repoRoot,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    if (!status.stdout.trim()) {
-      const tree = await execFileAsync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repoRoot });
-      const sha = tree.stdout.trim();
-      if (sha) return sha;
-    }
-  } catch {
-    // Fall through to temp-index tree calculation (e.g. unborn HEAD)
-  }
-
-  // Dirty working tree: compute tree SHA using a temporary GIT_INDEX_FILE
-  const tmpIndex = path.join(os.tmpdir(), `halley-tree-idx-${crypto.randomUUID()}`);
-  try {
-    const realIndex = path.join(repoRoot, '.git', 'index');
+  return withRepoGitLock(repoRoot, async () => {
     try {
-      await fs.copyFile(realIndex, tmpIndex);
+      const inside = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
+        cwd: repoRoot,
+      });
+      if (inside.stdout.trim() !== 'true') return null;
     } catch {
-      // No index yet; git will create tmpIndex on git add -A
+      return null;
     }
-    const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
-    await execFileAsync('git', ['add', '-A'], { cwd: repoRoot, env, maxBuffer: 8 * 1024 * 1024 });
-    // Mirror sanitizeProtectedPaths so .github edits don't alter tree hash unexpectedly
-    await execFileAsync('git', ['reset', '-q', 'HEAD', '--', '.github'], { cwd: repoRoot, env }).catch(
-      async () => {
-        await execFileAsync('git', ['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', '.github'], {
-          cwd: repoRoot,
-          env,
-        }).catch(() => {});
-      },
-    );
-    const { stdout } = await execFileAsync('git', ['write-tree'], { cwd: repoRoot, env });
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  } finally {
-    await fs.rm(tmpIndex, { force: true }).catch(() => {});
-  }
+
+    await ensureBuildArtifactsExcluded(repoRoot);
+
+    // Fast path: clean working tree -> HEAD^{tree}
+    try {
+      const status = await execFileAsync('git', ['status', '--porcelain'], {
+        cwd: repoRoot,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      if (!status.stdout.trim()) {
+        const tree = await execFileAsync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repoRoot });
+        const sha = tree.stdout.trim();
+        if (sha) return sha;
+      }
+    } catch {
+      // Fall through to temp-index tree calculation (e.g. unborn HEAD)
+    }
+
+    // Dirty working tree: compute tree SHA using a temporary GIT_INDEX_FILE
+    const tmpIndex = path.join(os.tmpdir(), `halley-tree-idx-${crypto.randomUUID()}`);
+    try {
+      const realIndex = path.join(repoRoot, '.git', 'index');
+      try {
+        await fs.copyFile(realIndex, tmpIndex);
+      } catch {
+        // No index yet; git will create tmpIndex on git add -A
+      }
+      const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+      await execFileAsync('git', ['add', '-A'], { cwd: repoRoot, env, maxBuffer: 8 * 1024 * 1024 });
+      // Mirror sanitizeProtectedPaths so .github edits don't alter tree hash unexpectedly
+      await execFileAsync('git', ['reset', '-q', 'HEAD', '--', '.github'], { cwd: repoRoot, env }).catch(
+        async () => {
+          await execFileAsync('git', ['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', '.github'], {
+            cwd: repoRoot,
+            env,
+          }).catch(() => {});
+        },
+      );
+      const { stdout } = await execFileAsync('git', ['write-tree'], { cwd: repoRoot, env });
+      return stdout.trim() || null;
+    } catch {
+      return null;
+    } finally {
+      await fs.rm(tmpIndex, { force: true }).catch(() => {});
+    }
+  });
 }
 
 export interface RunShellOptions {
@@ -187,9 +193,9 @@ export async function runShell(
     ? existingNodeOpts
     : `${existingNodeOpts} --max-old-space-size=1024`.trim();
 
-  const spawnCmd = priority === 'speculative' ? 'nice' : 'bash';
-  const spawnArgs =
-    priority === 'speculative' ? ['-n', '10', 'bash', '-lc', command] : ['-lc', command];
+  const niceLevel = priority === 'speculative' ? '15' : '10';
+  const spawnCmd = HAS_NICE_BIN ? 'nice' : 'bash';
+  const spawnArgs = HAS_NICE_BIN ? ['-n', niceLevel, 'bash', '-lc', command] : ['-lc', command];
 
   return new Promise((resolve) => {
     const child = spawn(spawnCmd, spawnArgs, {
@@ -203,6 +209,7 @@ export async function runShell(
         FORCE_COLOR: '0',
         NO_COLOR: '1',
         CI: '1',
+        UV_THREADPOOL_SIZE: process.env.UV_THREADPOOL_SIZE || '4',
         NODE_OPTIONS: nodeOptions,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -567,6 +574,7 @@ export interface BuildLockClientOptions {
   supervisorUrl?: string;
   hostSecret?: string;
   sessionId?: string;
+  verifySandboxDir?: string;
   priority?: BuildPriority;
   signal?: AbortSignal;
   bypassCache?: boolean;
@@ -574,6 +582,81 @@ export interface BuildLockClientOptions {
   onAcquired?: () => void;
   onLeaseAcquired?: (leaseId: string) => void;
   onPreempted?: () => void;
+}
+
+async function syncVerifySandboxToTree(
+  sourceRepoRoot: string,
+  treeSha: string,
+  verifySandboxRoot: string,
+): Promise<string> {
+  const sandboxRepoDir = path.join(verifySandboxRoot, 'workspace');
+  const sandboxStateDir = path.join(verifySandboxRoot, 'state');
+  await fs.mkdir(sandboxRepoDir, { recursive: true });
+  await fs.mkdir(sandboxStateDir, { recursive: true });
+
+  const hasGit = await fs
+    .access(path.join(sandboxRepoDir, '.git'))
+    .then(() => true)
+    .catch(() => false);
+  if (!hasGit) {
+    await execFileAsync('git', ['init', '-q'], { cwd: sandboxRepoDir });
+  }
+
+  const infoDir = path.join(sandboxRepoDir, '.git', 'objects', 'info');
+  await fs.mkdir(infoDir, { recursive: true });
+  const alternates: string[] = [path.resolve(sourceRepoRoot, '.git', 'objects')];
+  if (process.env.HALLEY_MIRROR_PATH) {
+    const mirrorObjs = path.resolve(process.env.HALLEY_MIRROR_PATH, 'objects');
+    if (fsSync.existsSync(mirrorObjs)) {
+      alternates.push(mirrorObjs);
+    }
+  }
+  await fs.writeFile(path.join(infoDir, 'alternates'), `${alternates.join('\n')}\n`, 'utf8');
+
+  await execFileAsync('git', ['-c', 'safe.directory=*', 'read-tree', '--reset', '-u', treeSha], {
+    cwd: sandboxRepoDir,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  await execFileAsync(
+    'git',
+    ['-c', 'safe.directory=*', 'clean', '-fd', '-e', 'node_modules', '-e', '.astro'],
+    { cwd: sandboxRepoDir, maxBuffer: 16 * 1024 * 1024 },
+  );
+
+  const sourceNmReal = await fs
+    .realpath(path.join(sourceRepoRoot, 'node_modules'))
+    .catch(() => null);
+  const sandboxNmPath = path.join(sandboxRepoDir, 'node_modules');
+  if (sourceNmReal) {
+    const currentSandboxNm = await fs.realpath(sandboxNmPath).catch(() => null);
+    if (currentSandboxNm !== sourceNmReal) {
+      await fs.rm(sandboxNmPath, { recursive: true, force: true }).catch(() => {});
+      await fs.symlink(sourceNmReal, sandboxNmPath, 'dir');
+    }
+  } else if (
+    await fs
+      .access(path.join(sandboxRepoDir, 'package-lock.json'))
+      .then(() => true)
+      .catch(() =>
+        fs
+          .access(path.join(sandboxRepoDir, 'pnpm-lock.yaml'))
+          .then(() => true)
+          .catch(() => false),
+      )
+  ) {
+    const nmCacheDir =
+      process.env.HALLEY_NM_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'nm-cache');
+    const pkgCacheDir =
+      process.env.HALLEY_PKG_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'pkg-cache');
+    const nmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
+    await nmCache.ensureSessionNodeModules({
+      workspaceDir: sandboxRepoDir,
+      stateDir: sandboxStateDir,
+      devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
+    });
+  }
+
+  return sandboxRepoDir;
 }
 
 export async function promoteSupervisorBuildLock(
@@ -979,11 +1062,26 @@ export async function runAllVerificationChecks(
               }
             },
           },
-          () =>
-            runAllVerificationChecksUnlocked(repoRoot, {
+          async () => {
+            const sandboxRoot =
+              lockOpts?.verifySandboxDir || process.env.HALLEY_VERIFY_SANDBOX_DIR || '';
+            let targetRepoDir = repoRoot;
+            if (sandboxRoot && treeSha) {
+              try {
+                targetRepoDir = await syncVerifySandboxToTree(repoRoot, treeSha, sandboxRoot);
+              } catch (err) {
+                console.warn(
+                  '[halley-verify] Falling back to session workspace after verify-sandbox sync error:',
+                  err,
+                );
+                targetRepoDir = repoRoot;
+              }
+            }
+            return runAllVerificationChecksUnlocked(targetRepoDir, {
               signal: ac.signal,
               getPriority: () => runEntry.priority,
-            }),
+            });
+          },
         );
 
         if (!outcome.aborted && !outcome.transient && treeSha) {

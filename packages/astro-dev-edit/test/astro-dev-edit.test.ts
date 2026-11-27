@@ -102,6 +102,80 @@ const title = 'Home';
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('preserves lossless attributes (id, style, aria-*, data-*) and relative/hash/mailto links', () => {
+    const html = `<span id="hero-badge" class="pill" style="letter-spacing: 0.05em" aria-label="Featured" data-track="cta-1">New</span> <a href="#schedule">Schedule</a> <a href="visiting">Visiting</a> <a href="mailto:hello@example.org">Email</a>`;
+    const res = serializeHtmlToAstro(html, {
+      previewBase: '/p/sess123/thecrossing.website',
+      originalBase: '/thecrossing.website',
+      hasUrlHelperFile: true,
+    });
+    expect(res.needsUrlImport).toBe(false);
+    expect(res.astroSource).toContain('id="hero-badge"');
+    expect(res.astroSource).toContain('style="letter-spacing: 0.05em"');
+    expect(res.astroSource).toContain('aria-label="Featured"');
+    expect(res.astroSource).toContain('data-track="cta-1"');
+    expect(res.astroSource).toContain('<a href="#schedule">Schedule</a>');
+    expect(res.astroSource).toContain('<a href="visiting">Visiting</a>');
+    expect(res.astroSource).toContain('<a href="mailto:hello@example.org">Email</a>');
+  });
+
+  it('injects url() import cleanly even with leading frontmatter comments and handles escaped quotes + same-line UTF-8 loc shifts', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-edit-edge-'));
+    try {
+      await fs.mkdir(path.join(tmp, 'src/pages/ministries'), { recursive: true });
+      await fs.mkdir(path.join(tmp, 'src/lib'), { recursive: true });
+      await fs.writeFile(path.join(tmp, 'src/lib/url.ts'), 'export const url = (p: string) => p;\n');
+
+      // Line 7 has a multi-byte UTF-8 em-dash BEFORE the second <span> on the exact same line,
+      // plus an attribute with escaped quotes!
+      const astroFile = `---
+// Top-of-frontmatter comment with --- inside comment
+/* Multi-line comment */
+const heading = 'Youth';
+---
+<main>
+  <div><span> Sunday — 10:00 AM </span><span data-quote="He said \\"Welcome > all\\"">Gather together</span></div>
+</main>
+`;
+      const absPage = path.join(tmp, 'src/pages/ministries/youth.astro');
+      await fs.writeFile(absPage, astroFile);
+
+      // Parse with @astrojs/compiler via inspectAstroElement: find the exact column of the second <span>
+      const line7 = astroFile.split('\n')[6]!;
+      const secondSpanCharIdx = line7.indexOf('<span data-quote');
+      // @astrojs/compiler reports 1-indexed UTF-8 BYTE column on the line
+      const secondSpanByteCol = Buffer.byteLength(line7.slice(0, secondSpanCharIdx), 'utf8') + 1;
+      const loc = `7:${secondSpanByteCol}`;
+
+      const inspected = await inspectAstroElement(astroFile, loc);
+      expect(inspected?.editability).toBe('editable-static');
+      expect(inspected?.innerSource).toBe('Gather together');
+
+      const lock = new PerFileMutex();
+      const ok = await patchStaticSpan({
+        repoRoot: tmp,
+        relFile: 'src/pages/ministries/youth.astro',
+        loc,
+        expectedHash: inspected!.snapshotHash,
+        newHtml: 'Gather <a href="/p/s1/thecrossing.website/im-new">with us</a>',
+        previewBase: '/p/s1/thecrossing.website',
+        originalBase: '/thecrossing.website',
+        fileLock: lock,
+      });
+      expect(ok.ok).toBe(true);
+      const updated = await fs.readFile(absPage, 'utf8');
+      // Relative depth from src/pages/ministries/youth.astro -> ../../lib/url
+      expect(updated).toContain(`import { url } from '../../lib/url';`);
+      // First span on the same line must remain completely intact!
+      expect(updated).toContain('<span> Sunday — 10:00 AM </span>');
+      expect(updated).toContain(
+        `<span data-quote="He said \\"Welcome > all\\"">Gather <a href={url('/im-new')}>with us</a></span>`,
+      );
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('client-bridge script', () => {

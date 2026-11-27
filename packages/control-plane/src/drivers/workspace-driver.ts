@@ -196,7 +196,12 @@ export interface WorkspaceDriver {
   startWarmPool?(): void;
   stopWarmPool?(): Promise<void>;
   reserveWarmWorkspace?(): Promise<WarmReservation | null> | WarmReservation | null;
+  releaseWarmWorkspace?(id: string): Promise<void>;
   getWarmPoolStatus?(): WarmPoolStatus;
+  touchSession?(sessionId: string): void;
+  notifyMirrorUpdated?(baseBranch: string): void;
+  deferSpeculativeBuilds?(durationMs: number): void;
+  isSessionAstroReady?(sessionId: string): boolean;
   scanRepository?(baseBranch: string): Promise<{
     sha: string;
     report: AstroAuditReportDto;

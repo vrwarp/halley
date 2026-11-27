@@ -404,13 +404,24 @@ export class HalleyPiRuntime {
     const isLikelyReadOnlyBash = (cmd: string): boolean => {
       const trimmed = cmd.trim();
       if (!trimmed) return true;
-      if (/[<>]|&&|\|\||;|\b(?:rm|mv|cp|mkdir|touch|tee|chmod|chown|sed\s+-i|perl\s+-i|git\s+(?:add|commit|checkout|reset|revert|merge|rebase|clean|rm|mv))\b/.test(trimmed)) {
+      if (
+        /[<>]|&&|\|\||;|\b(?:rm|mv|cp|mkdir|touch|tee|chmod|chown|sed\s+-i|perl\s+-i|python3?|node|tsx|npx|npm|pnpm|yarn|git\s+(?:add|commit|checkout|reset|revert|merge|rebase|clean|rm|mv|stash|tag|branch\s+-[dDmMfF]))\b/.test(
+          trimmed,
+        )
+      ) {
         return false;
       }
-      return /^(?:rg|grep|ls|cat|head|tail|find|jq|wc|stat|file|pwd|echo|git\s+(?:status|diff|log|show|rev-parse|branch))\b/.test(trimmed);
+      if (/^find\b/.test(trimmed) && /\s-(?:delete|exec|execdir|ok|fls|fprint)\b/.test(trimmed)) {
+        return false;
+      }
+      return /^(?:rg|grep|ls|cat|head|tail|find|jq|wc|stat|file|pwd|echo|git\s+(?:status|diff|log|show|rev-parse|branch))\b/.test(
+        trimmed,
+      );
     };
 
+    let mutatedInCurrentRun = false;
     const trackMutation = async <T>(fn: () => Promise<T>): Promise<T> => {
+      mutatedInCurrentRun = true;
       const p = fn();
       inFlightMutations.add(p);
       try {
@@ -601,7 +612,10 @@ export class HalleyPiRuntime {
           while (inFlightScreenshots.size > 0) {
             await Promise.allSettled([...inFlightScreenshots]);
           }
-          await opts.pauseAstroForBuild?.();
+          const needsAstroPause = !process.env.HALLEY_VERIFY_SANDBOX_DIR;
+          if (needsAstroPause) {
+            await opts.pauseAstroForBuild?.();
+          }
           try {
             const { allPassed, results } = await runAllVerificationChecks(opts.repoRoot, {
               supervisorUrl: opts.supervisorUrl,
@@ -629,9 +643,11 @@ export class HalleyPiRuntime {
               isError: true,
             };
           } finally {
-            await opts.resumeAstroAfterBuild?.().catch((err) => {
-              console.warn('[halley-pi] Failed to resume Astro after run_checks:', err);
-            });
+            if (needsAstroPause) {
+              await opts.resumeAstroAfterBuild?.().catch((err) => {
+                console.warn('[halley-pi] Failed to resume Astro after run_checks:', err);
+              });
+            }
           }
         })();
         inFlightChecks.add(runTask);
@@ -740,18 +756,22 @@ export class HalleyPiRuntime {
         ctx: Parameters<typeof base.execute>[2],
       ) => {
         const cmd = String((args as Record<string, unknown>).command ?? '');
+        if (isLikelyReadOnlyBash(cmd)) {
+          return base.execute(args as never, api, ctx);
+        }
         const runBash = () =>
           trackMutation(async () => {
             if (cmd && isDependencyMutationCommand(cmd)) {
-              await detachHardlinkedNodeModules(opts.repoRoot, opts.stateDir).catch(() => {});
+              await detachHardlinkedNodeModules(
+                opts.repoRoot,
+                opts.stateDir,
+                process.env.HALLEY_PKG_CACHE_DIR,
+              ).catch(() => {});
             }
             const res = await base.execute(args as never, api, ctx);
             await sanitizeProtectedPaths(opts.repoRoot).catch(() => {});
             return res;
           });
-        if (isLikelyReadOnlyBash(cmd)) {
-          return runBash();
-        }
         return withWorkspaceLock('shell', runBash);
       },
     }));
@@ -815,19 +835,21 @@ export class HalleyPiRuntime {
         }),
         hook(GenerationTask, {
           afterRun: async (run, api, context) => {
+            const didMutate = mutatedInCurrentRun;
+            mutatedInCurrentRun = false;
             const { items } = await api.entries(
               { minEntryId: run.first, maxEntryId: run.last, order: 'ascending' },
               500,
               undefined,
               context,
             );
-            const mutated = items.some((entry) => {
+            const nonBashMutated = items.some((entry) => {
               if (!ToolResultEntry.is(entry)) return false;
               const msg = entry.model?.[0];
               if (!msg || msg.role !== 'toolResult') return false;
-              return ['edit', 'write', 'bash', 'process_image'].includes(msg.toolName);
+              return ['edit', 'write', 'process_image'].includes(msg.toolName);
             });
-            if (mutated) {
+            if (didMutate || nonBashMutated) {
               await opts.onRunFinishedWithEdits('Update via Halley chat');
             }
             if (opts.pageService && this.trackedPageRequestIds.size > 0) {
@@ -1184,6 +1206,11 @@ export class HalleyPiRuntime {
     editorContext?: EditorContext;
     whenBusy?: 'steer' | 'followUp';
   }): Promise<void> {
+    if (this.activePurpose !== 'chat') {
+      await this.reconfigureModel(this.opts.modelId, 'chat', this.opts.thinkingLevel).catch(() => {
+        this.activePurpose = 'chat';
+      });
+    }
     if (input.editorContext) {
       this.lastEditorContext = input.editorContext;
     }
@@ -1305,7 +1332,17 @@ export class HalleyPiRuntime {
     await this.root.abort(BACKGROUND_CONTEXT);
     if (this.opts.pageService && this.trackedPageRequestIds.size > 0) {
       for (const id of Array.from(this.trackedPageRequestIds)) {
-        await this.opts.pageService.updateStatus(id, 'failed', 'Stopped before finishing this page.');
+        const pr = this.opts.pageService.getPageRequest(id);
+        if (!pr) {
+          this.trackedPageRequestIds.delete(id);
+          continue;
+        }
+        const stillPlaceholder = await this.opts.pageService.fileStillHasPlaceholder(pr.file);
+        if (stillPlaceholder) {
+          await this.opts.pageService.updateStatus(id, 'failed', 'Stopped before finishing this page.');
+        } else {
+          await this.opts.pageService.updateStatus(id, 'done');
+        }
         this.trackedPageRequestIds.delete(id);
       }
     }
