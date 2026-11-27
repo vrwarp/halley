@@ -16,6 +16,15 @@ export interface GitIdentity {
   editorEmail: string;
 }
 
+function normalizeGitIdentity(identity?: Partial<GitIdentity> | null): GitIdentity {
+  return {
+    botName: identity?.botName?.trim() || 'Halley Bot',
+    botEmail: identity?.botEmail?.trim() || 'halley-bot@users.noreply.github.com',
+    editorName: identity?.editorName?.trim() || 'Editor',
+    editorEmail: identity?.editorEmail?.trim() || 'editor@users.noreply.github.com',
+  };
+}
+
 async function gitUnlocked(
   cwd: string,
   args: string[],
@@ -159,14 +168,15 @@ export async function createCheckpoint(
     if (!status.stdout.trim()) return null;
 
     await gitUnlocked(repoRoot, ['add', '-A']);
+    const id = normalizeGitIdentity(identity);
     const cleanMsg = summary.replace(/\r?\n/g, ' ').trim() || 'Update website';
-    const fullMsg = `halley-checkpoint: ${cleanMsg}\n\nCo-authored-by: ${identity.editorName} <${identity.editorEmail}>`;
+    const fullMsg = `halley-checkpoint: ${cleanMsg}\n\nCo-authored-by: ${id.editorName} <${id.editorEmail}>`;
 
     const commit = await gitUnlocked(repoRoot, [
       '-c',
-      `user.name=${identity.botName}`,
+      `user.name=${id.botName}`,
       '-c',
-      `user.email=${identity.botEmail}`,
+      `user.email=${id.botEmail}`,
       'commit',
       '-m',
       fullMsg,
@@ -507,15 +517,16 @@ export async function virtualMergeWithBase(
     const treeSha = outLines[0]?.trim() ?? '';
 
     if (mergeTree.code === 0 && /^[0-9a-f]{40}$/i.test(treeSha)) {
+      const id = normalizeGitIdentity(opts.identity);
       const commitMsg = `halley-sync: Updated from live site (${newBaseSha.slice(0, 7)})`;
       const commitTree = await gitUnlocked(
         repoRoot,
         ['commit-tree', treeSha, '-p', preSyncSha, '-p', newBaseSha, '-m', commitMsg],
         {
-          GIT_AUTHOR_NAME: opts.identity.botName,
-          GIT_AUTHOR_EMAIL: opts.identity.botEmail,
-          GIT_COMMITTER_NAME: opts.identity.botName,
-          GIT_COMMITTER_EMAIL: opts.identity.botEmail,
+          GIT_AUTHOR_NAME: id.botName,
+          GIT_AUTHOR_EMAIL: id.botEmail,
+          GIT_COMMITTER_NAME: id.botName,
+          GIT_COMMITTER_EMAIL: id.botEmail,
         },
       );
       const mergeCommitSha = commitTree.stdout.trim();
@@ -690,16 +701,17 @@ export async function commitVirtualMergeResolution(
         return { ok: false, error: `Failed to write resolved tree: ${writtenTree.stderr}` };
       }
 
+      const id = normalizeGitIdentity(opts.identity);
       const msg =
         opts.commitMessage || `halley-sync: Updated from live site (${opts.newBaseSha.slice(0, 7)})`;
       const commitRes = await gitUnlocked(
         repoRoot,
         ['commit-tree', finalTreeSha, '-p', currentHeadSha, '-p', opts.newBaseSha, '-m', msg],
         {
-          GIT_AUTHOR_NAME: opts.identity.botName,
-          GIT_AUTHOR_EMAIL: opts.identity.botEmail,
-          GIT_COMMITTER_NAME: opts.identity.botName,
-          GIT_COMMITTER_EMAIL: opts.identity.botEmail,
+          GIT_AUTHOR_NAME: id.botName,
+          GIT_AUTHOR_EMAIL: id.botEmail,
+          GIT_COMMITTER_NAME: id.botName,
+          GIT_COMMITTER_EMAIL: id.botEmail,
         },
       );
       const mergeCommitSha = commitRes.stdout.trim();

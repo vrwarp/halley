@@ -197,9 +197,16 @@ describe('v2 workspace-runner hardening invariants', () => {
       const draftContent = '<h1>Sunday Service at 10:00 AM — Coffee at 9:30 AM</h1>\n';
       await fs.writeFile(path.join(sessionRepo, 'src/pages/index.astro'), draftContent);
 
+      const testIdentity = {
+        botName: 'Halley Bot',
+        botEmail: 'halley-bot@example.org',
+        editorName: 'Editor',
+        editorEmail: 'editor@example.org',
+      };
+
       const res = await virtualMergeWithBase(sessionRepo, {
         baseBranch: 'main',
-        identity: { name: 'Editor', email: 'editor@example.org' },
+        identity: testIdentity,
       });
 
       expect(res.status).toBe('conflict');
@@ -223,7 +230,7 @@ describe('v2 workspace-runner hardening invariants', () => {
             content: '<h1>Sunday Service at 10:30 AM — Coffee at 10:00 AM</h1>\n',
           },
         ],
-        identity: { name: 'Editor', email: 'editor@example.org' },
+        identity: testIdentity,
       });
       expect(commitRes.ok).toBe(true);
       expect(await fs.readFile(path.join(sessionRepo, 'src/pages/index.astro'), 'utf8')).toContain(
