@@ -5,10 +5,13 @@ import type {
   UserDto,
   VerificationCheckResult,
 } from '@halley/shared';
-import type { HalleyConfig } from '../config.js';
+import { resolveLiveSiteUrl, type HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, PublishRunRecord, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
-import { GitHubApiError, type GitHubService } from '../github/client.js';
+import { GitHubApiError, isTransientGitHubError, type GitHubService } from '../github/client.js';
+
+const TRANSIENT_GITHUB_ERROR_MESSAGE =
+  'GitHub had a temporary hiccup while publishing your changes. Your edits are safe — please try publishing again in a moment.';
 
 export interface DeployPollOptions {
   initialDelayMs?: number;
@@ -196,10 +199,16 @@ export class PublishService {
       );
     } catch (err) {
       this.db.deletePublishRun(session.id);
+      const transient = isTransientGitHubError(err);
       this.setState(session.id, 'failed_ci', {
         prNumber: run.pr_number,
         prUrl: run.pr_url,
-        error: err instanceof Error ? err.message : 'Failed resuming CI check after restart',
+        error: transient
+          ? TRANSIENT_GITHUB_ERROR_MESSAGE
+          : err instanceof Error
+            ? err.message
+            : 'Failed resuming CI check after restart',
+        ...(transient ? { retryable: true } : {}),
       });
     } finally {
       this.activePublishes.delete(session.id);
@@ -571,16 +580,23 @@ export class PublishService {
       this.db.deletePublishRun(sessionInput.id);
       const rawMsg = err instanceof Error ? err.message : 'Publish failed unexpectedly';
       const crashInfo = this.driver.getCrashInfo?.(sessionInput.id);
+      const isTransientGitHub = err instanceof GitHubApiError && isTransientGitHubError(err);
       const isRunnerDisconnect =
-        /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg);
+        !isTransientGitHub && /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg);
+      const isRetryable = isTransientGitHub || isRunnerDisconnect || isTransientGitHubError(err);
       const friendlyError =
         crashInfo?.oom
           ? 'The workspace ran out of memory while running publish checks. Restart the workspace and try publishing again.'
-          : isRunnerDisconnect
-            ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
-            : rawMsg;
+          : isTransientGitHub
+            ? TRANSIENT_GITHUB_ERROR_MESSAGE
+            : isRunnerDisconnect
+              ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
+              : isTransientGitHubError(err)
+                ? TRANSIENT_GITHUB_ERROR_MESSAGE
+                : rawMsg;
       this.setState(sessionInput.id, 'failed_checks', {
         error: friendlyError,
+        ...(isRetryable ? { retryable: true } : {}),
       });
     } finally {
       this.activePublishes.delete(sessionInput.id);
@@ -685,32 +701,60 @@ export class PublishService {
     const ciRegDeadline = startedAt + this.deployPollOptions.ciRegistrationGraceMs;
     let checkedCiPresence = false;
     let hasCiWorkflow = false;
+    let consecutiveErrors = 0;
 
     while (Date.now() < deadline) {
-      const prState = await this.github.getPrState(opts.prNumber);
-      if (prState.merged && prState.mergeCommitSha) {
-        return prState.mergeCommitSha;
-      }
-      if (prState.state === 'closed') {
-        this.setState(opts.session.id, 'failed_ci', {
-          prNumber: opts.prNumber,
-          prUrl: opts.prUrl,
-          error: 'Pull Request was closed before merging.',
-        });
-        return null;
+      let prState;
+      let targetSha = opts.headSha;
+      let ci;
+      try {
+        prState = await this.github.getPrState(opts.prNumber);
+        if (prState.merged && prState.mergeCommitSha) {
+          return prState.mergeCommitSha;
+        }
+        if (prState.state === 'closed') {
+          this.setState(opts.session.id, 'failed_ci', {
+            prNumber: opts.prNumber,
+            prUrl: opts.prUrl,
+            error: 'Pull Request was closed before merging.',
+          });
+          return null;
+        }
+
+        if (opts.headSha && prState.headSha && prState.headSha !== opts.headSha) {
+          this.setState(opts.session.id, 'failed_ci', {
+            prNumber: opts.prNumber,
+            prUrl: opts.prUrl,
+            error: `Pull Request branch head changed unexpectedly (${prState.headSha.slice(0, 7)} vs verified ${opts.headSha.slice(0, 7)}). Please click Publish again.`,
+          });
+          return null;
+        }
+
+        targetSha = opts.headSha || prState.headSha;
+        ci = await this.github.checkCommitStatus(targetSha);
+        consecutiveErrors = 0;
+      } catch (err) {
+        if (!isTransientGitHubError(err)) {
+          throw err;
+        }
+        consecutiveErrors += 1;
+        if (consecutiveErrors >= this.deployPollOptions.maxConsecutiveErrors) {
+          this.setState(opts.session.id, 'failed_ci', {
+            prNumber: opts.prNumber,
+            prUrl: opts.prUrl,
+            error: TRANSIENT_GITHUB_ERROR_MESSAGE,
+            retryable: true,
+          });
+          return null;
+        }
+        const backoffMs = Math.min(
+          15_000,
+          this.deployPollOptions.ciPollIntervalMs * 2 ** (consecutiveErrors - 1),
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        continue;
       }
 
-      if (opts.headSha && prState.headSha && prState.headSha !== opts.headSha) {
-        this.setState(opts.session.id, 'failed_ci', {
-          prNumber: opts.prNumber,
-          prUrl: opts.prUrl,
-          error: `Pull Request branch head changed unexpectedly (${prState.headSha.slice(0, 7)} vs verified ${opts.headSha.slice(0, 7)}). Please click Publish again.`,
-        });
-        return null;
-      }
-
-      const targetSha = opts.headSha || prState.headSha;
-      const ci = await this.github.checkCommitStatus(targetSha);
       if (ci.state === 'failed') {
         this.setState(opts.session.id, 'failed_ci', {
           prNumber: opts.prNumber,
@@ -780,10 +824,12 @@ export class PublishService {
     if (updated) {
       await this.driver.stop(updated).catch(() => {});
     }
+    const liveSiteUrl = resolveLiveSiteUrl(this.config);
     this.setState(sessionId, 'published', {
       prNumber,
       prUrl,
       ...(deployUrl ? { deployUrl } : {}),
+      ...(liveSiteUrl ? { liveSiteUrl } : {}),
     });
     this.onSessionMetaUpdated?.(sessionId);
   }

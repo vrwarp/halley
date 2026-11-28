@@ -87,6 +87,7 @@ export function createControlPlane(
 
   const enrichSessionDto = (s: import('./db.js').SessionRecord, user: UserDto) => ({
     ...db.toSessionDto(s, user),
+    liveSiteUrl: resolveLiveSiteUrl(config),
     astroReady: driver.isSessionAstroReady
       ? driver.isSessionAstroReady(s.id)
       : Boolean(s.astro_url && s.status === 'running'),

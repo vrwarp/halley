@@ -118,7 +118,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
 
     const stopped: string[] = [];
     const broadcasts: PublishProgressPayload[] = [];
-    const github = new GitHubService(cfg);
+    const github = new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0 });
     const publish = new PublishService(
       cfg,
       db,
@@ -360,7 +360,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
     const second = await setupSession(failingMock.url);
     await second.publish.retryDeployCheck(second.session);
 
-    expect(failCalls).toBe(3);
+    // 3 consecutive poll failures * (1 initial + 3 client retries) = 12 attempts
+    expect(failCalls).toBe(12);
     expect(second.db.getSession(second.session.id)?.status).toBe('merged');
     expect(second.db.getSession(second.session.id)?.publish_state).toBe('failed_deploy');
     expect(second.db.getSession(second.session.id)?.publish_error).toContain('failed repeatedly');
@@ -693,5 +694,291 @@ describe('deploy workflow matching & deploy check reliability', () => {
     expect(checkRunPolls).toBe(3);
     expect(mergeCalls).toBe(1);
     expect(db.getSession(session.id)?.publish_state).toBe('published');
+  });
+
+  it('recovers from transient 500s on /check-runs during CI polling and broadcasts liveSiteUrl on publish', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-ci-retry-test-'));
+    const runner = await startMockGitHub((_req, res, url) => {
+      if (url.pathname === '/internal/git/checkpoint') {
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      if (url.pathname === '/internal/sync/start') {
+        res.end(JSON.stringify({ heldForUser: false, review: { status: 'clean', alreadyUpToDate: true } }));
+        return;
+      }
+      if (url.pathname === '/internal/verify') {
+        res.end(JSON.stringify({ allPassed: true, results: [] }));
+        return;
+      }
+      if (url.pathname === '/internal/git/protected-diff') {
+        res.end(JSON.stringify({ clean: true, protectedFiles: [] }));
+        return;
+      }
+      res.end(JSON.stringify({ ok: true }));
+    });
+    cleanups.push(() => runner.close());
+
+    let checkRunAttempts = 0;
+    const gh = await startMockGitHub((req, res, url) => {
+      if (url.pathname.endsWith('/pulls') && req.method === 'GET') {
+        res.end(JSON.stringify([]));
+        return;
+      }
+      if (url.pathname.endsWith('/pulls') && req.method === 'POST') {
+        res.end(
+          JSON.stringify({
+            number: 88,
+            html_url: 'https://github.com/vrwarp/thecrossing.website/pull/88',
+            node_id: 'PR_kw88',
+            head: { sha: 'head500' },
+          }),
+        );
+        return;
+      }
+      if (url.pathname === '/graphql') {
+        res.end(JSON.stringify({ errors: [{ message: 'auto-merge disabled' }] }));
+        return;
+      }
+      if (url.pathname.endsWith('/pulls/88') && req.method === 'GET') {
+        res.end(JSON.stringify({ merged: false, merge_commit_sha: null, state: 'open', head: { sha: 'head500' } }));
+        return;
+      }
+      if (url.pathname.endsWith('/check-runs')) {
+        checkRunAttempts += 1;
+        // Return 500 on the first 5 attempts (exhausts 1 client call's 4 attempts + 1 poll retry)
+        if (checkRunAttempts <= 5) {
+          res.writeHead(500);
+          res.end('');
+          return;
+        }
+        res.end(
+          JSON.stringify({
+            total_count: 1,
+            check_runs: [{ id: 1, name: 'CI / verify', status: 'completed', conclusion: 'success' }],
+          }),
+        );
+        return;
+      }
+      if (url.pathname.endsWith('/status')) {
+        res.end(JSON.stringify({ state: 'success', statuses: [] }));
+        return;
+      }
+      if (url.pathname.endsWith('/pulls/88/merge') && req.method === 'PUT') {
+        res.end(JSON.stringify({ sha: 'merged500' }));
+        return;
+      }
+      if (url.pathname.endsWith('/actions/runs')) {
+        res.end(
+          JSON.stringify({
+            workflow_runs: [
+              {
+                id: 901,
+                name: 'Deploy to GitHub Pages',
+                path: '.github/workflows/deploy.yml',
+                event: 'push',
+                status: 'completed',
+                conclusion: 'success',
+                html_url: 'https://github.com/vrwarp/thecrossing.website/actions/runs/901',
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ message: 'not found' }));
+    });
+    cleanups.push(() => gh.close());
+
+    const cfg = {
+      ...loadConfig(),
+      dataDir: tmp,
+      repo: 'vrwarp/thecrossing.website',
+      liveSiteUrl: '',
+      githubApiBaseUrl: gh.url,
+      githubToken: 'test-token',
+      githubAppId: '',
+      githubAppPrivateKey: '',
+      githubAppInstallationId: '',
+    };
+    const db = new ControlPlaneDb(path.join(tmp, 'halley.db'), cfg);
+    cleanups.push(async () => {
+      db.db.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    });
+
+    const user = db.upsertUser({ email: 'e@thecrossing.website', name: 'Editor', picture: null });
+    const session = db.createSession({
+      id: 'sess-ci-500-recover',
+      title: 'Sync events',
+      slug: 'sync-events',
+      ownerUserId: user.id,
+      repo: cfg.repo,
+      baseBranch: 'main',
+      workingBranch: 'halley/sync-500',
+      volumeName: 'vol-sync-500',
+      workspaceTokenHash: 'hash-sync-500',
+    });
+
+    const broadcasts: PublishProgressPayload[] = [];
+    const driver: WorkspaceDriver = {
+      ...createStubDriver(),
+      ensureRunning: async () => ({
+        runnerUrl: runner.url,
+        astroUrl: '',
+        astroBase: '',
+        baseSha: 'base000',
+      }),
+    };
+    const publish = new PublishService(
+      cfg,
+      db,
+      driver,
+      new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0 }),
+      (_id, payload) => broadcasts.push(payload),
+      undefined,
+      {
+        initialDelayMs: 0,
+        pollIntervalMs: 5,
+        ciPollIntervalMs: 5,
+        ciRegistrationGraceMs: 500,
+        runRegistrationGraceMs: 500,
+        maxConsecutiveErrors: 3,
+        timeoutMs: 5000,
+      },
+    );
+
+    await publish.publish(
+      session,
+      { id: user.id, email: user.email, name: user.name, picture: null, isAdmin: true, persona: 'non-technical' },
+      { title: 'Sync events', summary: 'Updated events.' },
+    );
+
+    expect(checkRunAttempts).toBe(6);
+    expect(db.getSession(session.id)?.publish_state).toBe('published');
+    const publishedBroadcast = broadcasts.at(-1);
+    expect(publishedBroadcast?.state).toBe('published');
+    expect(publishedBroadcast?.liveSiteUrl).toBe('https://vrwarp.github.io/thecrossing.website');
+  });
+
+  it('marks persistent /check-runs 500 errors as retryable with a plain-English message', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-ci-500-fail-'));
+    const runner = await startMockGitHub((_req, res, url) => {
+      if (url.pathname === '/internal/sync/start') {
+        res.end(JSON.stringify({ heldForUser: false, review: { status: 'clean', alreadyUpToDate: true } }));
+        return;
+      }
+      if (url.pathname === '/internal/verify') {
+        res.end(JSON.stringify({ allPassed: true, results: [] }));
+        return;
+      }
+      if (url.pathname === '/internal/git/protected-diff') {
+        res.end(JSON.stringify({ clean: true, protectedFiles: [] }));
+        return;
+      }
+      res.end(JSON.stringify({ ok: true }));
+    });
+    cleanups.push(() => runner.close());
+
+    const gh = await startMockGitHub((req, res, url) => {
+      if (url.pathname.endsWith('/pulls') && req.method === 'GET') {
+        res.end(JSON.stringify([]));
+        return;
+      }
+      if (url.pathname.endsWith('/pulls') && req.method === 'POST') {
+        res.end(
+          JSON.stringify({
+            number: 89,
+            html_url: 'https://github.com/vrwarp/thecrossing.website/pull/89',
+            node_id: 'PR_kw89',
+            head: { sha: 'head500fail' },
+          }),
+        );
+        return;
+      }
+      if (url.pathname === '/graphql') {
+        res.end(JSON.stringify({ errors: [{ message: 'disabled' }] }));
+        return;
+      }
+      if (url.pathname.endsWith('/pulls/89') && req.method === 'GET') {
+        res.end(JSON.stringify({ merged: false, merge_commit_sha: null, state: 'open', head: { sha: 'head500fail' } }));
+        return;
+      }
+      if (url.pathname.endsWith('/check-runs')) {
+        res.writeHead(500);
+        res.end('');
+        return;
+      }
+      res.writeHead(404);
+      res.end(JSON.stringify({ message: 'not found' }));
+    });
+    cleanups.push(() => gh.close());
+
+    const cfg = {
+      ...loadConfig(),
+      dataDir: tmp,
+      repo: 'vrwarp/thecrossing.website',
+      githubApiBaseUrl: gh.url,
+      githubToken: 'test-token',
+      githubAppId: '',
+      githubAppPrivateKey: '',
+      githubAppInstallationId: '',
+    };
+    const db = new ControlPlaneDb(path.join(tmp, 'halley.db'), cfg);
+    cleanups.push(async () => {
+      db.db.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    });
+
+    const user = db.upsertUser({ email: 'e@thecrossing.website', name: 'Editor', picture: null });
+    const session = db.createSession({
+      id: 'sess-ci-500-fail',
+      title: 'Persistent 500',
+      slug: 'persistent-500',
+      ownerUserId: user.id,
+      repo: cfg.repo,
+      baseBranch: 'main',
+      workingBranch: 'halley/sync-500-fail',
+      volumeName: 'vol-sync-500-fail',
+      workspaceTokenHash: 'hash-sync-500-fail',
+    });
+
+    const broadcasts: PublishProgressPayload[] = [];
+    const driver: WorkspaceDriver = {
+      ...createStubDriver(),
+      ensureRunning: async () => ({
+        runnerUrl: runner.url,
+        astroUrl: '',
+        astroBase: '',
+        baseSha: 'base000',
+      }),
+    };
+    const publish = new PublishService(
+      cfg,
+      db,
+      driver,
+      new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0, maxRetries: 1 }),
+      (_id, payload) => broadcasts.push(payload),
+      undefined,
+      {
+        initialDelayMs: 0,
+        pollIntervalMs: 5,
+        ciPollIntervalMs: 5,
+        maxConsecutiveErrors: 2,
+        timeoutMs: 5000,
+      },
+    );
+
+    await publish.publish(
+      session,
+      { id: user.id, email: user.email, name: user.name, picture: null, isAdmin: true, persona: 'non-technical' },
+      { title: 'Persistent 500', summary: 'Updated events.' },
+    );
+
+    const finalBroadcast = broadcasts.at(-1);
+    expect(finalBroadcast?.state).toBe('failed_ci');
+    expect(finalBroadcast?.retryable).toBe(true);
+    expect(finalBroadcast?.error).toContain('GitHub had a temporary hiccup');
   });
 });
