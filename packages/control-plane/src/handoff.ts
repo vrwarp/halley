@@ -1,5 +1,6 @@
 import type { RevertedCommitSummaryDto, SessionArchiveDto } from '@halley/shared';
 import type { SessionRecord } from './db.js';
+import { ignore } from './log.js';
 
 interface TranscriptEntryShape {
   role?: string;
@@ -70,9 +71,14 @@ export function extractTranscriptTurnDigest(
 
   let entries: TranscriptEntryShape[] = [];
   try {
-    const parsed = JSON.parse(transcriptJson) as { entries?: TranscriptEntryShape[] };
-    entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-  } catch {
+    const parsed = JSON.parse(transcriptJson) as { entries?: TranscriptEntryShape[] } | null;
+    entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    // A corrupt archived transcript only loses the conversational part of the handoff.
+    ignore(err, 'handoff: archived transcript is not valid JSON; omitting conversation turns', {
+      length: transcriptJson.length,
+    });
     return { turns: [], stagedUploads: [], formatted: '' };
   }
 
@@ -133,23 +139,29 @@ export function extractTranscriptTurnDigest(
 
 function formatDiffSummaryFiles(diffSummary: string | null | undefined): string[] {
   if (!diffSummary || diffSummary === '[]') return [];
+  let diffs: unknown;
   try {
-    const diffs = JSON.parse(diffSummary) as Array<{
-      path: string;
-      status: string;
-      additions?: number;
-      deletions?: number;
-    }>;
-    return diffs.slice(0, 20).map((d) => {
+    diffs = JSON.parse(diffSummary);
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    ignore(err, 'handoff: stored diff summary is not valid JSON; omitting file list', {
+      length: diffSummary.length,
+    });
+    return [];
+  }
+  if (!Array.isArray(diffs)) {
+    ignore(null, 'handoff: stored diff summary is not an array; omitting file list', { type: typeof diffs });
+    return [];
+  }
+  return (diffs as Array<{ path: string; status: string; additions?: number; deletions?: number }>)
+    .slice(0, 20)
+    .map((d) => {
       const counts =
         typeof d.additions === 'number' || typeof d.deletions === 'number'
           ? `, +${d.additions ?? 0}/-${d.deletions ?? 0}`
           : '';
       return `${d.path} (${d.status}${counts})`;
     });
-  } catch {
-    return [];
-  }
 }
 
 export function buildContinuationHandoffSummary(

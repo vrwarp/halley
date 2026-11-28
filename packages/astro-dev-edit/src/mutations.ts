@@ -5,16 +5,24 @@ import {
   byteOffsetToCharOffset,
   collectSubtreeLocs,
   computeOuterSpan,
+  countAstroParseErrors,
+  countElementNodes,
+  countMalformedElements,
   findAdjacentStaticSiblingNode,
+  findElementsByOuterHash,
   findElementWithContext,
   inspectAstroElement,
   lineByteColToByteOffset,
+  locForElementStartingAt,
   parseLoc,
+  sha256,
   type AstNode,
+  type InspectResult,
   type ObjectPositionValue,
   type SpacingValue,
   type TextAlignValue,
 } from './ast-classifier.js';
+import { inlineEditingDisabledReason } from './compat.js';
 import type { AsyncFileLock } from './file-lock.js';
 import {
   byteColumnInLastLine,
@@ -23,6 +31,7 @@ import {
   injectUrlImportIfMissing,
   normalizeHref,
   resolveUrlHelperAbs,
+  writeFileAtomic,
 } from './serializer.js';
 
 export type AddBlockKind = 'paragraph' | 'heading' | 'list-item' | 'image';
@@ -66,6 +75,12 @@ export interface MutateElementInput {
   relFile: string;
   loc: string;
   expectedOuterHash: string;
+  /**
+   * `fileHash` from inspect. When it matches the current file the mutation lands at `loc`;
+   * when it differs the element is relocated by `expectedOuterHash` (exactly one match, else
+   * 409). Omitted by old clients: loc + `expectedOuterHash` only.
+   */
+  expectedFileHash?: string;
   mutation: ElementMutation;
   previewBase: string;
   originalBase: string;
@@ -82,6 +97,10 @@ export type MutateElementResult =
       newLoc: string;
       newHash: string;
       newOuterHash: string;
+      /** sha256 of the file after the mutation (send as the next `fileHash`). */
+      newFileHash: string;
+      /** True when the file had changed since inspect and the element was found by content. */
+      relocated: boolean;
       topLineDelta: number;
       afterLine: number;
       afterLineDelta: number;
@@ -369,10 +388,66 @@ function resolvePreviewUrl(publicPath: string, previewBase: string): string {
   return `${cleanBase}${publicPath}`;
 }
 
-async function atomicWriteFile(absPath: string, content: string): Promise<void> {
-  const tmpPath = `${absPath}.halley-tmp-${process.pid}-${Date.now()}`;
-  await fs.writeFile(tmpPath, content, 'utf8');
-  await fs.rename(tmpPath, absPath);
+/** What a mutated file must look like before it is written (see `verifyMutatedSource`). */
+export interface MutationExpectation {
+  /** Net change in the number of element/component nodes (e.g. +1 for add-block). */
+  elementDelta: number;
+  /** Loc (Astro 5 convention) of the element the mutation produced/kept; null for delete. */
+  loc: string | null;
+  tagName?: string;
+  /** Exact outer source the element at `loc` must have after the mutation. */
+  outerSource?: string;
+}
+
+/**
+ * Safety gate for structural/attribute mutations: the mutated file must parse without new
+ * compiler errors, keep the expected number of elements (catches a span cut mid-tag that the
+ * lenient compiler would still accept), and the target element must be found again at its new
+ * loc with exactly the expected outer source.
+ */
+export async function verifyMutatedSource(input: {
+  originalSource: string;
+  patchedSource: string;
+  file: string;
+  expect: MutationExpectation;
+}): Promise<{ ok: true; inspected: InspectResult | null } | { ok: false; error: string }> {
+  try {
+    const [errorsBefore, errorsAfter, before, after] = await Promise.all([
+      countAstroParseErrors(input.originalSource),
+      countAstroParseErrors(input.patchedSource),
+      parse(input.originalSource, { position: true }),
+      parse(input.patchedSource, { position: true }),
+    ]);
+    if (errorsAfter > errorsBefore) {
+      return { ok: false, error: 'Edit would produce an Astro file that does not compile' };
+    }
+    const delta =
+      countElementNodes(after.ast as unknown as AstNode) - countElementNodes(before.ast as unknown as AstNode);
+    if (delta !== input.expect.elementDelta) {
+      return { ok: false, error: 'Edit changed the page structure unexpectedly; refusing to save' };
+    }
+    if (
+      countMalformedElements(input.patchedSource, after.ast as unknown as AstNode) >
+      countMalformedElements(input.originalSource, before.ast as unknown as AstNode)
+    ) {
+      return { ok: false, error: 'Edit would leave an element unclosed; refusing to save' };
+    }
+    if (input.expect.loc === null) return { ok: true, inspected: null };
+    const re = await inspectAstroElement(input.patchedSource, input.expect.loc, { file: input.file });
+    if (
+      !re ||
+      (input.expect.tagName !== undefined && re.tagName !== input.expect.tagName) ||
+      (input.expect.outerSource !== undefined && re.outerSource !== input.expect.outerSource)
+    ) {
+      return { ok: false, error: 'Edit changed the page structure around the element; refusing to save' };
+    }
+    return { ok: true, inspected: re };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Edit would produce an unparseable Astro file: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 }
 
 export async function mutateAstroElement(
@@ -385,6 +460,9 @@ export async function mutateAstroElement(
   if (input.relFile === '.github' || input.relFile.startsWith('.github/')) {
     return { ok: false, code: 400, error: '.github/** is protected' };
   }
+  if (path.extname(absPath).toLowerCase() !== '.astro') {
+    return { ok: false, code: 400, error: 'Only .astro files can be edited directly' };
+  }
 
   const urlHelperAbs = await resolveUrlHelperAbs(input.repoRoot);
   const hasUrlHelperFile = Boolean(urlHelperAbs);
@@ -393,28 +471,96 @@ export async function mutateAstroElement(
     let source: string;
     try {
       source = await fs.readFile(absPath, 'utf8');
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       return { ok: false, code: 404, error: `File not found: ${input.relFile}` };
     }
 
-    const inspected = await inspectAstroElement(source, input.loc, input.relFile);
-    if (!inspected || !inspected.outerSource) {
-      return { ok: false, code: 404, error: `Element not found at ${input.loc}` };
+    if (!parseLoc(input.loc)) {
+      return { ok: false, code: 400, error: 'Invalid source location' };
+    }
+    const staleError = 'File changed on disk since you selected this element. Please re-click to refresh.';
+    const disabledReason = await inlineEditingDisabledReason(input.repoRoot);
+    const currentFileHash = sha256(source);
+    const fileChanged = Boolean(input.expectedFileHash) && input.expectedFileHash !== currentFileHash;
+
+    let loc = input.loc;
+    let relocated = false;
+    if (fileChanged) {
+      // The file is not the one the client inspected: find the element by content instead of
+      // trusting a loc that may now point somewhere else.
+      const matches = await findElementsByOuterHash(source, input.expectedOuterHash, input.relFile);
+      if (matches.length !== 1) {
+        return {
+          ok: false,
+          code: 409,
+          error:
+            matches.length > 1
+              ? 'File changed on disk and the element is no longer unique. Please re-click to refresh.'
+              : staleError,
+        };
+      }
+      relocated = matches[0] !== loc;
+      if (relocated) console.info(`[halley-dev-edit] relocated stale mutation in ${input.relFile}: ${loc} -> ${matches[0]}`);
+      loc = matches[0]!;
     }
 
-    if (inspected.outerSnapshotHash !== input.expectedOuterHash) {
+    const inspected = await inspectAstroElement(source, loc, { file: input.relFile, disabledReason });
+    if (!inspected) {
+      return { ok: false, code: 404, error: `Element not found at ${loc}` };
+    }
+    if (!inspected.outerSource) {
+      // computeOuterSpan refuses spans that do not end in the element's own closing tag.
       return {
         ok: false,
-        code: 409,
-        error: 'File changed on disk since you selected this element. Please re-click to refresh.',
+        code: 422,
+        error: `The <${inspected.tagName}> element's boundaries are ambiguous in the source — Ask Halley to edit it.`,
       };
+    }
+    if (inspected.outerSnapshotHash !== input.expectedOuterHash) {
+      return { ok: false, code: 409, error: staleError };
+    }
+    if (inspected.blockedReason) {
+      return { ok: false, code: 422, error: inspected.blockedReason };
     }
 
     const m = input.mutation;
-    const parsedInputLoc = parseLoc(input.loc);
-    if (!parsedInputLoc) {
-      return { ok: false, code: 400, error: 'Invalid source location' };
+    const parsedInputLoc = parseLoc(loc)!;
+    const parsedRoot = (await parse(source, { position: true })).ast as unknown as AstNode;
+    const srcBuf = Buffer.from(source, 'utf8');
+    const locatedTarget = findElementWithContext(
+      parsedRoot,
+      srcBuf,
+      lineByteColToByteOffset(srcBuf, parsedInputLoc.line, parsedInputLoc.column),
+    );
+    if (!locatedTarget) {
+      return { ok: false, code: 404, error: `Element not found at ${loc}` };
     }
+    const subtreeElementCount = countElementNodes(locatedTarget.node);
+
+    /** Verifies the mutated source, then writes it atomically; returns an error result or the re-inspection. */
+    const commit = async (
+      patched: string,
+      expectation: MutationExpectation,
+    ): Promise<{ ok: true; re: InspectResult | null } | { ok: false; code: 422; error: string }> => {
+      const verified = await verifyMutatedSource({
+        originalSource: source,
+        patchedSource: patched,
+        file: input.relFile,
+        expect: expectation,
+      });
+      if (!verified.ok) return { ok: false, code: 422, error: verified.error };
+      await writeFileAtomic(absPath, patched);
+      return { ok: true, re: verified.inspected };
+    };
+    const common = (patched: string) => ({
+      beforeSource: source,
+      afterSource: patched,
+      newFileHash: sha256(patched),
+      relocated,
+    });
+    /** Loc of the element whose `<` lands at `charOffset` in `patched`. */
+    const locAt = (patched: string, charOffset: number) => locForElementStartingAt(patched, charOffset) ?? '';
 
     // ------------------------------------------------------------------
     // 1. set-link (<a> href + target="_blank" + rel)
@@ -472,16 +618,24 @@ export async function mutateAstroElement(
         topLineDelta = countNewlines(patched) - beforeLines;
       }
 
-      await atomicWriteFile(absPath, patched);
-      const newLoc = `${parsedInputLoc.line + topLineDelta}:${parsedInputLoc.column}`;
-      const re = await inspectAstroElement(patched, newLoc, input.relFile).catch(() => null);
+      // The url import (if any) lands in the frontmatter, i.e. before the element.
+      const importShift = patched.length - (source.length - openTag.length + nextOpenTag.length);
+      const newStart = inspected.outerStartOffset + importShift;
+      const newLoc = locAt(patched, newStart);
+      const committed = await commit(patched, {
+        elementDelta: 0,
+        loc: newLoc,
+        tagName: inspected.tagName,
+        outerSource: nextOpenTag + inspected.outerSource.slice(openTag.length),
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
 
       return {
         ok: true,
         kind: 'set-link',
         summary: `Updated link in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc,
         newHash: re?.snapshotHash ?? inspected.snapshotHash,
         newOuterHash: re?.outerSnapshotHash ?? '',
@@ -558,16 +712,24 @@ export async function mutateAstroElement(
         topLineDelta = countNewlines(patched) - beforeLines;
       }
 
-      await atomicWriteFile(absPath, patched);
-      const newLoc = `${parsedInputLoc.line + topLineDelta}:${parsedInputLoc.column}`;
-      const re = await inspectAstroElement(patched, newLoc, input.relFile).catch(() => null);
+      // The url import (if any) lands in the frontmatter, i.e. before the element.
+      const importShift = patched.length - (source.length - openTag.length + nextOpenTag.length);
+      const newStart = inspected.outerStartOffset + importShift;
+      const newLoc = locAt(patched, newStart);
+      const committed = await commit(patched, {
+        elementDelta: 0,
+        loc: newLoc,
+        tagName: inspected.tagName,
+        outerSource: nextOpenTag + inspected.outerSource.slice(openTag.length),
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
 
       return {
         ok: true,
         kind: 'set-image',
         summary: m.src !== undefined ? `Replaced image in ${input.relFile}` : `Updated image alt in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc,
         newHash: re?.snapshotHash ?? '',
         newOuterHash: re?.outerSnapshotHash ?? '',
@@ -617,16 +779,22 @@ export async function mutateAstroElement(
         nextOpenTag +
         source.slice(inspected.openTagEndOffset);
 
-      await atomicWriteFile(absPath, patched);
-      const re = await inspectAstroElement(patched, input.loc, input.relFile).catch(() => null);
+      const newLoc = locAt(patched, inspected.outerStartOffset);
+      const committed = await commit(patched, {
+        elementDelta: 0,
+        loc: newLoc,
+        tagName: inspected.tagName,
+        outerSource: nextOpenTag + inspected.outerSource.slice(openTag.length),
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
 
       return {
         ok: true,
         kind: 'set-style',
         summary: `Updated style in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
-        newLoc: input.loc,
+        ...common(patched),
+        newLoc,
         newHash: re?.snapshotHash ?? inspected.snapshotHash,
         newOuterHash: re?.outerSnapshotHash ?? '',
         topLineDelta: 0,
@@ -665,20 +833,22 @@ export async function mutateAstroElement(
         insertion +
         source.slice(inspected.outerEndOffset);
 
-      const cloneStartLine = afterLine + 1;
-      const cloneStartCol = Buffer.byteLength(indent, 'utf8') + 1;
-      const cloneLoc = `${cloneStartLine}:${cloneStartCol}`;
-
-      await atomicWriteFile(absPath, patched);
+      const cloneLoc = locAt(patched, inspected.outerEndOffset + 1 + indent.length);
+      const committed = await commit(patched, {
+        elementDelta: subtreeElementCount,
+        loc: cloneLoc,
+        tagName: inspected.tagName,
+        outerSource: cloned,
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
       const subtreeLocs = await collectSubtreeLocs(patched, cloneLoc);
-      const re = await inspectAstroElement(patched, cloneLoc, input.relFile).catch(() => null);
 
       return {
         ok: true,
         kind: 'duplicate',
         summary: `Duplicated <${inspected.tagName}> in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc: cloneLoc,
         newHash: re?.snapshotHash ?? '',
         newOuterHash: re?.outerSnapshotHash ?? '',
@@ -725,14 +895,14 @@ export async function mutateAstroElement(
       const sameLineByteDelta = newEndCol - sameLineEndCol;
 
       const patched = source.slice(0, removeStart) + source.slice(removeEnd);
-      await atomicWriteFile(absPath, patched);
+      const committed = await commit(patched, { elementDelta: -subtreeElementCount, loc: null });
+      if (!committed.ok) return committed;
 
       return {
         ok: true,
         kind: 'delete',
         summary: `Deleted <${inspected.tagName}> in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc: '',
         newHash: '',
         newOuterHash: '',
@@ -762,16 +932,8 @@ export async function mutateAstroElement(
         };
       }
 
-      const buf = Buffer.from(source, 'utf8');
-      const targetByteOffset = lineByteColToByteOffset(buf, parsedInputLoc.line, parsedInputLoc.column);
-      const parsed = await parse(source, { position: true });
-      const root = parsed.ast as unknown as AstNode;
-      const located = findElementWithContext(root, buf, targetByteOffset);
-      if (!located) {
-        return { ok: false, code: 404, error: 'Element not found for move' };
-      }
-
-      const sibNode = findAdjacentStaticSiblingNode(located, buf, m.direction);
+      const buf = srcBuf;
+      const sibNode = findAdjacentStaticSiblingNode(locatedTarget, buf, m.direction);
       if (!sibNode) {
         return { ok: false, code: 422, error: `No static sibling to move ${m.direction}` };
       }
@@ -798,28 +960,31 @@ export async function mutateAstroElement(
         firstText +
         source.slice(secondEnd);
 
-      // Compute new start locs for both swapped elements
-      const firstNewPrefix = source.slice(0, firstStart);
-      const firstNewLoc = `${countNewlines(firstNewPrefix) + 1}:${byteColumnInLastLine(firstNewPrefix)}`;
-      const secondNewPrefix = firstNewPrefix + secondText + between;
-      const secondNewLoc = `${countNewlines(secondNewPrefix) + 1}:${byteColumnInLastLine(secondNewPrefix)}`;
+      // New locs (Astro 5 convention) of both swapped elements
+      const firstNewLoc = locAt(patched, firstStart);
+      const secondNewLoc = locAt(patched, firstStart + secondText.length + between.length);
 
       const movedLoc = m.direction === 'up' ? firstNewLoc : secondNewLoc;
       const swappedLoc = m.direction === 'up' ? secondNewLoc : firstNewLoc;
 
-      await atomicWriteFile(absPath, patched);
+      const committed = await commit(patched, {
+        elementDelta: 0,
+        loc: movedLoc,
+        tagName: inspected.tagName,
+        outerSource: inspected.outerSource,
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
       const [subtreeLocs, swappedSubtreeLocs] = await Promise.all([
         collectSubtreeLocs(patched, movedLoc),
         collectSubtreeLocs(patched, swappedLoc),
       ]);
-      const re = await inspectAstroElement(patched, movedLoc, input.relFile).catch(() => null);
 
       return {
         ok: true,
         kind: 'move',
         summary: `Moved <${inspected.tagName}> ${m.direction} in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc: movedLoc,
         newHash: re?.snapshotHash ?? inspected.snapshotHash,
         newOuterHash: re?.outerSnapshotHash ?? '',
@@ -845,11 +1010,8 @@ export async function mutateAstroElement(
         };
       }
 
-      const buf = Buffer.from(source, 'utf8');
-      const targetByteOffset = lineByteColToByteOffset(buf, parsedInputLoc.line, parsedInputLoc.column);
-      const parsed = await parse(source, { position: true });
-      const root = parsed.ast as unknown as AstNode;
-      const located = findElementWithContext(root, buf, targetByteOffset);
+      const root = parsedRoot;
+      const located = locatedTarget;
 
       const targetTag =
         m.blockKind === 'paragraph'
@@ -919,20 +1081,24 @@ export async function mutateAstroElement(
         topLineDelta = countNewlines(patched) - beforeLines;
       }
 
-      const insertedLine = afterLine + 1 + topLineDelta;
-      const insertedCol = Buffer.byteLength(indent, 'utf8') + 1;
-      const insertedLoc = `${insertedLine}:${insertedCol}`;
-
-      await atomicWriteFile(absPath, patched);
+      // The url import (if any) lands in the frontmatter, i.e. before the insertion point.
+      const importShift = patched.length - (source.length + insertion.length);
+      const insertedLoc = locAt(patched, inspected.outerEndOffset + 1 + indent.length + importShift);
+      const committed = await commit(patched, {
+        elementDelta: 1,
+        loc: insertedLoc,
+        tagName: targetTag,
+        outerSource: astroSnippet,
+      });
+      if (!committed.ok) return committed;
+      const re = committed.re;
       const subtreeLocs = await collectSubtreeLocs(patched, insertedLoc);
-      const re = await inspectAstroElement(patched, insertedLoc, input.relFile).catch(() => null);
 
       return {
         ok: true,
         kind: 'add-block',
         summary: `Added ${m.blockKind} in ${input.relFile}`,
-        beforeSource: source,
-        afterSource: patched,
+        ...common(patched),
         newLoc: insertedLoc,
         newHash: re?.snapshotHash ?? '',
         newOuterHash: re?.outerSnapshotHash ?? '',

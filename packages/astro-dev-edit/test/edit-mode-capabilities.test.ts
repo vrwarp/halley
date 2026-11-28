@@ -65,7 +65,9 @@ const showBanner = true;
     expect(pEl?.capabilities.structural.canDelete).toBe(true);
 
     // Line 10: <span> inside .map() -> inLoopOrConditional true, text editable, structural HARD-BLOCKED
-    const loopSpanCol = src.split('\n')[9]!.indexOf('<span>') + 1;
+    // Astro 5 loc convention (just after the opening tag's `>`): the `<span>` start byte is also
+    // the `<li>`'s inner start, i.e. the `<li>`'s own loc, so the span is addressed after `<span>`.
+    const loopSpanCol = src.split('\n')[9]!.indexOf('<span>') + '<span>'.length + 1;
     const loopSpan = await inspectAstroElement(src, `10:${loopSpanCol}`, 'src/pages/index.astro');
     expect(loopSpan?.context.inLoopOrConditional).toBe(true);
     expect(loopSpan?.capabilities.text).toBe(true);

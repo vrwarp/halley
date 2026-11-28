@@ -1,107 +1,59 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
-import {
-  WORKSPACE_HOST_PROTOCOL_VERSION,
-  type BootProgressDto,
-  type BootStage,
-} from '@halley/shared';
+import { WORKSPACE_HOST_PROTOCOL_VERSION, type BootProgressDto, type BootStage } from '@halley/shared';
 import { extractBearerToken, safeEqualToken } from '@halley/shared/auth';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { computePreviewBase } from './astro-manager.js';
 import { scanBareGitRepo } from './astro-optimizer.js';
-import { BuildQueueTimeoutError, FifoBuildQueue } from './build-queue.js';
+import { FifoBuildQueue } from './build-queue.js';
+import {
+  ignore,
+  ignoreExpected,
+  logger,
+  MISSING_PATH_CODES,
+  orDefault,
+  readJsonBodyOrEmpty,
+  requestContextMiddleware,
+} from './log.js';
+import { AsyncMutex, KeyedMutex } from './mutex.js';
 import { NodeModulesCacheManager } from './nm-cache.js';
-
-const execFileAsync = promisify(execFile);
-
-const MAX_LOG_LINES_PER_SESSION = 500;
-
-const BOOT_STAGE_MESSAGES: Partial<Record<BootStage, string>> = {
-  syncing_repo: 'Syncing latest website repository…',
-  cloning_repo: 'Cloning website files…',
-  installing_deps: 'Installing project packages…',
-  starting_preview: 'Starting Astro live preview…',
-  starting_ai: 'Starting AI editing assistant…',
-  claiming_warm: 'Connecting to ready workspace…',
-  ready: 'Workspace ready!',
-};
-
-export interface SupervisorOptions {
-  workspacesDir: string;
-  controlPlaneInternalUrl: string;
-  hostSecret?: string;
-  repo: string;
-  baseBranch: string;
-  modelId: string;
-  thinkingLevel: 'off' | 'low' | 'medium' | 'high';
-  gitBotName: string;
-  gitBotEmail: string;
-  warmPoolSize: number;
-  maxActiveWorkspaces: number;
-  buildQueueTimeoutMs?: number;
-  devLocalRepo?: string;
-  runnerEntry?: string;
-  bindHost?: string;
-  port?: number;
-}
-
-interface ManagedSession {
-  id: string;
-  proc: ChildProcess;
-  runnerPort: number;
-  astroPort: number;
-  astroBase: string;
-  baseSha: string;
-  workspaceToken: string;
-  lastActiveAt: number;
-  isWarmStandby: boolean;
-}
-
-interface WarmSlot {
-  id: string;
-  rawToken: string;
-  state: 'warming' | 'ready' | 'failed';
-  runnerPort: number;
-  astroPort: number;
-  astroBase: string;
-  baseSha: string;
-  progress: BootProgressDto;
-  bootPromise: Promise<void>;
-  claimedBySessionId: string | null;
-  reservedAt?: number;
-}
-
-export interface DiskUsageInfo {
-  totalBytes: number;
-  freeBytes: number;
-  usedBytes: number;
-  usedPercent: number;
-}
-
-async function fileExists(p: string): Promise<boolean> {
-  return fs
-    .access(p)
-    .then(() => true)
-    .catch(() => false);
-}
-
-function parseBootStageFromLine(line: string): { stage: BootStage; message: string } | null {
-  const m = line.match(/\[halley-boot\]\s+([a-z_]+)/);
-  const stage = m?.[1] as BootStage | undefined;
-  if (!stage) return null;
-  const message = BOOT_STAGE_MESSAGES[stage];
-  if (!message) return null;
-  return { stage, message };
-}
+import { envInt, execFileGroup, setProcessRunner, onParentDeath } from './proc.js';
+import { realClock, sleep, type TimerHandle } from './clock.js';
+import {
+  WARM_SLOT_MARKER,
+  MAX_LOG_LINES_PER_SESSION,
+  MAX_IDLE_LOG_BUFFERS,
+  MAX_DELETED_TOMBSTONES,
+  DELETED_TOMBSTONE_TTL_MS,
+  STOP_ALL_EXTRA_MS,
+  DiskPressureError,
+  StartPhaseTimings,
+  SupervisorOptions,
+  ManagedSession,
+  CrashedSessionInfo,
+  WarmSlot,
+  DiskUsageInfo,
+  runnerFetch,
+  fileExists,
+  parseBootStageFromLine,
+} from './supervisor/shared.js';
+import { createMirror } from './supervisor/mirror.js';
+import { createProcessManager } from './supervisor/process-manager.js';
+import { createWarmPool } from './supervisor/warm-pool.js';
+import { createMaintenance } from './supervisor/maintenance.js';
+import { registerSessionRoutes } from './supervisor/session-routes.js';
+import { registerBuildLockRoutes } from './supervisor/build-lock-routes.js';
+import type { SupervisorContext } from './supervisor/context.js';
+export { WARM_SLOT_MARKER, DiskPressureError } from './supervisor/shared.js';
+export type { CrashedSessionInfo, DiskUsageInfo, StartPhaseTimings, SupervisorOptions } from './supervisor/shared.js';
 
 export function createWorkspaceSupervisor(opts: SupervisorOptions) {
+  if (opts.processRunner) setProcessRunner(opts.processRunner);
+  const clock = opts.clock ?? realClock;
   const instanceId = crypto.randomUUID();
   const workspacesDir = path.resolve(opts.workspacesDir);
   const sessionsRoot = path.join(workspacesDir, 'sessions');
@@ -110,7 +62,19 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
   const pkgCacheDir = path.join(workspacesDir, 'pkg-cache');
   const verifySandboxDir = path.join(workspacesDir, 'verify-sandbox');
   const nmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
-  const buildQueue = new FifoBuildQueue(opts.buildQueueTimeoutMs ?? 10 * 60_000);
+  const buildQueueTimeoutMs = opts.buildQueueTimeoutMs ?? 10 * 60_000;
+  const buildQueue = new FifoBuildQueue(
+    buildQueueTimeoutMs,
+    envInt('HALLEY_BUILD_MAX_LEASE_MS', 15 * 60_000, 1_000),
+    3_500,
+    (msg, fields) => logger.warn(msg, fields),
+    clock,
+  );
+  // W6: per-process heap caps so one runaway session cannot OOM the whole shared container
+  const runnerHeapMb = envInt('HALLEY_RUNNER_MAX_OLD_SPACE_MB', 1536, 128);
+  // W6e: must exceed the runner's own shutdown budget (HALLEY_RUNNER_SHUTDOWN_BUDGET_MS, 4s)
+  const runnerStopGraceMs = envInt('HALLEY_RUNNER_STOP_GRACE_MS', 5_000, 100);
+  const crashedSessions: CrashedSessionInfo[] = [];
 
   let activeHostSecret = (opts.hostSecret || '').trim();
 
@@ -142,21 +106,91 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
 
   function releaseLeasedPort(port: number): void {
     if (port <= 0) return;
-    setTimeout(() => {
-      leasedPorts.delete(port);
-    }, 1500).unref?.();
+    clock
+      .setTimeout(() => {
+        leasedPorts.delete(port);
+      }, 1500)
+      .unref?.();
   }
 
   const activeSessions = new Map<string, ManagedSession>();
   const bootingSessions = new Map<string, Promise<ManagedSession>>();
-  const deletedSessionIds = new Set<string>();
+  /** id -> deletion time; bounded (see pruneTombstones). */
+  const deletedSessionIds = new Map<string, number>();
   const logsBySession = new Map<string, string[]>();
   const bootProgressBySession = new Map<string, BootProgressDto>();
+  const startPhasesBySession = new Map<string, StartPhaseTimings>();
+  /** W-LRU: serializes cap admission so concurrent /start calls cannot both pass the cap. */
+  const admissionMutex = new AsyncMutex();
+  /** Sessions admitted under the cap whose runner is not in activeSessions (or not ready) yet. */
+  const admittedBooting = new Set<string>();
+  /** Serializes supervisor-side git ops on a stopped session with that session's runner boot. */
+  const sessionGitLocks = new KeyedMutex();
+
+  // Disk admission control (W-disk)
+  const minFreeDiskBytes = envInt('HALLEY_MIN_FREE_DISK_MB', 2048, 0) * 1024 * 1024;
+  const minFreeDiskPercent = envInt('HALLEY_MIN_FREE_DISK_PERCENT', 5, 0, 100);
+  let lastDiskPressureLogAt = 0;
+
+  function diskThresholdBytes(totalBytes: number): number {
+    return Math.max(minFreeDiskBytes, Math.floor((totalBytes * minFreeDiskPercent) / 100));
+  }
+
+  function isDiskPressure(usage: DiskUsageInfo | null): boolean {
+    if (!usage || usage.totalBytes <= 0) return false;
+    return usage.freeBytes < diskThresholdBytes(usage.totalBytes);
+  }
+
+  /** Throws DiskPressureError (HTTP 507) when free space on the workspaces volume is below threshold. */
+  async function assertDiskAdmission(operation: string, fields?: Record<string, unknown>): Promise<void> {
+    const usage = await getDiskUsage();
+    if (!usage || !isDiskPressure(usage)) return;
+    const threshold = diskThresholdBytes(usage.totalBytes);
+    const now = clock.now();
+    if (now - lastDiskPressureLogAt > 10_000) {
+      lastDiskPressureLogAt = now;
+      logger.error('supervisor: refusing operation under disk pressure', {
+        operation,
+        freeBytes: usage.freeBytes,
+        thresholdBytes: threshold,
+        usedPercent: usage.usedPercent,
+        ...fields,
+      });
+    }
+    throw new DiskPressureError(operation, usage.freeBytes, threshold);
+  }
+
+  function markDeleted(sessionId: string): void {
+    deletedSessionIds.delete(sessionId);
+    deletedSessionIds.set(sessionId, clock.now());
+    pruneTombstones();
+  }
+
+  function pruneTombstones(): void {
+    const now = clock.now();
+    for (const [id, at] of deletedSessionIds) {
+      const overCap = deletedSessionIds.size > MAX_DELETED_TOMBSTONES;
+      if (!overCap && now - at < DELETED_TOMBSTONE_TTL_MS) break; // insertion order = oldest first
+      if (bootingSessions.has(id)) continue;
+      deletedSessionIds.delete(id);
+    }
+  }
+
+  /** Drops log buffers of sessions that are not running, keeping the most recent MAX_IDLE_LOG_BUFFERS. */
+  function pruneLogBuffers(): void {
+    const idle = [...logsBySession.keys()].filter(
+      (id) => !activeSessions.has(id) && !bootingSessions.has(id) && !reservedWarmSlots.has(id),
+    );
+    for (const id of idle.slice(0, Math.max(0, idle.length - MAX_IDLE_LOG_BUFFERS))) {
+      logsBySession.delete(id);
+      startPhasesBySession.delete(id);
+    }
+  }
 
   let warmPool: WarmSlot[] = [];
   const reservedWarmSlots = new Map<string, WarmSlot>();
   let warmPoolRunning = false;
-  let warmHealthTimer: NodeJS.Timeout | null = null;
+  let warmHealthTimer: TimerHandle | null = null;
   let supervisorSelfUrl = `http://127.0.0.1:${opts.port ?? 4000}`;
 
   const runnerEntry =
@@ -232,59 +266,118 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       fullArgs.push('-c', `http.extraHeader=Authorization: Bearer ${activeHostSecret}`);
     }
     fullArgs.push(...args);
-    const { stdout } = await execFileAsync('git', fullArgs, {
+    // Own process group: a timed-out fetch/clone also kills git-remote-https and friends (W10)
+    const { stdout } = await execFileGroup('git', fullArgs, {
       cwd,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       maxBuffer: 32 * 1024 * 1024,
-      timeout: timeoutMs,
+      timeoutMs,
     });
     return stdout.trim();
   }
 
-  let mirrorSyncPromise: Promise<string> | null = null;
-  async function syncLocalMirror(baseBranch: string): Promise<string> {
-    if (mirrorSyncPromise) return mirrorSyncPromise;
-    mirrorSyncPromise = (async () => {
-      const exists = await fileExists(path.join(mirrorDir, 'HEAD'));
-      if (!exists) {
-        await fs.mkdir(path.dirname(mirrorDir), { recursive: true });
-        await fs.mkdir(mirrorDir, { recursive: true });
-        await runGit(mirrorDir, ['init', '--bare'], false);
-        await runGit(mirrorDir, ['remote', 'add', 'origin', internalGitUrl], false);
-      } else {
-        await runGit(mirrorDir, ['remote', 'set-url', 'origin', internalGitUrl], false).catch(() => {});
-      }
-      await runGit(
-        mirrorDir,
-        ['fetch', 'origin', `+refs/heads/${baseBranch}:refs/heads/${baseBranch}`],
-        true,
-      );
-      await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});
-      const headSha = await runGit(mirrorDir, ['rev-parse', `refs/heads/${baseBranch}`]).catch(() => '');
-      if (headSha) {
-        void recycleStaleWarmSlots(headSha);
-      }
-      return headSha;
-    })().finally(() => {
-      mirrorSyncPromise = null;
-    });
-    return mirrorSyncPromise;
-  }
-
-  async function recycleStaleWarmSlots(latestBaseSha: string): Promise<void> {
-    if (!warmPoolRunning || !latestBaseSha) return;
-    const stale = warmPool.filter(
-      (s) => s.state === 'ready' && !s.claimedBySessionId && s.baseSha && s.baseSha !== latestBaseSha,
-    );
-    if (stale.length === 0) return;
-    for (const slot of stale) {
-      const idx = warmPool.indexOf(slot);
-      if (idx !== -1) warmPool.splice(idx, 1);
-      await stopSessionProcess(slot.id).catch(() => {});
-      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
-    }
-    replenishWarmPool();
-  }
+  // The supervisor's parts (src/supervisor/*) share an explicit, typed view of its state;
+  // mutable fields and parts created later are accessors, so reads are always current.
+  const ctx: SupervisorContext = {
+    opts,
+    clock,
+    instanceId,
+    sessionsRoot,
+    mirrorDir,
+    nmCacheDir,
+    pkgCacheDir,
+    verifySandboxDir,
+    nmCache,
+    buildQueueTimeoutMs,
+    buildQueue,
+    runnerHeapMb,
+    runnerStopGraceMs,
+    crashedSessions,
+    get activeHostSecret() {
+      return activeHostSecret;
+    },
+    set activeHostSecret(v) {
+      activeHostSecret = v;
+    },
+    allocateLeasedPort,
+    releaseLeasedPort,
+    activeSessions,
+    bootingSessions,
+    deletedSessionIds,
+    logsBySession,
+    bootProgressBySession,
+    startPhasesBySession,
+    admissionMutex,
+    admittedBooting,
+    sessionGitLocks,
+    assertDiskAdmission,
+    markDeleted,
+    pruneTombstones,
+    pruneLogBuffers,
+    get warmPool() {
+      return warmPool;
+    },
+    set warmPool(v) {
+      warmPool = v;
+    },
+    reservedWarmSlots,
+    get warmPoolRunning() {
+      return warmPoolRunning;
+    },
+    set warmPoolRunning(v) {
+      warmPoolRunning = v;
+    },
+    get warmHealthTimer() {
+      return warmHealthTimer;
+    },
+    set warmHealthTimer(v) {
+      warmHealthTimer = v;
+    },
+    get supervisorSelfUrl() {
+      return supervisorSelfUrl;
+    },
+    set supervisorSelfUrl(v) {
+      supervisorSelfUrl = v;
+    },
+    runnerEntry,
+    controlPlaneBase,
+    internalGitUrl,
+    sessionDir,
+    appendLog,
+    emitProgress,
+    runGit,
+    get withMirrorRead() {
+      return withMirrorRead;
+    },
+    get syncLocalMirror() {
+      return syncLocalMirror;
+    },
+    get runMirrorMaintenance() {
+      return runMirrorMaintenance;
+    },
+    get discardSlot() {
+      return discardSlot;
+    },
+    get recycleStaleWarmSlots() {
+      return recycleStaleWarmSlots;
+    },
+    get stopSessionProcess() {
+      return stopSessionProcess;
+    },
+    get admitSession() {
+      return admitSession;
+    },
+    get spawnRunnerForSession() {
+      return spawnRunnerForSession;
+    },
+    get replenishWarmPool() {
+      return replenishWarmPool;
+    },
+  };
+  const { withMirrorRead, syncLocalMirror, runMirrorMaintenance } = createMirror(ctx);
+  const { stopSessionProcess, admitSession, spawnRunnerForSession } = createProcessManager(ctx);
+  const { discardSlot, recycleStaleWarmSlots, replenishWarmPool, startWarmPool } = createWarmPool(ctx);
+  const { runMaintenance, maintenanceTimer } = createMaintenance(ctx);
 
   async function getDiskUsage(): Promise<DiskUsageInfo | null> {
     try {
@@ -295,468 +388,92 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       const usedBytes = Math.max(0, totalBytes - freeBytes);
       const usedPercent = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 1000) / 10 : 0;
       return { totalBytes, freeBytes, usedBytes, usedPercent };
-    } catch {
+    } catch (err) {
+      ignore(err, 'supervisor: statfs of workspaces volume');
       return null;
     }
   }
 
-  function killRunnerGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
-    if (proc.pid) {
-      try {
-        process.kill(-proc.pid, signal);
-        return;
-      } catch {
-        // fallback to direct kill
-      }
-    }
-    try {
-      proc.kill(signal);
-    } catch {
-      // already exited
-    }
-  }
-
-  async function stopSessionProcess(sessionId: string): Promise<void> {
-    bootProgressBySession.delete(sessionId);
-    buildQueue.releaseBySession(sessionId);
-    const managed = activeSessions.get(sessionId);
-    activeSessions.delete(sessionId);
-    if (!managed) return;
-    if (managed.proc.exitCode === null) {
-      // Signal entire process group so astro dev / Vite / esbuild children exit cleanly too
-      killRunnerGroup(managed.proc, 'SIGTERM');
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, 1800);
-        t.unref?.();
-        managed.proc.once('exit', () => {
-          clearTimeout(t);
-          resolve();
-        });
-      });
-      if (managed.proc.exitCode === null) {
-        killRunnerGroup(managed.proc, 'SIGKILL');
-      }
-    }
-    releaseLeasedPort(managed.runnerPort);
-    releaseLeasedPort(managed.astroPort);
-  }
-
-  /**
-   * Enforces `maxActiveWorkspaces` across ALL running processes (including warm standby).
-   * Reclaims unclaimed warm standby slots first so user sessions are never evicted needlessly,
-   * and sorts remaining sessions by real `lastActiveAt` (synced from control-plane).
-   */
-  async function enforceLruCap(excludeSessionId: string, protectedIds: Set<string>): Promise<void> {
-    const cap = opts.maxActiveWorkspaces;
-    if (cap <= 0) return;
-
-    let totalRunning = [...activeSessions.values()].filter((s) => s.id !== excludeSessionId).length;
-    if (totalRunning < cap) return;
-
-    // 1. Reclaim unclaimed warm standby processes first
-    for (const slot of [...warmPool]) {
-      if (totalRunning < cap) break;
-      if (slot.claimedBySessionId || slot.id === excludeSessionId) continue;
-      const idx = warmPool.indexOf(slot);
-      if (idx !== -1) warmPool.splice(idx, 1);
-      await stopSessionProcess(slot.id).catch(() => {});
-      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
-      totalRunning = [...activeSessions.values()].filter((s) => s.id !== excludeSessionId).length;
-    }
-
-    if (totalRunning < cap) return;
-
-    const bq = buildQueue.getStatus();
-    const buildProtected = new Set<string>(bq.queuedSessionIds);
-    if (bq.activeSessionId) buildProtected.add(bq.activeSessionId);
-
-    const nonWarm = [...activeSessions.values()].filter(
-      (s) => !s.isWarmStandby && s.id !== excludeSessionId,
-    );
-    nonWarm.sort((a, b) => a.lastActiveAt - b.lastActiveAt);
-
-    for (const candidate of nonWarm) {
-      if (totalRunning < cap) break;
-      if (protectedIds.has(candidate.id) || buildProtected.has(candidate.id)) continue;
-
-      let runnerBusy = false;
-      try {
-        const res = await fetch(`http://127.0.0.1:${candidate.runnerPort}/health`, {
-          signal: AbortSignal.timeout(3_000),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { piBusy?: boolean; busy?: boolean };
-          runnerBusy = Boolean(data.piBusy || data.busy);
-        }
-      } catch {
-        // unreachable -> safe to evict
-      }
-      if (runnerBusy) continue;
-
-      console.log(
-        `[halley-supervisor] LRU cap (${cap}) reached — putting idle session ${candidate.id.slice(0, 8)} to sleep`,
-      );
-      await stopSessionProcess(candidate.id);
-      totalRunning--;
-    }
-  }
-
-  async function spawnRunnerForSession(params: {
-    sessionId: string;
-    workspaceDir: string;
-    stateDir: string;
-    baseBranch: string;
-    baseSha: string;
-    workspaceToken: string;
-    persona: 'non-technical' | 'developer';
-    editorName: string;
-    editorEmail: string;
-    readOnly: boolean;
-    isWarmStandby: boolean;
-  }): Promise<ManagedSession> {
-    const bindHost = opts.bindHost || '0.0.0.0';
-    const runnerPort = await allocateLeasedPort(bindHost);
-    let astroPort = 0;
-    try {
-      astroPort = await allocateLeasedPort(bindHost);
-    } catch (err) {
-      releaseLeasedPort(runnerPort);
-      throw err;
-    }
-
-    emitProgress(params.sessionId, 'starting_preview', 'Starting Astro live preview…', {
-      warmHit: params.isWarmStandby || undefined,
-    });
-
-    const child = spawn(process.execPath, [runnerEntry], {
-      cwd: params.workspaceDir,
-      detached: true,
-      env: {
-        ...process.env,
-        HALLEY_WORKSPACE_DIR: params.workspaceDir,
-        HALLEY_STATE_DIR: params.stateDir,
-        HALLEY_SESSION_ID: params.sessionId,
-        HALLEY_BASE_BRANCH: params.baseBranch,
-        HALLEY_BASE_SHA: params.baseSha,
-        HALLEY_MIRROR_PATH: mirrorDir,
-        HALLEY_NM_CACHE_DIR: nmCacheDir,
-        HALLEY_PKG_CACHE_DIR: pkgCacheDir,
-        HALLEY_VERIFY_SANDBOX_DIR: verifySandboxDir,
-        RUNNER_PORT: String(runnerPort),
-        ASTRO_PORT: String(astroPort),
-        CONTROL_PLANE_INTERNAL_URL: controlPlaneBase,
-        HALLEY_SUPERVISOR_URL: supervisorSelfUrl,
-        ...(activeHostSecret ? { WORKSPACE_HOST_SECRET: activeHostSecret } : {}),
-        WORKSPACE_TOKEN: params.workspaceToken,
-        HALLEY_MODEL_ID: opts.modelId,
-        HALLEY_THINKING_LEVEL: opts.thinkingLevel,
-        HALLEY_PERSONA: params.persona,
-        HALLEY_GIT_BOT_NAME: opts.gitBotName,
-        HALLEY_GIT_BOT_EMAIL: opts.gitBotEmail,
-        HALLEY_EDITOR_NAME: params.editorName,
-        HALLEY_EDITOR_EMAIL: params.editorEmail,
-        HALLEY_READ_ONLY: params.readOnly ? 'true' : 'false',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const managed: ManagedSession = {
-      id: params.sessionId,
-      proc: child,
-      runnerPort,
-      astroPort,
-      astroBase: '/',
-      baseSha: params.baseSha,
-      workspaceToken: params.workspaceToken,
-      lastActiveAt: Date.now(),
-      isWarmStandby: params.isWarmStandby,
-    };
-    activeSessions.set(params.sessionId, managed);
-
-    let spawnError: Error | null = null;
-    child.on('error', (err) => {
-      spawnError = err;
-      if (activeSessions.get(params.sessionId)?.proc === child) {
-        activeSessions.delete(params.sessionId);
-      }
-      buildQueue.releaseBySession(params.sessionId);
-      releaseLeasedPort(runnerPort);
-      releaseLeasedPort(astroPort);
-    });
-    child.stdout?.on('data', (d: Buffer) => appendLog(params.sessionId, d, false));
-    child.stderr?.on('data', (d: Buffer) => appendLog(params.sessionId, d, true));
-    child.on('exit', () => {
-      if (activeSessions.get(params.sessionId)?.proc === child) {
-        activeSessions.delete(params.sessionId);
-      }
-      buildQueue.releaseBySession(params.sessionId);
-      releaseLeasedPort(runnerPort);
-      releaseLeasedPort(astroPort);
-    });
-
-    // Poll until astroReady (generous 90s ceiling for cold Ryzen V1500B boots)
-    const deadline = Date.now() + 90_000;
-    let lastAstroState: string | undefined;
-    let lastAstroLogs: string[] = [];
-    while (Date.now() < deadline) {
-      if (deletedSessionIds.has(params.sessionId)) {
-        await stopSessionProcess(params.sessionId);
-        throw new Error('Session was deleted while starting');
-      }
-      if (spawnError !== null) {
-        throw new Error(`Failed to spawn workspace process: ${(spawnError as Error).message}`);
-      }
-      if (child.exitCode !== null) {
-        const tail = (logsBySession.get(params.sessionId) ?? []).slice(-15).join('\n');
-        throw new Error(
-          `Workspace process exited unexpectedly (exit=${child.exitCode}). ${tail}`.trim(),
-        );
-      }
-      try {
-        const res = await fetch(`http://127.0.0.1:${runnerPort}/health`, {
-          signal: AbortSignal.timeout(4_000),
-        });
-        if (res.ok) {
-          const health = (await res.json()) as {
-            originalBase?: string;
-            astroReady?: boolean;
-            astroState?: string;
-            astroLogs?: string[];
-            baseSha?: string;
-          };
-          managed.astroBase = health.originalBase || '/';
-          if (health.baseSha) managed.baseSha = health.baseSha;
-          if (health.astroState) lastAstroState = health.astroState;
-          if (Array.isArray(health.astroLogs) && health.astroLogs.length > 0) {
-            lastAstroLogs = health.astroLogs;
-          }
-          if (health.astroReady) {
-            emitProgress(params.sessionId, 'ready', 'Workspace ready!');
-            return managed;
-          }
-          if (health.astroState === 'crashed') {
-            const tail = (
-              lastAstroLogs.length > 0
-                ? lastAstroLogs
-                : (logsBySession.get(params.sessionId) ?? [])
-            )
-              .slice(-10)
-              .join('\n');
-            await stopSessionProcess(params.sessionId);
-            throw new Error(
-              `Workspace preview server crashed during startup.${tail ? `\n${tail}` : ''}`,
-            );
-          }
-        }
-      } catch (err) {
-        if (
-          err instanceof Error &&
-          (err.message.startsWith('Workspace preview server crashed') ||
-            err.message === 'Session was deleted while starting')
-        ) {
-          throw err;
-        }
-        // still booting
-      }
-      await new Promise((r) => setTimeout(r, 350));
-    }
-
-    const tail = (
-      lastAstroLogs.length > 0 ? lastAstroLogs : (logsBySession.get(params.sessionId) ?? [])
-    )
-      .slice(-10)
-      .join('\n');
-    await stopSessionProcess(params.sessionId);
-    throw new Error(
-      `Timed out waiting for workspace preview server to become ready${lastAstroState ? ` (state=${lastAstroState})` : ''}.${tail ? `\n${tail}` : ''}`,
-    );
-  }
-
-  async function bootWarmSlot(slot: WarmSlot): Promise<void> {
-    const baseDir = sessionDir(slot.id);
-    const workspaceDir = path.join(baseDir, 'workspace');
-    const stateDir = path.join(baseDir, 'state');
-
-    const updateSlotProgress = (stage: BootStage, message: string) => {
-      const now = new Date().toISOString();
-      slot.progress = {
-        stage,
-        message,
-        startedAt: slot.progress.startedAt,
-        updatedAt: now,
-        warmHit: true,
-      };
-      if (slot.claimedBySessionId) {
-        emitProgress(slot.claimedBySessionId, stage, message, {
-          startedAt: slot.progress.startedAt,
-          warmHit: true,
-        });
-      }
-    };
-
-    try {
-      console.log(`[halley-warm-pool] Warming standby workspace ${slot.id.slice(0, 8)}…`);
-      updateSlotProgress('syncing_repo', 'Syncing latest website repository…');
-      const headSha = await syncLocalMirror(opts.baseBranch);
-      slot.baseSha = headSha;
-
-      updateSlotProgress('cloning_repo', 'Cloning website files…');
-      await fs.mkdir(stateDir, { recursive: true });
-      await runGit(baseDir, ['clone', mirrorDir, 'workspace']);
-      await runGit(workspaceDir, ['remote', 'set-url', 'origin', internalGitUrl]);
-      await runGit(workspaceDir, [
-        'checkout',
-        '-B',
-        `halley/standby-${slot.id.slice(0, 6)}`,
-        `origin/${opts.baseBranch}`,
-      ]);
-      slot.baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
-
-      await nmCache.ensureSessionNodeModules({
-        workspaceDir,
-        stateDir,
-        devLocalRepo: opts.devLocalRepo,
-        onInstalling: () => updateSlotProgress('installing_deps', 'Installing project packages…'),
-      });
-
-      updateSlotProgress('starting_preview', 'Starting Astro live preview…');
-      const managed = await spawnRunnerForSession({
-        sessionId: slot.id,
-        workspaceDir,
-        stateDir,
-        baseBranch: opts.baseBranch,
-        baseSha: slot.baseSha,
-        workspaceToken: slot.rawToken,
-        persona: 'non-technical',
-        editorName: 'Editor',
-        editorEmail: 'editor@example.com',
-        readOnly: false,
-        isWarmStandby: true,
-      });
-
-      // Pre-render `/` once so Vite + Tailwind v4 JIT + Astro Content Layer are already hot in RAM!
-      const previewBase = computePreviewBase(slot.id, managed.astroBase);
-      await fetch(`http://127.0.0.1:${managed.astroPort}${previewBase}/`, {
-        signal: AbortSignal.timeout(25_000),
-      })
-        .then((r) => r.arrayBuffer())
-        .catch(() => {});
-
-      slot.runnerPort = managed.runnerPort;
-      slot.astroPort = managed.astroPort;
-      slot.astroBase = managed.astroBase;
-      slot.baseSha = managed.baseSha;
-      slot.state = 'ready';
-      console.log(
-        `[halley-warm-pool] Standby workspace ${slot.id.slice(0, 8)} is pre-rendered & ready (baseSha=${slot.baseSha.slice(0, 7)})`,
-      );
-    } catch (err) {
-      slot.state = 'failed';
-      console.warn(`[halley-warm-pool] Failed to warm standby ${slot.id.slice(0, 8)}:`, err);
-      const idx = warmPool.indexOf(slot);
-      if (idx !== -1) warmPool.splice(idx, 1);
-      await stopSessionProcess(slot.id).catch(() => {});
-      // Only remove baseDir here if not currently claimed by an active `/start` handler
-      // (if claimed, `/start` owns cleanup before its cold-boot fallback to avoid racing fs.rm!)
-      if (!slot.claimedBySessionId) {
-        await fs.rm(baseDir, { recursive: true, force: true }).catch(() => {});
-        if (warmPoolRunning) {
-          setTimeout(() => {
-            if (warmPoolRunning) replenishWarmPool();
-          }, 30_000).unref?.();
-        }
-      }
-    }
-  }
-
-  function replenishWarmPool(): void {
-    if (!warmPoolRunning || opts.warmPoolSize <= 0) return;
-    warmPool = warmPool.filter((s) => s.state !== 'failed');
-    // Respect MAX_ACTIVE_WORKSPACES across active user sessions + standby slots
-    const activeNonWarmCount = [...activeSessions.values()].filter((s) => !s.isWarmStandby).length;
-    const availableCapacity = Math.max(0, opts.maxActiveWorkspaces - activeNonWarmCount);
-    const targetSlots = Math.min(opts.warmPoolSize, availableCapacity);
-
-    while (warmPool.length < targetSlots) {
-      const id = crypto.randomUUID();
-      const rawToken = crypto.randomBytes(24).toString('hex');
-      const now = new Date().toISOString();
-      const slot: WarmSlot = {
-        id,
-        rawToken,
-        state: 'warming',
-        runnerPort: 0,
-        astroPort: 0,
-        astroBase: '/',
-        baseSha: '',
-        progress: {
-          stage: 'syncing_repo',
-          message: 'Preparing standby workspace…',
-          startedAt: now,
-          updatedAt: now,
-          warmHit: true,
-        },
-        bootPromise: Promise.resolve(),
-        claimedBySessionId: null,
-      };
-      slot.bootPromise = bootWarmSlot(slot);
-      warmPool.push(slot);
-    }
-  }
-
-  async function checkWarmPoolHealth(): Promise<void> {
-    if (!warmPoolRunning) return;
-    const unhealthy: WarmSlot[] = [];
-    for (const slot of warmPool) {
-      if (slot.state !== 'ready') continue;
-      try {
-        const res = await fetch(`http://127.0.0.1:${slot.runnerPort}/health`, {
-          signal: AbortSignal.timeout(4_000),
-        });
-        if (!res.ok) unhealthy.push(slot);
-      } catch {
-        unhealthy.push(slot);
-      }
-    }
-    for (const slot of unhealthy) {
-      const idx = warmPool.indexOf(slot);
-      if (idx !== -1) warmPool.splice(idx, 1);
-      await stopSessionProcess(slot.id).catch(() => {});
-      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
-    }
-    const now = Date.now();
-    for (const [id, slot] of Array.from(reservedWarmSlots.entries())) {
-      if (slot.reservedAt && now - slot.reservedAt > 5 * 60_000) {
-        reservedWarmSlots.delete(id);
-        await stopSessionProcess(slot.id).catch(() => {});
-        await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
-      }
-    }
-    replenishWarmPool();
-  }
-
-  function startWarmPool(): void {
-    if (opts.warmPoolSize <= 0 || warmPoolRunning) return;
-    warmPoolRunning = true;
-    replenishWarmPool();
-    warmHealthTimer = setInterval(() => {
-      void checkWarmPoolHealth();
-    }, 120_000);
-    warmHealthTimer.unref?.();
-  }
-
   async function stopAll(): Promise<void> {
     warmPoolRunning = false;
+    clock.clearTimeout(maintenanceTimer);
     if (warmHealthTimer) {
-      clearInterval(warmHealthTimer);
+      clock.clearTimeout(warmHealthTimer);
       warmHealthTimer = null;
     }
     const ids = [...activeSessions.keys()];
-    await Promise.allSettled(ids.map((id) => stopSessionProcess(id)));
+    // Each stop is already bounded (grace -> SIGKILL); this caps the whole fan-out (reaping /proc,
+    // a wedged exit event) so a supervisor shutdown can never hang on one runner.
+    let stopDeadline: TimerHandle | null = null;
+    const timedOut = await Promise.race([
+      Promise.allSettled(ids.map((id) => stopSessionProcess(id))).then(() => false),
+      new Promise<boolean>((resolve) => {
+        stopDeadline = clock.setTimeout(() => resolve(true), runnerStopGraceMs + STOP_ALL_EXTRA_MS);
+        stopDeadline.unref?.();
+      }),
+    ]);
+    clock.clearTimeout(stopDeadline);
+    if (timedOut) logger.warn('supervisor: stopAll deadline exceeded; continuing shutdown', { sessions: ids.length });
     for (const slot of warmPool.splice(0)) {
-      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
+      await fs
+        .rm(sessionDir(slot.id), { recursive: true, force: true })
+        .catch((e) => ignore(e, 'supervisor: remove warm slot on stop', { id: slot.id }));
     }
   }
+
+  /**
+   * W6c: on startup, remove leftovers of a supervisor that died without graceful shutdown:
+   * warm-slot dirs (identified ONLY by the `.warm-slot` marker; real session dirs never carry it),
+   * node_modules staging/old dirs inside session workspaces, and partial nm-cache installs.
+   */
+  async function sweepLeftovers(): Promise<void> {
+    // no sessions root yet (first boot) is expected; anything else is logged and the sweep skipped
+    const entries = await orDefault(fs.readdir(sessionsRoot, { withFileTypes: true }), [], 'supervisor: list sessions for leftover sweep', {
+      expected: MISSING_PATH_CODES,
+      fields: { sessionsRoot },
+    });
+    let removedSlots = 0;
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const id = e.name;
+      const dir = sessionDir(id);
+      const inUse =
+        activeSessions.has(id) ||
+        bootingSessions.has(id) ||
+        reservedWarmSlots.has(id) ||
+        warmPool.some((s) => s.id === id);
+      if (!inUse && (await fileExists(path.join(dir, WARM_SLOT_MARKER)))) {
+        await fs.rm(dir, { recursive: true, force: true }).catch((err) => ignore(err, 'sweep: warm slot', { id }));
+        removedSlots++;
+        continue;
+      }
+      if (inUse) continue;
+      const ws = path.join(dir, 'workspace');
+      const wsEntries = await orDefault(fs.readdir(ws), [] as string[], 'sweep: list session workspace', {
+        expected: MISSING_PATH_CODES,
+        silentExpected: true,
+        fields: { ws },
+      });
+      for (const name of wsEntries) {
+        if (name.startsWith('.node_modules.tmp-') || name.startsWith('.node_modules.old-')) {
+          await fs.rm(path.join(ws, name), { recursive: true, force: true }).catch((err) => ignore(err, 'sweep: nm scratch'));
+        }
+      }
+    }
+    const cacheEntries = await orDefault(fs.readdir(nmCacheDir), [] as string[], 'sweep: list nm-cache', {
+      expected: MISSING_PATH_CODES,
+      fields: { nmCacheDir },
+    });
+    for (const name of cacheEntries) {
+      if (name.startsWith('.tmp-')) {
+        await fs.rm(path.join(nmCacheDir, name), { recursive: true, force: true }).catch((err) => ignore(err, 'sweep: nm-cache tmp'));
+      }
+    }
+    if (removedSlots > 0) {
+      logger.info('supervisor: swept leftover warm-slot dirs from a previous run', { removedSlots });
+    }
+  }
+  const startupSweep = sweepLeftovers().catch((err) => ignore(err, 'supervisor: startup sweep'));
 
   function getWarmPoolStatus() {
     return {
@@ -768,13 +485,15 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
   }
 
   const app = new Hono();
+  // Correlation ids (X-Request-Id / X-Halley-Run-Id) land on every log line of the request
+  app.use('*', requestContextMiddleware());
 
   /**
    * Zero-config HKDF handshake from control-plane: adopts `internalHostToken` on startup
    * when `WORKSPACE_HOST_SECRET` was not set manually, then enforces mandatory Bearer auth!
    */
   app.post('/api/handshake', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { internalHostToken?: string };
+    const body = (await readJsonBodyOrEmpty(c)) as { internalHostToken?: string };
     const candidate = (body.internalHostToken || '').trim();
     if (!candidate) {
       return c.json({ error: 'Missing internalHostToken' }, 400);
@@ -810,15 +529,16 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     await Promise.all(
       activeNonWarm.map(async (s) => {
         try {
-          const r = await fetch(`http://127.0.0.1:${s.runnerPort}/health`, {
-            signal: AbortSignal.timeout(1500),
+          const r = await runnerFetch(`http://127.0.0.1:${s.runnerPort}/health`, {
+            signal: clock.timeoutSignal(1500),
           });
           if (r.ok) {
             const d = (await r.json()) as { astroReady?: boolean };
             if (d.astroReady) astroReadySessionIds.push(s.id);
           }
-        } catch {
-          // ignore
+        } catch (err) {
+          // not ready / unreachable: simply not listed as astro-ready
+          ignoreExpected(err, 'supervisor: runner health for /health aggregation', { sessionId: s.id });
         }
       }),
     );
@@ -834,531 +554,19 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
       warmPool: getWarmPoolStatus(),
       buildQueue: buildQueue.getStatus(),
       diskUsage,
+      // W-disk: new starts / clones / installs / verify builds are refused while true
+      diskPressure: isDiskPressure(diskUsage),
+      diskThresholdBytes: diskUsage ? diskThresholdBytes(diskUsage.totalBytes) : null,
+      crashedSessions: crashedSessions.map(({ logTail: _logTail, ...rest }) => rest),
     });
   });
 
-  app.post('/api/mirror/notify-updated', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { baseBranch?: string };
-    void syncLocalMirror(body.baseBranch || opts.baseBranch).catch(() => {});
-    return c.json({ ok: true });
-  });
+  registerSessionRoutes(app, ctx);
 
-  app.post('/api/sessions/:id/touch', (c) => {
-    const sessionId = c.req.param('id')!;
-    const s = activeSessions.get(sessionId);
-    if (s) {
-      s.lastActiveAt = Date.now();
-    }
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/warm/reserve', (c) => {
-    if (opts.warmPoolSize <= 0) return c.json({ reserved: null });
-    let idx = warmPool.findIndex((s) => s.state === 'ready');
-    if (idx === -1) idx = warmPool.findIndex((s) => s.state === 'warming');
-    if (idx === -1) return c.json({ reserved: null });
-
-    const [slot] = warmPool.splice(idx, 1);
-    if (!slot) return c.json({ reserved: null });
-
-    slot.claimedBySessionId = slot.id;
-    slot.reservedAt = Date.now();
-    reservedWarmSlots.set(slot.id, slot);
-
-    const adoptedWarming = slot.state === 'warming';
-    if (adoptedWarming) {
-      emitProgress(slot.id, slot.progress.stage, slot.progress.message, {
-        startedAt: slot.progress.startedAt,
-        warmHit: true,
-      });
-    } else {
-      emitProgress(slot.id, 'claiming_warm', 'Connecting to ready workspace…', {
-        warmHit: true,
-      });
-    }
-
-    setTimeout(() => {
-      if (warmPoolRunning) replenishWarmPool();
-    }, 100).unref?.();
-
-    return c.json({
-      reserved: {
-        id: slot.id,
-        volumeName: `halley-ws-${slot.id}`,
-        rawToken: slot.rawToken,
-        adoptedWarming,
-      },
-    });
-  });
-
-  app.post('/api/warm/release/:id', async (c) => {
-    const id = c.req.param('id')!;
-    const slot = reservedWarmSlots.get(id);
-    if (slot) {
-      reservedWarmSlots.delete(id);
-      await stopSessionProcess(slot.id).catch(() => {});
-      await fs.rm(sessionDir(slot.id), { recursive: true, force: true }).catch(() => {});
-      replenishWarmPool();
-    }
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/start', async (c) => {
-    const sessionId = c.req.param('id')!;
-    deletedSessionIds.delete(sessionId);
-    const body = (await c.req.json()) as {
-      baseBranch: string;
-      workingBranch: string;
-      baseSha?: string;
-      workspaceToken: string;
-      persona?: 'non-technical' | 'developer';
-      editorName?: string;
-      editorEmail?: string;
-      readOnly?: boolean;
-      protectedSessionIds?: string[];
-    };
-
-    const protectedSet = new Set(body.protectedSessionIds ?? []);
-
-    // Deduplicate concurrent boots for the same session
-    const inflight = bootingSessions.get(sessionId);
-    if (inflight) {
-      const m = await inflight;
-      return c.json({
-        runnerPort: m.runnerPort,
-        astroPort: m.astroPort,
-        astroBase: m.astroBase,
-        baseSha: m.baseSha,
-        instanceId,
-      });
-    }
-
-    // Fast path: already running & healthy (non-warm)
-    const existing = activeSessions.get(sessionId);
-    if (existing && !existing.isWarmStandby && existing.proc.exitCode === null) {
-      if (body.workspaceToken && body.workspaceToken !== existing.workspaceToken) {
-        try {
-          const tokRes = await fetch(`http://127.0.0.1:${existing.runnerPort}/internal/token`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              workspaceToken: body.workspaceToken,
-              hostSecret: activeHostSecret || undefined,
-            }),
-            signal: AbortSignal.timeout(5_000),
-          });
-          if (tokRes.ok) {
-            existing.workspaceToken = body.workspaceToken;
-          } else {
-            await stopSessionProcess(sessionId);
-          }
-        } catch {
-          await stopSessionProcess(sessionId);
-        }
-      }
-      if (activeSessions.get(sessionId) === existing && existing.proc.exitCode === null) {
-        existing.lastActiveAt = Date.now();
-        return c.json({
-          runnerPort: existing.runnerPort,
-          astroPort: existing.astroPort,
-          astroBase: existing.astroBase,
-          baseSha: existing.baseSha,
-          instanceId,
-        });
-      }
-    }
-
-    const bootPromise = (async (): Promise<ManagedSession> => {
-      const reservedSlot = reservedWarmSlots.get(sessionId);
-      if (reservedSlot) {
-        reservedWarmSlots.delete(sessionId);
-        try {
-          if (reservedSlot.state === 'warming') {
-            await reservedSlot.bootPromise;
-          }
-          if (reservedSlot.state === 'ready') {
-            const managed = activeSessions.get(sessionId);
-            if (managed && managed.proc.exitCode === null) {
-              await enforceLruCap(sessionId, protectedSet);
-              const latestHead = await syncLocalMirror(body.baseBranch).catch(() => '');
-              const needsSync = Boolean(
-                latestHead && reservedSlot.baseSha && latestHead !== reservedSlot.baseSha,
-              );
-              const claimRes = await fetch(`http://127.0.0.1:${managed.runnerPort}/internal/claim`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  workingBranch: body.workingBranch,
-                  baseBranch: body.baseBranch,
-                  editorName: body.editorName || 'Editor',
-                  editorEmail: body.editorEmail || 'editor@example.com',
-                  persona: body.persona || 'non-technical',
-                  readOnly: Boolean(body.readOnly),
-                  syncFromMirror: needsSync,
-                  mirrorPath: mirrorDir,
-                  workspaceToken: body.workspaceToken || undefined,
-                  hostSecret: activeHostSecret || undefined,
-                }),
-                signal: AbortSignal.timeout(60_000),
-              });
-              if (claimRes.ok) {
-                const claimed = (await claimRes.json()) as {
-                  baseSha?: string;
-                  originalBase?: string;
-                };
-                managed.isWarmStandby = false;
-                managed.lastActiveAt = Date.now();
-                if (body.workspaceToken) managed.workspaceToken = body.workspaceToken;
-                if (claimed.baseSha) managed.baseSha = claimed.baseSha;
-                if (claimed.originalBase) managed.astroBase = claimed.originalBase;
-                emitProgress(sessionId, 'ready', 'Workspace ready!', { warmHit: true });
-                return managed;
-              }
-            }
-          }
-        } catch (err) {
-          console.warn(
-            `[halley-warm-pool] Claim failed for ${sessionId.slice(0, 8)}, cleaning up before cold boot:`,
-            err,
-          );
-        }
-        // Cleanly wipe failed/partial warm slot directory so cold boot starts 100% fresh on workingBranch!
-        await stopSessionProcess(sessionId).catch(() => {});
-        await fs.rm(sessionDir(sessionId), { recursive: true, force: true }).catch(() => {});
-      }
-
-      if (deletedSessionIds.has(sessionId)) {
-        throw new Error('Session was deleted before boot');
-      }
-
-      await enforceLruCap(sessionId, protectedSet);
-
-      const baseDir = sessionDir(sessionId);
-      const workspaceDir = path.join(baseDir, 'workspace');
-      const stateDir = path.join(baseDir, 'state');
-      await fs.mkdir(stateDir, { recursive: true });
-
-      const repoReady = await fileExists(path.join(workspaceDir, '.git'));
-      let baseSha = body.baseSha || '';
-
-      if (!repoReady) {
-        emitProgress(sessionId, 'syncing_repo', 'Syncing latest website repository…');
-        await syncLocalMirror(body.baseBranch);
-
-        emitProgress(sessionId, 'cloning_repo', 'Cloning website files…');
-        await fs.mkdir(baseDir, { recursive: true });
-        await runGit(baseDir, ['clone', mirrorDir, 'workspace']);
-        await runGit(workspaceDir, ['remote', 'set-url', 'origin', internalGitUrl]);
-        await runGit(workspaceDir, ['checkout', '-B', body.workingBranch, `origin/${body.baseBranch}`]);
-        baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']);
-      } else {
-        await runGit(workspaceDir, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
-        if (!baseSha) {
-          baseSha = await runGit(workspaceDir, ['rev-parse', 'HEAD']).catch(() => '');
-        }
-      }
-
-      await nmCache.ensureSessionNodeModules({
-        workspaceDir,
-        stateDir,
-        devLocalRepo: opts.devLocalRepo,
-        onInstalling: () => emitProgress(sessionId, 'installing_deps', 'Installing project packages…'),
-      });
-
-      const spawned = await spawnRunnerForSession({
-        sessionId,
-        workspaceDir,
-        stateDir,
-        baseBranch: body.baseBranch,
-        baseSha,
-        workspaceToken: body.workspaceToken,
-        persona: body.persona || 'non-technical',
-        editorName: body.editorName || 'Editor',
-        editorEmail: body.editorEmail || 'editor@example.com',
-        readOnly: Boolean(body.readOnly),
-        isWarmStandby: false,
-      });
-
-      if (deletedSessionIds.has(sessionId)) {
-        await stopSessionProcess(sessionId).catch(() => {});
-        await fs.rm(baseDir, { recursive: true, force: true }).catch(() => {});
-        throw new Error('Session was deleted during boot');
-      }
-
-      return spawned;
-    })().finally(() => {
-      bootingSessions.delete(sessionId);
-    });
-
-    bootingSessions.set(sessionId, bootPromise);
-    try {
-      const m = await bootPromise;
-      return c.json({
-        runnerPort: m.runnerPort,
-        astroPort: m.astroPort,
-        astroBase: m.astroBase,
-        baseSha: m.baseSha,
-        instanceId,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[halley-supervisor] Session ${sessionId.slice(0, 8)} start failed: ${msg}`);
-      emitProgress(sessionId, 'error', 'Workspace failed to start', { detail: msg });
-      return c.json({ error: msg }, 500);
-    }
-  });
-
-  app.post('/api/sessions/:id/stop', async (c) => {
-    const sessionId = c.req.param('id')!;
-    await stopSessionProcess(sessionId);
-    // Once a user session goes to sleep, replenish warm standby if capacity opened up
-    if (warmPoolRunning) replenishWarmPool();
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/restart', async (c) => {
-    const sessionId = c.req.param('id')!;
-    reservedWarmSlots.delete(sessionId);
-    await stopSessionProcess(sessionId);
-    return c.json({ ok: true });
-  });
-
-  app.delete('/api/sessions/:id', async (c) => {
-    const sessionId = c.req.param('id')!;
-    deletedSessionIds.add(sessionId);
-    const reserved = reservedWarmSlots.get(sessionId);
-    if (reserved) {
-      reservedWarmSlots.delete(sessionId);
-    }
-    const inflight = bootingSessions.get(sessionId);
-    await stopSessionProcess(sessionId);
-    if (inflight) {
-      await inflight.catch(() => {});
-      await stopSessionProcess(sessionId);
-    }
-    logsBySession.delete(sessionId);
-    await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
-    if (warmPoolRunning) replenishWarmPool();
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/prune-node-modules', async (c) => {
-    const sessionId = c.req.param('id')!;
-    if (activeSessions.has(sessionId) || bootingSessions.has(sessionId)) {
-      return c.json({ error: 'Cannot prune node_modules of an active session' }, 409);
-    }
-    const nmPath = path.join(sessionDir(sessionId), 'workspace', 'node_modules');
-    await fs.rm(nmPath, { recursive: true, force: true });
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/duplicate', async (c) => {
-    const sourceId = c.req.param('id')!;
-    const body = (await c.req.json()) as {
-      targetSessionId: string;
-      targetWorkingBranch: string;
-      mode?: 'branch-off' | 'fresh-from-main';
-    };
-
-    const dstBase = sessionDir(body.targetSessionId);
-    await fs.mkdir(path.join(dstBase, 'state'), { recursive: true });
-
-    if (body.mode === 'fresh-from-main') {
-      return c.json({ ok: true });
-    }
-
-    const srcBase = sessionDir(sourceId);
-    const srcWs = path.join(srcBase, 'workspace');
-    const dstWs = path.join(dstBase, 'workspace');
-
-    const hasSrcRepo = await fileExists(path.join(srcWs, '.git'));
-    if (hasSrcRepo) {
-      // Atomic Git clone avoids torn reads of .git/index or refs when duplicating a live session!
-      await runGit(dstBase, ['clone', '--no-hardlinks', srcWs, 'workspace']);
-      await runGit(dstWs, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
-      await runGit(dstWs, ['checkout', '-B', body.targetWorkingBranch]);
-    }
-
-    const srcUploads = path.join(srcBase, 'state', 'uploads');
-    if (await fileExists(srcUploads)) {
-      await fs.cp(srcUploads, path.join(dstBase, 'state', 'uploads'), { recursive: true });
-    }
-    const srcPageRequests = path.join(srcBase, 'state', 'page-requests.json');
-    if (await fileExists(srcPageRequests)) {
-      await fs.copyFile(srcPageRequests, path.join(dstBase, 'state', 'page-requests.json')).catch(() => {});
-    }
-
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/git/fetch', async (c) => {
-    const sessionId = c.req.param('id')!;
-    const body = (await c.req.json()) as { baseBranch: string };
-    const ws = path.join(sessionDir(sessionId), 'workspace');
-    await runGit(ws, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
-    await runGit(ws, ['fetch', 'origin', body.baseBranch], true);
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/git/push', async (c) => {
-    const sessionId = c.req.param('id')!;
-    const body = (await c.req.json()) as { workingBranch: string };
-    const ws = path.join(sessionDir(sessionId), 'workspace');
-    await runGit(ws, ['remote', 'set-url', 'origin', internalGitUrl]).catch(() => {});
-    await runGit(
-      ws,
-      ['push', '--force', 'origin', `HEAD:refs/heads/${body.workingBranch}`],
-      true,
-    );
-    return c.json({ ok: true });
-  });
-
-  app.get('/api/sessions/:id/logs', (c) => {
-    const sessionId = c.req.param('id')!;
-    return c.json({ lines: logsBySession.get(sessionId) ?? [] });
-  });
-
-  app.get('/api/sessions/:id/progress', (c) => {
-    const sessionId = c.req.param('id')!;
-    return c.json({ progress: bootProgressBySession.get(sessionId) ?? null });
-  });
-
-  app.post('/internal/build-lock/defer-speculative', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { durationMs?: number };
-    buildQueue.deferSpeculativeFor(Math.min(120_000, Math.max(1_000, Number(body.durationMs) || 15_000)));
-    return c.json({ ok: true });
-  });
-
-  const speculativeStreamClosers = new Map<string, () => void>();
-
-  // Container-wide priority FIFO build lock (NDJSON stream)
-  app.post('/internal/build-lock/acquire', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
-      sessionId?: string;
-      priority?: 'foreground' | 'speculative';
-      timeoutMs?: number;
-    };
-    const sessionId = body.sessionId || 'unknown';
-    const priority = body.priority === 'speculative' ? 'speculative' : 'foreground';
-    const encoder = new TextEncoder();
-    const ac = new AbortController();
-
-    c.req.raw.signal?.addEventListener('abort', () => ac.abort(), { once: true });
-
-    let acquiredLeaseId: string | null = null;
-    let sentAcquired = false;
-    let streamCancelled = false;
-
-    const stream = new ReadableStream({
-      start(controller) {
-        let closed = false;
-        const closeStream = () => {
-          if (closed) return;
-          closed = true;
-          if (acquiredLeaseId) {
-            speculativeStreamClosers.delete(acquiredLeaseId);
-          }
-          try {
-            controller.close();
-          } catch {
-            // already closed
-          }
-        };
-        const send = (obj: Record<string, unknown>): boolean => {
-          if (closed) return false;
-          try {
-            controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
-            return true;
-          } catch {
-            return false;
-          }
-        };
-
-        void buildQueue
-          .acquire(sessionId, {
-            priority,
-            timeoutMs: body.timeoutMs,
-            signal: ac.signal,
-            onQueued: (position) => {
-              send({
-                event: 'queued',
-                position,
-                message: `Waiting for another editor's checks to finish (position ${position})…`,
-              });
-            },
-            onPreempted:
-              priority === 'speculative'
-                ? () => {
-                    send({ event: 'preempted', leaseId: acquiredLeaseId });
-                    closeStream();
-                  }
-                : undefined,
-          })
-          .then((lease) => {
-            acquiredLeaseId = lease.leaseId;
-            if (streamCancelled || ac.signal.aborted) {
-              buildQueue.releaseByLease(lease.leaseId);
-              closeStream();
-              return;
-            }
-            sentAcquired = send({ event: 'acquired', leaseId: lease.leaseId });
-            if (!sentAcquired) {
-              buildQueue.releaseByLease(lease.leaseId);
-              closeStream();
-              return;
-            }
-            if (priority === 'speculative') {
-              speculativeStreamClosers.set(lease.leaseId, closeStream);
-            } else {
-              closeStream();
-            }
-          })
-          .catch((err) => {
-            send({
-              event: err instanceof BuildQueueTimeoutError ? 'timeout' : 'error',
-              message: err instanceof Error ? err.message : String(err),
-            });
-            closeStream();
-          });
-      },
-      cancel() {
-        streamCancelled = true;
-        ac.abort();
-        if (acquiredLeaseId && !sentAcquired) {
-          buildQueue.releaseByLease(acquiredLeaseId);
-        }
-      },
-    });
-
-    return new Response(stream, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/x-ndjson',
-        'Cache-Control': 'no-cache',
-      },
-    });
-  });
-
-  app.post('/internal/build-lock/promote', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { leaseId?: string };
-    const promoted = body.leaseId ? buildQueue.promoteToForeground(body.leaseId) : false;
-    if (body.leaseId) {
-      speculativeStreamClosers.get(body.leaseId)?.();
-    }
-    return c.json({ ok: true, promoted });
-  });
-
-  app.post('/internal/build-lock/release', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { leaseId?: string };
-    const released = body.leaseId ? buildQueue.releaseByLease(body.leaseId) : false;
-    if (body.leaseId) {
-      speculativeStreamClosers.get(body.leaseId)?.();
-    }
-    return c.json({ ok: true, released });
-  });
+  registerBuildLockRoutes(app, ctx);
 
   app.post('/api/optimize/scan', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
+    const body = (await readJsonBodyOrEmpty(c)) as {
       baseBranch?: string;
       repo?: string;
     };
@@ -1387,6 +595,9 @@ export function createWorkspaceSupervisor(opts: SupervisorOptions) {
     stopAll,
     setSupervisorSelfUrl,
     getWarmPoolStatus,
+    startupSweep,
+    runMaintenance,
+    nmCache,
   };
 }
 
@@ -1395,6 +606,22 @@ const isMain =
   path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isMain) {
+  // Fail-stop: after an uncaught exception the process state is unknown, so shut down (bounded) and
+  // exit non-zero; Docker restarts us and the control plane reconciles sessions from disk.
+  let fatalShutdownStarted = false;
+  let fatalShutdown: (() => void) | null = null;
+  process.on('uncaughtException', (err) => {
+    logger.error('supervisor: uncaughtException; shutting down', { err });
+    if (fatalShutdownStarted) return;
+    fatalShutdownStarted = true;
+    const hardExit = setTimeout(() => process.exit(1), 10_000);
+    hardExit.unref();
+    if (fatalShutdown) fatalShutdown();
+    else process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('supervisor: unhandledRejection', { err: reason });
+  });
   const port = Number(process.env.SUPERVISOR_PORT || 4000);
   const bindHost = process.env.SUPERVISOR_BIND_HOST || '0.0.0.0';
   const workspacesDir = process.env.WORKSPACES_DIR || '/workspaces';
@@ -1447,26 +674,38 @@ if (isMain) {
   if (initialHostSecret) {
     void (async () => {
       const cpHealthUrl = `${controlPlaneInternalUrl.replace(/\/+$/, '')}/api/health`;
-      const deadline = Date.now() + 60_000;
-      while (Date.now() < deadline) {
+      const deadline = realClock.now() + 60_000;
+      while (realClock.now() < deadline) {
         try {
-          const res = await fetch(cpHealthUrl, { signal: AbortSignal.timeout(2000) });
+          const res = await fetch(cpHealthUrl, { signal: realClock.timeoutSignal(2000) });
           if (res.ok) break;
-        } catch {
-          // control-plane still starting
+        } catch (err) {
+          ignoreExpected(err, 'supervisor: control plane not reachable yet');
         }
-        await new Promise((r) => setTimeout(r, 1000));
+        await sleep(realClock, 1000);
       }
       supervisor.startWarmPool();
     })();
   }
 
-  const shutdown = () => {
+  let shuttingDown = false;
+  const shutdown = (code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     void supervisor.stopAll().finally(() => {
       server.close();
-      process.exit(0);
+      process.exit(code);
     });
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  fatalShutdown = () => shutdown(1);
+  process.on('SIGINT', () => shutdown(0));
+  process.on('SIGTERM', () => shutdown(0));
+  // Local (non-Docker) mode: the control plane spawns us and sets this; if it dies we must not keep
+  // running its sessions unsupervised. In Docker our parent is tini, which never goes away.
+  if (process.env.HALLEY_EXIT_WITH_PARENT === '1') {
+    onParentDeath(() => {
+      logger.warn('supervisor: parent process died; stopping all sessions and exiting');
+      shutdown(1);
+    });
+  }
 }

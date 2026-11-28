@@ -1,5 +1,14 @@
 export { parse as parseAstroSource } from '@astrojs/compiler';
 export {
+  computeContentHash,
+  computeOuterHash,
+  countElementNodes,
+  countMalformedElements,
+  findElementsByOuterHash,
+  locForElementStartingAt,
+  computeSnapshotHash,
+  countAstroParseErrors,
+  findElementsByContentHash,
   ALLOWED_INLINE_TAGS,
   PROTECTED_LANDMARK_TAGS,
   collectSubtreeLocs,
@@ -7,6 +16,8 @@ export {
   parseLoc,
   sha256,
   type EditabilityKind,
+  type InspectOptions,
+  type SourceElement,
   type ElementCapabilities,
   type ElementContextInfo,
   type ImageCapability,
@@ -18,6 +29,14 @@ export {
   type StyleCapability,
   type TextAlignValue,
 } from './ast-classifier.js';
+export {
+  detectAstroVersions,
+  formatAstroVersions,
+  getAstroCompat,
+  inlineEditingDisabledReason,
+  SUPPORTED_ASTRO_MAJORS,
+  type AstroVersionInfo,
+} from './compat.js';
 export { PerFileMutex, type AsyncFileLock } from './file-lock.js';
 export {
   listSiteImages,
@@ -41,6 +60,8 @@ export {
   type ElementMutation,
   type MutateElementInput,
   type MutateElementResult,
+  type MutationExpectation,
+  verifyMutatedSource,
 } from './mutations.js';
 export {
   discoverSiteRoutes,
@@ -61,6 +82,7 @@ export {
 export {
   patchStaticSpan,
   serializeHtmlToAstro,
+  verifyPatchedSource,
   type PatchStaticSpanInput,
   type PatchStaticSpanResult,
   type SerializeOptions,

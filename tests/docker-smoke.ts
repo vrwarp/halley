@@ -16,6 +16,57 @@ async function run(cmd: string, args: string[], cwd = process.cwd()): Promise<st
   return stdout.trim();
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Poll `probe` until it returns a non-undefined value (or throws a fatal error), failing with
+ * `what` after `timeoutMs`. Replaces fixed sleeps: proceeds as soon as the condition holds.
+ */
+async function waitFor<T>(
+  what: string,
+  probe: () => Promise<T | undefined>,
+  { timeoutMs, intervalMs = 500 }: { timeoutMs: number; intervalMs?: number },
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const v = await probe();
+      if (v !== undefined) return v;
+    } catch (err) {
+      if (err instanceof FatalSmokeError) throw err;
+      lastErr = err; // transient (connection refused while booting, etc.)
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}${lastErr ? ` (last error: ${String(lastErr)})` : ''}`);
+}
+
+/** Thrown from a waitFor probe to abort immediately instead of retrying. */
+class FatalSmokeError extends Error {}
+
+/** Astro version from the lockfile, so the fixture site installs exactly what CI tested against. */
+async function lockfileAstroVersion(): Promise<string> {
+  const lock = await fs.readFile(path.resolve('pnpm-lock.yaml'), 'utf8');
+  const m = /^ {2}astro@(\d+\.\d+\.\d+):/m.exec(lock);
+  if (!m) throw new Error('Could not find astro@x.y.z in pnpm-lock.yaml');
+  return m[1]!;
+}
+
+/**
+ * Optional CA bundle for runs behind a TLS-intercepting proxy (the workspace container runs
+ * `pnpm install` for the fixture site). No-op unless HALLEY_SMOKE_EXTRA_CA_CERT is set.
+ */
+function extraCaDockerArgs(): string[] {
+  const ca = process.env.HALLEY_SMOKE_EXTRA_CA_CERT;
+  if (!ca) return [];
+  return ['-v', `${path.resolve(ca)}:/etc/halley-smoke-extra-ca.crt:ro`, '-e', 'NODE_EXTRA_CA_CERTS=/etc/halley-smoke-extra-ca.crt'];
+}
+
+async function containerHealth(name: string): Promise<string> {
+  return run('docker', ['inspect', '--format', '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', name]);
+}
+
 async function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -86,6 +137,7 @@ function startFakeAnthropicOnAllInterfaces(port: number): Promise<http.Server> {
 }
 
 async function createMinimalAstroSite(dir: string): Promise<void> {
+  const astroVersion = await lockfileAstroVersion();
   await fs.mkdir(path.join(dir, 'src/pages'), { recursive: true });
   await fs.writeFile(
     path.join(dir, 'package.json'),
@@ -96,7 +148,7 @@ async function createMinimalAstroSite(dir: string): Promise<void> {
         private: true,
         type: 'module',
         dependencies: {
-          astro: '^5.5.0',
+          astro: astroVersion,
         },
       },
       null,
@@ -190,11 +242,26 @@ async function main() {
       'HALLEY_WARM_POOL_SIZE=1',
       '-e',
       'MAX_ACTIVE_WORKSPACES=5',
+      ...extraCaDockerArgs(),
       'halley-workspace:ci-smoke',
     ]);
 
-    // Deliberately wait 2s before starting control-plane to exercise workspaces-first cold boot + HKDF /api/handshake
-    await new Promise((r) => setTimeout(r, 2000));
+    // Start control-plane only once the supervisor is serving, to exercise workspaces-first cold boot +
+    // HKDF /api/handshake (polls instead of a fixed sleep; any HTTP status means it is listening).
+    await waitFor(
+      'workspace supervisor to listen on :4000',
+      async () => {
+        await run('docker', [
+          'exec',
+          wsName,
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:4000/health').then(()=>process.exit(0),()=>process.exit(1))",
+        ]);
+        return true;
+      },
+      { timeoutMs: 60_000, intervalMs: 250 },
+    );
 
     console.log('[docker-smoke] 3b. Starting halley-control-plane container (--memory 2g, SESSION_SECRET only, zero docker.sock)…');
     await run('docker', [
@@ -232,6 +299,7 @@ async function main() {
       `ANTHROPIC_BASE_URL=http://${gatewayIp}:${fakeLlmPort}`,
       '-e',
       'GITHUB_TOKEN=fake-token',
+      ...extraCaDockerArgs(),
       'halley-control-plane:ci-smoke',
     ]);
 
@@ -239,16 +307,11 @@ async function main() {
     await run('docker', ['cp', repoDir, `${cpName}:/tmp/fixture-repo`]);
 
     const cpUrl = `http://127.0.0.1:${hostPort}`;
-    const deadline = Date.now() + 25_000;
-    while (Date.now() < deadline) {
-      try {
-        const res = await fetch(`${cpUrl}/api/health`);
-        if (res.ok) break;
-      } catch {
-        // retry
-      }
-      await new Promise((r) => setTimeout(r, 300));
-    }
+    await waitFor(
+      'control-plane /api/health',
+      async () => ((await fetch(`${cpUrl}/api/health`)).ok ? true : undefined),
+      { timeoutMs: 60_000, intervalMs: 300 },
+    );
 
     // Verify mandatory /internal/git/repo.git authentication (401 without HKDF Bearer token)
     const unauthGit = await fetch(`${cpUrl}/internal/git/repo.git/info/refs?service=git-upload-pack`);
@@ -257,9 +320,9 @@ async function main() {
     }
 
     console.log('[docker-smoke] 4. Checking /api/health/doctor (protocolVersion=2 + HKDF handshake) & waiting for warm standby pool…');
-    let warmReady = false;
-    const warmDeadline = Date.now() + 120_000;
-    while (Date.now() < warmDeadline) {
+    const warmReady = await waitFor(
+      'warm standby pool to become ready',
+      async () => {
       const docRes = await fetch(`${cpUrl}/api/health/doctor`);
       const docJson = (await docRes.json()) as {
         ok: boolean;
@@ -272,23 +335,39 @@ async function main() {
         };
       };
       if (!docJson.ok) {
-        throw new Error(`Doctor check failed: ${JSON.stringify(docJson)}`);
+        throw new FatalSmokeError(`Doctor check failed: ${JSON.stringify(docJson)}`);
       }
       if (docJson.details.supervisor?.protocolVersion !== 2) {
-        throw new Error(`Expected supervisor protocolVersion=2 in doctor report: ${JSON.stringify(docJson)}`);
+        throw new FatalSmokeError(`Expected supervisor protocolVersion=2 in doctor report: ${JSON.stringify(docJson)}`);
       }
-      if ((docJson.details.supervisor?.warmPool?.ready ?? 0) >= 1) {
-        warmReady = true;
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 1500));
-    }
+      return (docJson.details.supervisor?.warmPool?.ready ?? 0) >= 1 ? true : undefined;
+      },
+      { timeoutMs: 120_000, intervalMs: 1000 },
+    ).catch((err: unknown) => {
+      if (err instanceof FatalSmokeError) throw err;
+      return false;
+    });
     if (!warmReady) {
       const wsLogs = await run('docker', ['logs', wsName]).catch(() => '');
       throw new Error(`Timed out waiting for warm standby pool to become ready.\nWS logs:\n${wsLogs}`);
     }
 
-    console.log('[docker-smoke] 5. Verifying BOTH containers run `tini` as unprivileged `node` PID 1…');
+    console.log('[docker-smoke] 5a. Waiting for both image HEALTHCHECKs to report healthy…');
+    for (const cName of [wsName, cpName]) {
+      await waitFor(
+        `${cName} HEALTHCHECK to report healthy`,
+        async () => {
+          const status = await containerHealth(cName);
+          if (status === 'unhealthy' || status === 'none') {
+            throw new FatalSmokeError(`${cName} health status is '${status}'`);
+          }
+          return status === 'healthy' ? true : undefined;
+        },
+        { timeoutMs: 90_000, intervalMs: 1000 },
+      );
+    }
+
+    console.log('[docker-smoke] 5b. Verifying BOTH containers run `tini` as unprivileged `node` PID 1…');
     for (const cName of [wsName, cpName]) {
       const pid1Owner = await run('docker', ['exec', cName, 'stat', '-c', '%U', '/proc/1']);
       const pid1Comm = await run('docker', ['exec', cName, 'cat', '/proc/1/comm']);
@@ -422,12 +501,20 @@ async function main() {
       await page1.click('button:has-text("Edit")');
       const p1 = f1.locator('p').first();
       await p1.click();
+      // Wait for the actual save round-trip instead of a fixed delay.
+      const patchSaved = page1.waitForResponse(
+        (r) => r.url().includes('/__editor/patch') && r.request().method() === 'POST',
+        { timeout: 30_000 },
+      );
       await p1.evaluate((el) => {
         el.textContent = 'Edited live inside real Docker browser smoke test!';
         el.dispatchEvent(new Event('input', { bubbles: true }));
       });
       await p1.evaluate((el) => el.blur());
-      await page1.waitForTimeout(800);
+      const patchRes = await patchSaved;
+      if (!patchRes.ok()) {
+        throw new Error(`Inline edit patch failed (${patchRes.status()}): ${await patchRes.text()}`);
+      }
 
       // Reload both tabs: Tab 1 keeps the edit, Tab 2 stays isolated with original copy!
       await page1.reload({ waitUntil: 'networkidle' });
@@ -450,17 +537,22 @@ async function main() {
     console.log('[docker-smoke] 10. Restarting workspaces container and verifying state reconciliation + lazy wake…');
     await run('docker', ['restart', wsName]);
     // Wait for doctor to report healthy again (which reconciles DB sessions to sleeping)
-    const reconDeadline = Date.now() + 20_000;
-    while (Date.now() < reconDeadline) {
-      const r = await fetch(`${cpUrl}/api/health/doctor`);
-      if (r.ok) break;
-      await new Promise((r2) => setTimeout(r2, 400));
-    }
-    const afterRestartRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
-    const afterRestart = (await afterRestartRes.json()) as { session: { status: string } };
-    if (afterRestart.session.status !== 'sleeping') {
-      throw new Error(`Expected session to reconcile to 'sleeping' after workspaces restart, got '${afterRestart.session.status}'`);
-    }
+    // Poll for the reconciled state itself: doctor can still report OK from before the restart was
+    // noticed, so checking the status once right after doctor turns OK raced the reconciler.
+    let lastStatus = '';
+    await waitFor(
+      "session to reconcile to 'sleeping' after workspaces restart",
+      async () => {
+        const r = await fetch(`${cpUrl}/api/health/doctor`);
+        if (!r.ok) return undefined;
+        const afterRestartRes = await fetch(`${cpUrl}/api/sessions/${sessionId}`, { headers: { Cookie: cookie } });
+        lastStatus = ((await afterRestartRes.json()) as { session: { status: string } }).session.status;
+        return lastStatus === 'sleeping' ? true : undefined;
+      },
+      { timeoutMs: 60_000, intervalMs: 400 },
+    ).catch((err: unknown) => {
+      throw new Error(`${String(err)}; last status '${lastStatus}'`);
+    });
 
     // Simulate an interrupted/partial node_modules directory (empty dir, missing astro) before waking
     await run('docker', [

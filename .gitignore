@@ -10,3 +10,6 @@ dist/
 /data/
 .DS_Store
 coverage/
+
+# local before/after benchmark build copies
+.dist-base/

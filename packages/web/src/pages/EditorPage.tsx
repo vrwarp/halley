@@ -1,21 +1,12 @@
 import type {
-  BootProgressDto,
   ChatServerMessage,
-  CheckpointInfo,
   EditorSessionDto,
   ElementContext,
-  LiveRunStateDto,
   MergeReviewStateDto,
-  PageRequestMetadata,
-  PostMessageFromPreview,
-  PostMessageToPreview,
   PreviewMode,
   PreviewRect,
   PublishProgressPayload,
-  SiteRouteEntryDto,
   SpendStatusDto,
-  StagedAttachment,
-  TranscriptEntryDto,
   UserDto,
 } from '@halley/shared';
 import {
@@ -47,9 +38,19 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { elementKey, friendlyElementKind } from '@halley/shared';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { api, type PriorThreadDto } from '../api.js';
+import { elementKey } from '@halley/shared';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { api } from '../api.js';
+import { LoadErrorScreen } from '../components/ErrorBoundary.js';
+import { ErrorNoticeBanner, WsConnectionIndicator } from '../components/EditorStatusOverlays.js';
+import { errorMessage, reportIgnored, useStableCallback } from '../lib/retry.js';
+import { errorFrameText } from '../lib/client-frames.js';
+import type { ResyncReason } from '../lib/ws-sequencer.js';
+import { chipKeyOf, chipLabelOf, useComposer } from '../hooks/useComposer.js';
+import { useChatSocket } from '../hooks/useChatSocket.js';
+import { usePreviewBridge } from '../hooks/usePreviewBridge.js';
+import { useSessionMeta } from '../hooks/useSessionMeta.js';
+import { useTranscript } from '../hooks/useTranscript.js';
 import { flyToChip } from '../components/attachFlight.js';
 import { BranchOffModal } from '../components/BranchOffModal.js';
 import { ChatMessageContent, parseUserMessageDisplay } from '../components/ChatMessageContent.js';
@@ -67,15 +68,8 @@ import { NewPageModal } from '../components/NewPageModal.js';
 import { PageToolbarControls } from '../components/PageToolbarControls.js';
 import { PublishModal } from '../components/PublishModal.js';
 import { PreviewVerifyingOverlay } from '../components/PreviewVerifyingOverlay.js';
+import { DesktopTranscriptBlocks, friendlyToolLabel, groupTranscriptEntries } from '../components/TranscriptBlocks.js';
 import { WorkspaceLoadingScreen } from '../components/WorkspaceLoadingScreen.js';
-
-/** Chips are unique per element + highlighted phrase. */
-const chipKeyOf = (c: ElementContext) => `${elementKey(c)}|${c.selectedText ?? ''}`;
-const chipLabelOf = (c: ElementContext, persona: 'non-technical' | 'developer' = 'non-technical') => {
-  if (c.selectedText) return `“${c.selectedText}”`;
-  const kind = persona === 'developer' ? `<${c.tagName}>` : friendlyElementKind(c.tagName);
-  return c.renderedText ? `${kind}: ${c.renderedText}` : kind;
-};
 
 interface Props {
   sessionId: string;
@@ -88,58 +82,6 @@ interface Props {
 
 const MUTATING_TOOLS = new Set(['edit', 'write', 'bash', 'process_image', 'create_page']);
 
-type TranscriptDisplayBlock =
-  | { kind: 'entry'; entry: TranscriptEntryDto }
-  | { kind: 'steps'; id: string; items: TranscriptEntryDto[] };
-
-function groupTranscriptEntries(
-  entries: TranscriptEntryDto[],
-  collapseIntermediate: boolean,
-): TranscriptDisplayBlock[] {
-  if (!collapseIntermediate) {
-    return entries.map((entry) => ({ kind: 'entry', entry }));
-  }
-  const blocks: TranscriptDisplayBlock[] = [];
-  for (const entry of entries) {
-    const isStep =
-      (entry.role === 'tool' && !entry.pageRequest) ||
-      (entry.role === 'assistant' && entry.isIntermediate);
-    if (isStep) {
-      const prev = blocks.at(-1);
-      if (prev && prev.kind === 'steps') {
-        prev.items.push(entry);
-      } else {
-        blocks.push({ kind: 'steps', id: `steps-${entry.id}`, items: [entry] });
-      }
-    } else {
-      blocks.push({ kind: 'entry', entry });
-    }
-  }
-  return blocks;
-}
-
-function friendlyToolLabel(name?: string): string {
-  switch (name) {
-    case 'read':
-      return 'Read file';
-    case 'edit':
-    case 'write':
-      return 'Updated file';
-    case 'create_page':
-      return 'Created starter page';
-    case 'bash':
-      return 'Ran command';
-    case 'process_image':
-      return 'Optimized image';
-    case 'screenshot_page':
-      return 'Inspected page layout';
-    case 'run_checks':
-      return 'Checked site health';
-    default:
-      return name || 'Step';
-  }
-}
-
 export function EditorPage({
   sessionId,
   user,
@@ -148,25 +90,10 @@ export function EditorPage({
   onBack,
   onOpenSession,
 }: Props) {
-  const [session, setSession] = useState<EditorSessionDto | null>(null);
-  const [bootProgress, setBootProgress] = useState<BootProgressDto | null>(null);
-  const [spend, setSpend] = useState<SpendStatusDto>(initialSpend);
-  const [entries, setEntries] = useState<TranscriptEntryDto[]>([]);
-  const [priorThread, setPriorThread] = useState<PriorThreadDto | null>(null);
-  const [volumeExpired, setVolumeExpired] = useState(false);
-  const [live, setLive] = useState<LiveRunStateDto>({
-    busy: false,
-    activeTools: [],
-    queuedCount: 0,
-  });
-  const [checkpoints, setCheckpoints] = useState<CheckpointInfo[]>([]);
-  const [changedCount, setChangedCount] = useState(0);
   const [publishProgress, setPublishProgress] = useState<PublishProgressPayload | null>(null);
   const [previewPaused, setPreviewPaused] = useState<{ paused: boolean; reason?: string }>({
     paused: false,
   });
-  const [wsReconnectNonce, setWsReconnectNonce] = useState(0);
-  const crashLoopHaltedRef = useRef(false);
   const prevPreviewPausedRef = useRef(false);
   const [syncing, setSyncing] = useState(false);
   const [syncToast, setSyncToast] = useState<string | null>(null);
@@ -187,13 +114,10 @@ export function EditorPage({
       ? 'mobile'
       : 'desktop',
   );
-  const [currentRoute, setCurrentRoute] = useState('/');
-  const [siteRoutes, setSiteRoutes] = useState<SiteRouteEntryDto[]>([]);
   const [showPageSwitcher, setShowPageSwitcher] = useState(false);
   const [routeQuery, setRouteQuery] = useState('');
   const [showNewPageModal, setShowNewPageModal] = useState(false);
   const [newPageInitialTitle, setNewPageInitialTitle] = useState('');
-  const [pageRequestsMap, setPageRequestsMap] = useState<Record<string, PageRequestMetadata>>({});
   const [showHistory, setShowHistory] = useState(false);
   const [showPublish, setShowPublish] = useState(initialOpenPublish);
   const [showDebug, setShowDebug] = useState(false);
@@ -201,7 +125,6 @@ export function EditorPage({
   // Mobile-specific UI state
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const [mobileBubblePos, setMobileBubblePos] = useState<BubblePos>(() => defaultBubblePos());
-  const [previewSelectionActive, setPreviewSelectionActive] = useState(false);
   const [mobileCompletionToast, setMobileCompletionToast] = useState<string | null>(null);
   const [mobileSheet, setMobileSheet] = useState<
     null | 'history' | 'review' | 'pages' | 'menu' | 'checkpoints'
@@ -213,34 +136,16 @@ export function EditorPage({
   const [branchOffBusy, setBranchOffBusy] = useState(false);
   const [branchOffError, setBranchOffError] = useState<string | null>(null);
 
-  const [input, setInput] = useState('');
-  const [chips, setChips] = useState<ElementContext[]>([]);
-  const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
   const [expandedTool, setExpandedTool] = useState<string | null>(null);
   const [persona, setPersona] = useState<'non-technical' | 'developer'>(user.persona ?? 'non-technical');
 
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const wsRef = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const lastPreviewReloadAtRef = useRef(0);
-  const lastNavigationAtRef = useRef(0);
-  const pendingRouteRef = useRef<string | null>(null);
-  const pendingRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sessionStatusRef = useRef<string | null>(null);
-  sessionStatusRef.current = session?.status ?? null;
-  const sessionKindRef = useRef<string | null>(null);
-  sessionKindRef.current = session?.kind ?? null;
-  const currentRouteRef = useRef(currentRoute);
-  currentRouteRef.current = currentRoute;
   const prevBusyRef = useRef(false);
   const hadMutatingToolRef = useRef(false);
   const runStartEntryCountRef = useRef(0);
   const runStartRoutesRef = useRef<Set<string> | null>(null);
   const runStartedAtRef = useRef(0);
-  const wakeRequestedRef = useRef(false);
   const chipRowRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -249,8 +154,11 @@ export function EditorPage({
   const mobileTextareaRef = useRef<HTMLTextAreaElement>(null);
   const completionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingFlightRef = useRef<{ chipKey: string; from: PreviewRect | null; label: string } | null>(null);
-  const pendingHighlightKeyRef = useRef<string | null>(null);
   const [flightNonce, setFlightNonce] = useState(0);
+
+  const [errorNotice, setErrorNotice] = useState<{ id: number; text: string } | null>(null);
+  const noticeIdRef = useRef(0);
+  const showErrorNotice = (text: string) => setErrorNotice({ id: ++noticeIdRef.current, text });
 
   // Sync phone layout breakpoint (< 640px) and keep editorContext.viewport accurate on phones
   useEffect(() => {
@@ -267,49 +175,38 @@ export function EditorPage({
     return () => mq.removeEventListener('change', onChange);
   }, []);
 
-  const [astroReady, setAstroReady] = useState(false);
-
-  const postToPreview = (payload: PostMessageToPreview) => {
-    try {
-      iframeRef.current?.contentWindow?.postMessage(payload, window.location.origin);
-    } catch {
-      // Cross-origin frame navigated externally; ignore
-    }
-  };
-
-  const reloadPreview = (force = false) => {
-    const now = Date.now();
-    if (!force) {
-      if (pendingRouteRef.current !== null) return;
-      if (now - lastNavigationAtRef.current < 3000) return;
-      if (now - lastPreviewReloadAtRef.current < 1200) return;
-    }
-    lastPreviewReloadAtRef.current = now;
-    const frame = iframeRef.current;
-    if (!frame) return;
-    if (force && session) {
-      try {
-        const href = frame.contentWindow?.location?.href;
-        if (!href || !href.includes(`/p/${session.id}`)) {
-          const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
-          const clean = currentRouteRef.current.startsWith('/')
-            ? currentRouteRef.current
-            : `/${currentRouteRef.current}`;
-          frame.src = `/p/${session.id}${baseSuffixVal}${clean}`;
-          return;
-        }
-      } catch {
-        // Cross-origin frame navigated to external link in Browse mode: reset src back to preview!
-        const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
-        const clean = currentRouteRef.current.startsWith('/')
-          ? currentRouteRef.current
-          : `/${currentRouteRef.current}`;
-        frame.src = `/p/${session.id}${baseSuffixVal}${clean}`;
-        return;
-      }
-    }
-    postToPreview({ type: 'halley:reload', force });
-  };
+  const {
+    session,
+    setSession,
+    bootProgress,
+    setBootProgress,
+    spend,
+    setSpend,
+    astroReady,
+    setAstroReady,
+    checkpoints,
+    setCheckpoints,
+    changedCount,
+    setChangedCount,
+    siteRoutes,
+    setSiteRoutes,
+    metaError,
+    setMetaError,
+    initialLoadError,
+    retryInitialLoad,
+    loadSessionMeta,
+    applyWokenSession,
+    crashLoopHaltedRef,
+  } = useSessionMeta({
+    sessionId,
+    initialSpend,
+    onReadOnly: () => setMode('browse'),
+    onLoadStart: () => setPreviewPaused({ paused: false }),
+  });
+  const sessionKindRef = useRef<string | null>(null);
+  sessionKindRef.current = session?.kind ?? null;
+  const sessionStatusRef = useRef<string | null>(null);
+  sessionStatusRef.current = session?.status ?? null;
 
   const clearStaleFailedPublish = () => {
     setPublishProgress((prev) => {
@@ -328,108 +225,115 @@ export function EditorPage({
     });
   };
 
-  const loadSessionMeta = async (): Promise<Array<{ route: string; label: string; unlisted?: boolean }> | null> => {
-    const res = await api.getSession(sessionId);
-    setSession(res.session);
-    if (res.session.astroReady !== undefined) {
-      setAstroReady(Boolean(res.session.astroReady));
-    } else if (res.session.status === 'running') {
-      setAstroReady(true);
-    }
-    if (res.session.bootProgress) {
-      setBootProgress(res.session.bootProgress);
-      if (res.session.bootProgress.crashLoop) {
-        crashLoopHaltedRef.current = true;
+  const {
+    iframeRef,
+    currentRoute,
+    currentRouteRef,
+    lastNavigationAtRef,
+    previewSelectionActive,
+    postToPreview,
+    reloadPreview,
+    navigatePreview: navigateBridge,
+    highlightInPreview,
+    setPreviewPins,
+    highlightOnNextReady,
+  } = usePreviewBridge({
+    session,
+    mode,
+    persona,
+    isMobile,
+    onElementContext: (ctx, from) => {
+      const chipKey = chipKeyOf(ctx);
+      pendingFlightRef.current = { chipKey, from, label: chipLabelOf(ctx, persona) };
+      addChip(ctx);
+      if (isMobile) {
+        setMobileChatOpen(true);
+        setMobileCompletionToast(null);
       }
-    }
-    setSpend(res.spend);
-    setChangedCount(res.session.changedFilesCount);
-    if (!res.session.canEdit) setMode('browse');
-    if (res.session.status === 'running') {
-      try {
-        const [ch, rt] = await Promise.all([api.getChanges(sessionId), api.getRoutes(sessionId)]);
-        setChangesFromServer(ch.changes.length, ch.checkpoints);
-        setSiteRoutes(rt.routes);
-        return rt.routes;
-      } catch {
-        // runner may still be initializing
+      setFlightNonce((n) => n + 1);
+    },
+    onPreviewPointerDown: () => {
+      if (isMobile) {
+        setMobileChatOpen(false);
       }
-    }
-    return null;
+    },
+    onPatchSaved: () => {
+      clearStaleFailedPublish();
+      void loadSessionMeta();
+    },
+  });
+
+  const navigatePreview = (route: string) => {
+    if (!navigateBridge(route)) return;
+    setShowPageSwitcher(false);
+    setMobileSheet(null);
   };
+
+  const { wsConnected, wsStatus, reconnect, isOpen, dispatchClientMessage } = useChatSocket({
+    sessionId,
+    haltedRef: crashLoopHaltedRef,
+    onMessage: (msg) => handleServerMessage(msg),
+    onResync: (reason) => resyncFromServer(reason),
+    onSendError: showErrorNotice,
+  });
+
+  const {
+    entries,
+    live,
+    pageRequestsMap,
+    setPageRequestsMap,
+    priorThread,
+    volumeExpired,
+    applyTranscript,
+    applyTranscriptFrame,
+    upsertPageRequest,
+    replacePageRequests,
+    refreshTranscript,
+  } = useTranscript({
+    sessionId,
+    sessionStatus: session?.status ?? null,
+    wsConnected,
+    crashLoop: Boolean(bootProgress?.crashLoop),
+  });
+
+  const {
+    input,
+    setInput,
+    chips,
+    setChips,
+    addChip,
+    attachments,
+    setAttachments,
+    uploading,
+    dragOver,
+    setDragOver,
+    sendingPrompt,
+    sendPrompt,
+    handleFiles,
+  } = useComposer({
+    sessionId,
+    canEdit: Boolean(session?.canEdit),
+    editorContext: { currentRoute, viewport, mode },
+    dispatch: dispatchClientMessage,
+  });
 
   const handleRetryBoot = async () => {
     crashLoopHaltedRef.current = false;
     setBootProgress(null);
     const shouldHardRestart = Boolean(bootProgress?.crashLoop) || session?.status === 'error';
-    const { session: woken } = shouldHardRestart
-      ? await api.restartSession(sessionId)
-      : await api.wakeSession(sessionId);
-    setSession(woken);
-    if (woken.astroReady !== undefined) setAstroReady(Boolean(woken.astroReady));
-    if (woken.bootProgress) setBootProgress(woken.bootProgress);
-    setWsReconnectNonce((n) => n + 1);
-  };
-
-  const setChangesFromServer = (count: number, ckpts: CheckpointInfo[]) => {
-    setChangedCount(count);
-    setCheckpoints(ckpts);
-  };
-
-  useEffect(() => {
-    wakeRequestedRef.current = false;
-    crashLoopHaltedRef.current = false;
-    setAstroReady(false);
-    setBootProgress(null);
-    setPreviewPaused({ paused: false });
-    void loadSessionMeta();
-  }, [sessionId]);
-
-  useEffect(() => {
-    if (!session) return;
-    if (session.status !== 'running' && session.status !== 'published' && session.status !== 'merged') {
+    let woken: EditorSessionDto;
+    try {
+      ({ session: woken } = shouldHardRestart
+        ? await api.restartSession(sessionId)
+        : await api.wakeSession(sessionId));
+    } catch (err) {
+      showErrorNotice(`Couldn't restart workspace: ${errorMessage(err)}`);
+      void loadSessionMeta();
       return;
     }
-    api
-      .getTranscript(sessionId)
-      .then((t) => {
-        if (t.priorThread) setPriorThread(t.priorThread);
-        if (t.volumeExpired) setVolumeExpired(true);
-      })
-      .catch(() => {});
-  }, [sessionId, session?.status]);
-
-  useEffect(() => {
-    if (!session) return;
-    if (session.status === 'sleeping' && !wakeRequestedRef.current) {
-      wakeRequestedRef.current = true;
-      let retryTimer: ReturnType<typeof setTimeout> | null = null;
-      void api
-        .wakeSession(sessionId)
-        .then(({ session: woken }) => {
-          setSession(woken);
-          if (woken.astroReady !== undefined) setAstroReady(Boolean(woken.astroReady));
-          if (woken.bootProgress) setBootProgress(woken.bootProgress);
-        })
-        .catch(() => {
-          retryTimer = setTimeout(() => {
-            wakeRequestedRef.current = false;
-            void loadSessionMeta();
-          }, 2500);
-        });
-      return () => {
-        if (retryTimer) clearTimeout(retryTimer);
-      };
-    }
-    const waitingForAstro =
-      session.status === 'starting' ||
-      (session.status === 'running' && session.astroReady === false && !astroReady);
-    if (!waitingForAstro) return;
-    const timer = setInterval(() => {
-      void loadSessionMeta();
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [sessionId, session?.status, session?.astroReady, astroReady]);
+    applyWokenSession(woken);
+    reconnect();
+  };
 
   // Q8 / Q12: Safe-moment auto-sync & proactive upstream/co-editor banner
   const handleManualSync = async () => {
@@ -489,8 +393,9 @@ export function EditorPage({
             await loadSessionMeta();
           }
         }
-      } catch {
-        // non-fatal
+      } catch (err) {
+        // non-fatal: the next focus/visibility change retries the sync check
+        reportIgnored(err, 'base-branch sync check failed');
       }
     };
     void checkAndAutoSync();
@@ -501,140 +406,106 @@ export function EditorPage({
     };
   }, [session?.id, session?.status, session?.canEdit, live.busy, showPublish]);
 
-  const [wsConnected, setWsConnected] = useState(false);
+  /**
+   * Full resync after lost/out-of-order WS frames (gap, runner restart, reconnect): reloads session
+   * meta (incl. changes + checkpoint list, so a `checkpoint_created` missed while disconnected is
+   * recovered) and the transcript/live state.
+   */
+  async function resyncFromServer(reason: ResyncReason): Promise<void> {
+    console.info(`[halley] resyncing session state from server (${reason})`);
+    const [, transcript] = await Promise.all([loadSessionMeta(), api.getTranscript(sessionId)]);
+    applyTranscript(transcript);
+  }
 
-  useEffect(() => {
-    let disposed = false;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let attempt = 0;
+  const refreshRoutes = () =>
+    void api
+      .getRoutes(sessionId)
+      .then((rt) => setSiteRoutes(rt.routes))
+      .catch((err) => console.debug('[halley] route refresh failed', err));
 
-    const connect = () => {
-      if (disposed || crashLoopHaltedRef.current) return;
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/sessions/${sessionId}`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        attempt = 0;
-        if (!disposed) setWsConnected(true);
-      };
-
-      ws.onmessage = (evt) => {
-        const msg = JSON.parse(evt.data) as ChatServerMessage;
-        if (msg.type === 'boot_progress') {
-          setBootProgress(msg.progress);
-          if (msg.progress.crashLoop) {
-            crashLoopHaltedRef.current = true;
-          }
-          if (msg.progress.stage === 'ready') {
-            setAstroReady(true);
-          }
-          if (
-            (msg.progress.stage === 'ready' && sessionStatusRef.current !== 'running') ||
-            (msg.progress.stage === 'error' && sessionStatusRef.current !== 'error')
-          ) {
-            void loadSessionMeta();
-          }
-        } else if (msg.type === 'session_state_sync') {
-          setAstroReady(msg.astroReady);
-          setPreviewPaused({ paused: msg.previewPaused, reason: msg.previewPauseReason });
-          postToPreview({
-            type: 'halley:lock',
-            locked: msg.workspaceLocked,
-            reason: msg.lockedFile,
-          });
-          if (msg.publishProgress) {
-            setPublishProgress(msg.publishProgress);
-          }
-          if (msg.mergeReview) {
-            setSyncReview(msg.mergeReview);
-          }
-        } else if (msg.type === 'preview_paused') {
-          setPreviewPaused({ paused: msg.paused, reason: msg.reason });
-        } else if (msg.type === 'transcript_state') {
-          setEntries(msg.entries);
-          setLive(msg.live);
-        } else if (msg.type === 'workspace_lock') {
-          postToPreview({ type: 'halley:lock', locked: msg.locked, reason: msg.file });
-        } else if (msg.type === 'checkpoint_created') {
-          setChangedCount(msg.changedFilesCount);
-          setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
-          clearStaleFailedPublish();
-          if (!msg.checkpoint.summary.startsWith('Inline edit in ')) {
-            reloadPreview();
-          }
-          if (sessionKindRef.current === 'revert') {
-            void loadSessionMeta();
-          }
-        } else if (msg.type === 'session_meta_updated') {
-          void loadSessionMeta();
-        } else if (msg.type === 'publish_state') {
-          setPublishProgress(msg.payload);
-          if (msg.payload.state === 'published' || msg.payload.state === 'deploying_pages') {
-            void loadSessionMeta();
-          }
-        } else if (msg.type === 'spend_status') {
-          setSpend({
-            spentTodayUsd: msg.spentTodayUsd,
-            dailyCapUsd: msg.dailyCapUsd,
-            extraGrantedUsd: msg.extraGrantedUsd,
-            capped: msg.capped,
-          });
-        } else if (msg.type === 'page_request_state') {
-          const pr = msg.pageRequest;
-          setPageRequestsMap((prev) => ({ ...prev, [pr.pageRequestId]: pr }));
-          postToPreview({
-            type: 'halley:page-progress',
-            route: pr.route,
-            status: pr.status,
-            message: pageStatusText(pr.status),
-          });
-          if (msg.autoNavigate) {
-            navigatePreviewRef.current(pr.route);
-            void api
-              .getRoutes(sessionId)
-              .then((rt) => setSiteRoutes(rt.routes))
-              .catch(() => {});
-          } else if (pr.status === 'done') {
-            void api
-              .getRoutes(sessionId)
-              .then((rt) => setSiteRoutes(rt.routes))
-              .catch(() => {});
-            if (pr.route === currentRouteRef.current) {
-              reloadPreview(true);
-            }
-          }
-        } else if (msg.type === 'page_requests_sync') {
-          const next: Record<string, PageRequestMetadata> = {};
-          for (const pr of msg.pageRequests) {
-            next[pr.pageRequestId] = pr;
-          }
-          setPageRequestsMap(next);
+  function handleServerMessage(msg: ChatServerMessage): void {
+    if (msg.type === 'error') {
+      showErrorNotice(errorFrameText(msg));
+    } else if (msg.type === 'boot_progress') {
+      setBootProgress(msg.progress);
+      if (msg.progress.crashLoop) {
+        crashLoopHaltedRef.current = true;
+      }
+      if (msg.progress.stage === 'ready') {
+        setAstroReady(true);
+      }
+      if (
+        (msg.progress.stage === 'ready' && sessionStatusRef.current !== 'running') ||
+        (msg.progress.stage === 'error' && sessionStatusRef.current !== 'error')
+      ) {
+        void loadSessionMeta();
+      }
+    } else if (msg.type === 'session_state_sync') {
+      setAstroReady(msg.astroReady);
+      setPreviewPaused({ paused: msg.previewPaused, reason: msg.previewPauseReason });
+      postToPreview({
+        type: 'halley:lock',
+        locked: msg.workspaceLocked,
+        reason: msg.lockedFile,
+      });
+      if (msg.publishProgress) {
+        setPublishProgress(msg.publishProgress);
+      }
+      if (msg.mergeReview) {
+        setSyncReview(msg.mergeReview);
+      }
+    } else if (msg.type === 'preview_paused') {
+      setPreviewPaused({ paused: msg.paused, reason: msg.reason });
+    } else if (msg.type === 'transcript_state') {
+      applyTranscriptFrame(msg);
+    } else if (msg.type === 'workspace_lock') {
+      postToPreview({ type: 'halley:lock', locked: msg.locked, reason: msg.file });
+    } else if (msg.type === 'checkpoint_created') {
+      setChangedCount(msg.changedFilesCount);
+      setCheckpoints((prev) => [msg.checkpoint, ...prev.filter((c) => c.sha !== msg.checkpoint.sha)]);
+      clearStaleFailedPublish();
+      if (!msg.checkpoint.summary.startsWith('Inline edit in ')) {
+        reloadPreview();
+      }
+      if (sessionKindRef.current === 'revert') {
+        void loadSessionMeta();
+      }
+    } else if (msg.type === 'session_meta_updated') {
+      void loadSessionMeta();
+    } else if (msg.type === 'publish_state') {
+      setPublishProgress(msg.payload);
+      if (msg.payload.state === 'published' || msg.payload.state === 'deploying_pages') {
+        void loadSessionMeta();
+      }
+    } else if (msg.type === 'spend_status') {
+      setSpend({
+        spentTodayUsd: msg.spentTodayUsd,
+        dailyCapUsd: msg.dailyCapUsd,
+        extraGrantedUsd: msg.extraGrantedUsd,
+        capped: msg.capped,
+      });
+    } else if (msg.type === 'page_request_state') {
+      const pr = msg.pageRequest;
+      upsertPageRequest(pr);
+      postToPreview({
+        type: 'halley:page-progress',
+        route: pr.route,
+        status: pr.status,
+        message: pageStatusText(pr.status),
+      });
+      if (msg.autoNavigate) {
+        navigatePreview(pr.route);
+        refreshRoutes();
+      } else if (pr.status === 'done') {
+        refreshRoutes();
+        if (pr.route === currentRouteRef.current) {
+          reloadPreview(true);
         }
-      };
-
-      ws.onclose = () => {
-        if (disposed) return;
-        setWsConnected(false);
-        if (crashLoopHaltedRef.current) return;
-        attempt += 1;
-        const baseDelay = Math.min(30_000, 2000 * 2 ** Math.min(attempt - 1, 4));
-        const jitter = Math.floor(Math.random() * 500);
-        reconnectTimer = setTimeout(connect, baseDelay + jitter);
-      };
-
-      ws.onerror = () => {
-        ws.close();
-      };
-    };
-
-    connect();
-    return () => {
-      disposed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      wsRef.current?.close();
-    };
-  }, [sessionId, wsReconnectNonce]);
+      }
+    } else if (msg.type === 'page_requests_sync') {
+      replacePageRequests(msg.pageRequests);
+    }
+  }
 
   // Reload iframe smoothly once Astro dev resumes after a paused verification run
   const isPreviewPaused = previewPaused.paused;
@@ -644,30 +515,6 @@ export function EditorPage({
     }
     prevPreviewPausedRef.current = isPreviewPaused;
   }, [isPreviewPaused]);
-
-  // Fallback HTTP transcript polling whenever WebSocket is disconnected (e.g. reverse proxy without WS headers)
-  useEffect(() => {
-    if (wsConnected) return;
-    if (bootProgress?.crashLoop) return;
-    if (!session || (session.status !== 'running' && session.status !== 'published')) return;
-    const poll = () => {
-      void api
-        .getTranscript(sessionId)
-        .then((t) => {
-          setEntries(t.entries);
-          setLive(t.live);
-          if (t.pageRequests) {
-            const next: Record<string, PageRequestMetadata> = {};
-            for (const pr of t.pageRequests) next[pr.pageRequestId] = pr;
-            setPageRequestsMap(next);
-          }
-        })
-        .catch(() => {});
-    };
-    poll();
-    const timer = setInterval(poll, 5000);
-    return () => clearInterval(timer);
-  }, [sessionId, wsConnected, session?.status, bootProgress?.crashLoop]);
 
   // Track mutating tools during an agent run, refresh preview/metadata when the run completes,
   // and auto-navigate to a newly created single route if the user hasn't navigated away.
@@ -739,23 +586,9 @@ export function EditorPage({
     const onVisibility = () => {
       if (document.visibilityState !== 'visible') return;
       void loadSessionMeta();
-      void api
-        .getTranscript(sessionId)
-        .then((t) => {
-          setEntries(t.entries);
-          setLive(t.live);
-          if (t.pageRequests) {
-            const next: Record<string, PageRequestMetadata> = {};
-            for (const pr of t.pageRequests) next[pr.pageRequestId] = pr;
-            setPageRequestsMap(next);
-          }
-        })
-        .catch(() => {});
-      if (
-        !crashLoopHaltedRef.current &&
-        (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)
-      ) {
-        setWsReconnectNonce((n) => n + 1);
+      void refreshTranscript().catch((err) => reportIgnored(err, 'transcript refresh failed'));
+      if (!crashLoopHaltedRef.current && !isOpen()) {
+        reconnect();
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
@@ -778,20 +611,8 @@ export function EditorPage({
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [entries.length, live.streamingText]);
 
-  useEffect(() => {
-    if (!session) return;
-    postToPreview({
-      type: 'halley:set-mode',
-      mode,
-      readOnly: !session.canEdit,
-      persona,
-      touchLayout: isMobile,
-    });
-  }, [mode, session?.canEdit, persona, isMobile]);
-
   // Numbered markers in the preview for attached elements on the *current* route
   // (keeps global element group numbers sequential without skipping when multiple phrases share an element).
-  const pinsRef = useRef<Array<{ key: string; n: number }>>([]);
   useEffect(() => {
     const uniqueElements = [...new Set(chips.map((x) => elementKey(x)))];
     const seen = new Set<string>();
@@ -803,13 +624,8 @@ export function EditorPage({
       seen.add(key);
       pins.push({ key, n: uniqueElements.indexOf(key) + 1 });
     }
-    pinsRef.current = pins;
-    postToPreview({ type: 'halley:pins', pins });
+    setPreviewPins(pins);
   }, [chips, currentRoute]);
-
-  const highlightInPreview = (key: string | null) => {
-    postToPreview({ type: 'halley:highlight', key });
-  };
 
   // Play the fly-to-chat animation once the (new or existing) chip is in the DOM.
   useLayoutEffect(() => {
@@ -830,113 +646,6 @@ export function EditorPage({
     });
   }, [flightNonce, isMobile, mobileChatOpen]);
 
-  useEffect(() => {
-    const onMsg = (e: MessageEvent) => {
-      if (e.source !== iframeRef.current?.contentWindow || e.origin !== window.location.origin) {
-        return;
-      }
-      const data = e.data as PostMessageFromPreview;
-      if (!data || typeof data !== 'object') return;
-      if (data.type === 'halley:ready') {
-        pendingRouteRef.current = null;
-        if (pendingRouteTimerRef.current) {
-          clearTimeout(pendingRouteTimerRef.current);
-          pendingRouteTimerRef.current = null;
-        }
-        setCurrentRoute(data.route);
-        setPreviewSelectionActive(false);
-        if (session) {
-          postToPreview({
-            type: 'halley:set-mode',
-            mode,
-            readOnly: !session.canEdit,
-            persona,
-            touchLayout: isMobile,
-          });
-        }
-        postToPreview({ type: 'halley:pins', pins: pinsRef.current });
-        if (pendingHighlightKeyRef.current) {
-          const k = pendingHighlightKeyRef.current;
-          pendingHighlightKeyRef.current = null;
-          postToPreview({ type: 'halley:highlight', key: k });
-          setTimeout(() => {
-            postToPreview({ type: 'halley:highlight', key: null });
-          }, 1400);
-        }
-      } else if (data.type === 'halley:route-changed') {
-        pendingRouteRef.current = null;
-        if (pendingRouteTimerRef.current) {
-          clearTimeout(pendingRouteTimerRef.current);
-          pendingRouteTimerRef.current = null;
-        }
-        lastNavigationAtRef.current = Date.now();
-        setCurrentRoute(data.route);
-      } else if (data.type === 'halley:selection-changed') {
-        setPreviewSelectionActive(Boolean(data.active));
-      } else if (data.type === 'halley:preview-pointerdown') {
-        if (isMobile) {
-          setMobileChatOpen(false);
-        }
-      } else if (data.type === 'halley:element-context') {
-        // Only sent when the user explicitly presses "Ask Halley…" in the preview.
-        const ctx = data.context;
-        const chipKey = chipKeyOf(ctx);
-        const frame = iframeRef.current?.getBoundingClientRect();
-        let from: PreviewRect | null = null;
-        if (data.rect && frame) {
-          // Convert iframe-viewport coords to page coords, clipped to the visible frame.
-          const left = Math.max(frame.left, frame.left + data.rect.left);
-          const top = Math.max(frame.top, frame.top + data.rect.top);
-          const right = Math.min(frame.right, frame.left + data.rect.left + data.rect.width);
-          const bottom = Math.min(frame.bottom, frame.top + data.rect.top + data.rect.height);
-          if (right > left && bottom > top) from = { left, top, width: right - left, height: bottom - top };
-        }
-        pendingFlightRef.current = { chipKey, from, label: chipLabelOf(ctx, persona) };
-        setChips((prev) => (prev.some((c) => chipKeyOf(c) === chipKey) ? prev : [...prev, ctx]));
-        if (isMobile) {
-          setMobileChatOpen(true);
-          setMobileCompletionToast(null);
-        }
-        setFlightNonce((n) => n + 1);
-      } else if (data.type === 'halley:patch-saved') {
-        clearStaleFailedPublish();
-        void loadSessionMeta();
-      }
-    };
-    window.addEventListener('message', onMsg);
-    return () => window.removeEventListener('message', onMsg);
-  }, [mode, session, persona, isMobile]);
-
-  const dispatchClientMessage = (payload: Record<string, unknown>) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload));
-    } else {
-      void api.sendClientMessage(sessionId, payload);
-    }
-  };
-
-  const navigatePreview = (route: string) => {
-    if (!session) return;
-    const clean = route.startsWith('/') ? route : `/${route}`;
-    const baseSuffixVal = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
-    lastNavigationAtRef.current = Date.now();
-    pendingRouteRef.current = clean;
-    if (pendingRouteTimerRef.current) clearTimeout(pendingRouteTimerRef.current);
-    pendingRouteTimerRef.current = setTimeout(() => {
-      pendingRouteRef.current = null;
-      pendingRouteTimerRef.current = null;
-    }, 5_000);
-    if (iframeRef.current) {
-      iframeRef.current.src = `/p/${session.id}${baseSuffixVal}${clean}`;
-    }
-    setCurrentRoute(clean);
-    setShowPageSwitcher(false);
-    setMobileSheet(null);
-  };
-  const navigatePreviewRef = useRef(navigatePreview);
-  navigatePreviewRef.current = navigatePreview;
-
   // Keep placeholder progress synced whenever the preview lands on a newly created page
   useEffect(() => {
     const active = Object.values(pageRequestsMap)
@@ -954,7 +663,7 @@ export function EditorPage({
   const handleRetryPageRequest = async (pageRequestId: string) => {
     const res = await api.retryPageRequest(sessionId, pageRequestId, viewport);
     if (res.pageRequest) {
-      setPageRequestsMap((prev) => ({ ...prev, [res.pageRequest!.pageRequestId]: res.pageRequest! }));
+      upsertPageRequest(res.pageRequest);
     }
   };
 
@@ -975,54 +684,12 @@ export function EditorPage({
   const focusChipInPreview = (c: ElementContext) => {
     const key = elementKey(c);
     if (c.route !== currentRoute) {
-      pendingHighlightKeyRef.current = key;
+      highlightOnNextReady(key);
       navigatePreview(c.route);
       return;
     }
     highlightInPreview(key);
     setTimeout(() => highlightInPreview(null), 1200);
-  };
-
-  const sendPrompt = (whenBusy?: 'steer' | 'followUp', overrideText?: string) => {
-    if (!session?.canEdit) return;
-    const textToSend = (overrideText ?? input).trim();
-    if (!textToSend && attachments.length === 0 && chips.length === 0) return;
-    const defaultEmptyPrompt =
-      attachments.length > 0 && chips.length === 0
-        ? 'Please use the attached photo.'
-        : chips.length === 1
-          ? 'What is this section on the page and how could I update or improve it?'
-          : 'How could I update or improve these selected sections?';
-    dispatchClientMessage({
-      type: 'submit_input',
-      requestId: crypto.randomUUID(),
-      text: textToSend || defaultEmptyPrompt,
-      contextChips: chips,
-      attachments,
-      editorContext: {
-        currentRoute,
-        viewport,
-        mode,
-      },
-      whenBusy,
-    });
-    if (overrideText === undefined) setInput('');
-    setChips([]);
-    setAttachments([]);
-  };
-
-  const handleFiles = async (files: FileList | null) => {
-    if (!files || !session?.canEdit) return;
-    setUploading(true);
-    try {
-      for (const file of Array.from(files)) {
-        if (!file.type.startsWith('image/')) continue;
-        const att = await api.uploadImage(sessionId, file);
-        setAttachments((prev) => [...prev, att]);
-      }
-    } finally {
-      setUploading(false);
-    }
   };
 
   const handleUndoLast = async () => {
@@ -1044,12 +711,68 @@ export function EditorPage({
     reloadPreview(true);
   };
 
+  // Memoized derived data (must stay above the early return below).
+  const transcriptBlocks = useMemo(
+    () => groupTranscriptEntries(entries, persona === 'non-technical'),
+    [entries, persona],
+  );
+  const knownRoutes = useMemo(() => new Set(siteRoutes.map((r) => r.route)), [siteRoutes]);
+  const liveUnlistedByRoute = useMemo(
+    () => new Map(siteRoutes.map((r) => [r.route, Boolean(r.unlisted)])),
+    [siteRoutes],
+  );
+  const navigatePreviewStable = useStableCallback(navigatePreview);
+  const handleRetryPageRequestStable = useStableCallback(handleRetryPageRequest);
+  const handleDeletePageStable = useStableCallback(handleDeletePage);
+  const noticeText = errorNotice?.text ?? metaError;
+  const overlays = (
+    <>
+      {noticeText && (
+        <ErrorNoticeBanner
+          text={noticeText}
+          onDismiss={() => {
+            if (errorNotice) setErrorNotice(null);
+            else setMetaError(null);
+          }}
+        />
+      )}
+      {session && (
+        <WsConnectionIndicator status={wsStatus} onRetry={reconnect} />
+      )}
+    </>
+  );
+
   if (!session) {
+    if (initialLoadError) {
+      return (
+        <>
+          {overlays}
+          <LoadErrorScreen
+            title="Couldn't load this workspace"
+            message={initialLoadError.message}
+            retryInMs={initialLoadError.retryInMs}
+            onRetry={retryInitialLoad}
+            extra={
+              <button
+                type="button"
+                onClick={onBack}
+                className="rounded-lg border border-stone-300 bg-white px-3 py-1.5 text-xs font-semibold text-stone-700 hover:bg-stone-50"
+              >
+                Back to dashboard
+              </button>
+            }
+          />
+        </>
+      );
+    }
     return (
-      <div className="flex h-dvh flex-col items-center justify-center gap-3 bg-[#FAF9F7] text-sm text-stone-500">
-        <Loader2 className="h-5 w-5 animate-spin text-amber-600" />
-        <span>Loading workspace…</span>
-      </div>
+      <>
+        {overlays}
+        <div className="flex h-dvh flex-col items-center justify-center gap-3 bg-[#FAF9F7] text-sm text-stone-500">
+          <Loader2 className="h-5 w-5 animate-spin text-amber-600" />
+          <span>Loading workspace…</span>
+        </div>
+      </>
     );
   }
 
@@ -1076,7 +799,6 @@ export function EditorPage({
   const baseSuffix = session.astroBase === '/' ? '' : session.astroBase.replace(/\/$/, '');
   const previewSrc = `/p/${session.id}${baseSuffix}/`;
   const spendPct = Math.min(100, (spend.spentTodayUsd / Math.max(0.01, spend.dailyCapUsd + spend.extraGrantedUsd)) * 100);
-  const liveUnlistedByRoute = new Map(siteRoutes.map((r) => [r.route, Boolean(r.unlisted)]));
   const failedPageRequest = Object.values(pageRequestsMap).find(
     (pr) => pr.status === 'failed' || pr.status === 'capped',
   );
@@ -1190,6 +912,7 @@ export function EditorPage({
 
   return (
     <div className="flex h-dvh w-full max-w-full flex-col overflow-x-clip bg-[#FAF9F7]">
+      {overlays}
       {isMobile ? (
       /* Mobile Top Bar (< 640px): single compact 48px row guaranteed to fit >=320px without overflow */
       <header
@@ -1216,8 +939,8 @@ export function EditorPage({
             try {
               const rt = await api.getRoutes(sessionId);
               setSiteRoutes(rt.routes);
-            } catch {
-              // ignore
+            } catch (err) {
+              reportIgnored(err, 'route list refresh failed; showing cached routes');
             }
           }}
           aria-label="Switch page"
@@ -1757,7 +1480,7 @@ export function EditorPage({
                       <button
                         key={starter}
                         type="button"
-                        onClick={() => sendPrompt(undefined, starter)}
+                        onClick={() => void sendPrompt(undefined, starter)}
                         className="rounded-lg border border-stone-200 bg-white px-2.5 py-1 text-left text-[11px] font-medium text-stone-700 transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
                       >
                         {starter}
@@ -1769,132 +1492,21 @@ export function EditorPage({
               )
             )}
 
-            {groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
-              if (block.kind === 'steps') {
-                const isOpen = expandedTool === block.id;
-                const toolSteps = block.items.filter((i) => i.role === 'tool');
-                const stepCount = toolSteps.length || block.items.length;
-                return (
-                  <div key={block.id} className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-1.5 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setExpandedTool(isOpen ? null : block.id)}
-                      className="flex w-full items-center justify-between text-stone-600"
-                    >
-                      <span className="font-medium">
-                        {stepCount === 1
-                          ? friendlyToolLabel(toolSteps[0]?.toolName)
-                          : `Completed ${stepCount} steps`}
-                      </span>
-                      <ChevronDown className={`h-3.5 w-3.5 transition ${isOpen ? 'rotate-180' : ''}`} />
-                    </button>
-                    {isOpen && (
-                      <div className="mt-2 space-y-1.5 border-t border-stone-200/70 pt-2 text-[11px] text-stone-500">
-                        {block.items.map((step) =>
-                          step.role === 'tool' ? (
-                            <div key={step.id} className="flex items-center justify-between gap-2">
-                              <span className="font-medium text-stone-600">{friendlyToolLabel(step.toolName)}</span>
-                              {step.toolStatus === 'error' && (
-                                <span className="text-red-600 font-medium">issue</span>
-                              )}
-                            </div>
-                          ) : (
-                            <p key={step.id} className="text-stone-500 leading-relaxed">
-                              {step.text}
-                            </p>
-                          ),
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-              const entry = block.entry;
-              if (entry.role === 'user') {
-                if (entry.pageRequest) {
-                  const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
-                  return (
-                    <NewPageCard
-                      key={entry.id}
-                      pageRequest={livePr}
-                      liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
-                      persona={persona}
-                      canEdit={session.canEdit}
-                      spendCapped={spend.capped}
-                      onNavigateRoute={navigatePreview}
-                      onRetry={handleRetryPageRequest}
-                      onDelete={handleDeletePage}
-                    />
-                  );
-                }
-                const parsed = parseUserMessageDisplay(entry.text);
-                return (
-                  <div key={entry.id} className="flex flex-col items-end gap-1">
-                    {parsed.badges.length > 0 && (
-                      <div className="flex max-w-[85%] flex-wrap justify-end gap-1">
-                        {parsed.badges.map((b, idx) => (
-                          <span
-                            key={idx}
-                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-900"
-                          >
-                            {b}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-stone-900 px-3.5 py-2.5 text-sm text-white whitespace-pre-wrap">
-                      {parsed.body}
-                    </div>
-                  </div>
-                );
-              }
-              if (entry.role === 'tool') {
-                if (entry.pageRequest) {
-                  const livePr = pageRequestsMap[entry.pageRequest.pageRequestId] ?? entry.pageRequest;
-                  return (
-                    <NewPageCard
-                      key={entry.id}
-                      pageRequest={livePr}
-                      liveUnlisted={liveUnlistedByRoute.get(livePr.route)}
-                      persona={persona}
-                      canEdit={session.canEdit}
-                      spendCapped={spend.capped}
-                      onNavigateRoute={navigatePreview}
-                      onRetry={handleRetryPageRequest}
-                      onDelete={handleDeletePage}
-                    />
-                  );
-                }
-                const isOpen = expandedTool === entry.id;
-                return (
-                  <div key={entry.id} className="rounded-lg border border-stone-200/80 bg-[#FAF9F7] px-3 py-1.5 text-xs">
-                    <button
-                      type="button"
-                      onClick={() => setExpandedTool(isOpen ? null : entry.id)}
-                      className="flex w-full items-center justify-between text-stone-600"
-                    >
-                      <span className="font-medium">{friendlyToolLabel(entry.toolName)}</span>
-                      <ChevronDown className={`h-3.5 w-3.5 transition ${isOpen ? 'rotate-180' : ''}`} />
-                    </button>
-                    {isOpen && entry.toolOutput && (
-                      <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-stone-500">
-                        {entry.toolOutput}
-                      </pre>
-                    )}
-                  </div>
-                );
-              }
-              return (
-                <div key={entry.id}>
-                  <ChatMessageContent
-                    text={entry.text}
-                    onNavigateRoute={navigatePreview}
-                    knownRoutes={new Set(siteRoutes.map((r) => r.route))}
-                    astroBase={session.astroBase}
-                  />
-                </div>
-              );
-            })}
+            <DesktopTranscriptBlocks
+              blocks={transcriptBlocks}
+              expandedTool={expandedTool}
+              setExpandedTool={setExpandedTool}
+              pageRequestsMap={pageRequestsMap}
+              liveUnlistedByRoute={liveUnlistedByRoute}
+              knownRoutes={knownRoutes}
+              persona={persona}
+              canEdit={session.canEdit}
+              spendCapped={spend.capped}
+              astroBase={session.astroBase}
+              onNavigateRoute={navigatePreviewStable}
+              onRetry={handleRetryPageRequestStable}
+              onDelete={handleDeletePageStable}
+            />
 
             {(() => {
               const renderedIds = new Set(
@@ -1935,7 +1547,7 @@ export function EditorPage({
                 <ChatMessageContent
                   text={live.streamingText}
                   onNavigateRoute={navigatePreview}
-                  knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                  knownRoutes={knownRoutes}
                   astroBase={session.astroBase}
                 />
                 <span className="inline-block h-3.5 w-1.5 ml-0.5 animate-pulse bg-amber-600 align-middle" />
@@ -2060,7 +1672,7 @@ export function EditorPage({
                         <button
                           key={q.label}
                           type="button"
-                          onClick={() => sendPrompt(undefined, q.prompt)}
+                          onClick={() => void sendPrompt(undefined, q.prompt)}
                           className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-0.5 text-[11px] font-medium text-stone-600 transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
                         >
                           {q.label}
@@ -2121,7 +1733,7 @@ export function EditorPage({
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
-                      sendPrompt(live.busy ? 'followUp' : undefined);
+                      void sendPrompt(live.busy ? 'followUp' : undefined);
                     }
                   }}
                   placeholder={
@@ -2159,7 +1771,10 @@ export function EditorPage({
                       onClick={async () => {
                         const next = persona === 'non-technical' ? 'developer' : 'non-technical';
                         setPersona(next);
-                        await api.updatePreferences(next).catch(() => {});
+                        await api.updatePreferences(next).catch((err) => {
+                          setPersona(persona);
+                          reportIgnored(err, 'saving persona preference failed; reverted');
+                        });
                       }}
                       title="Switch Halley's communication style"
                       className="rounded-lg px-2 py-1 text-[11px] font-medium text-stone-400 hover:bg-stone-200/60 hover:text-stone-700"
@@ -2173,21 +1788,21 @@ export function EditorPage({
                       <>
                         <button
                           type="button"
-                          onClick={() => dispatchClientMessage({ type: 'abort' })}
+                          onClick={() => void dispatchClientMessage({ type: 'abort' })}
                           className="inline-flex items-center gap-1 rounded-lg border border-stone-300 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 hover:bg-stone-50"
                         >
                           <Square className="h-3 w-3 fill-current" /> Stop
                         </button>
                         <button
                           type="button"
-                          onClick={() => sendPrompt('steer')}
+                          onClick={() => void sendPrompt('steer')}
                           className="rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-100"
                         >
                           Steer
                         </button>
                         <button
                           type="button"
-                          onClick={() => sendPrompt('followUp')}
+                          onClick={() => void sendPrompt('followUp')}
                           className="rounded-lg bg-stone-900 px-2.5 py-1 text-xs font-semibold text-white hover:bg-stone-800"
                         >
                           Queue
@@ -2196,11 +1811,12 @@ export function EditorPage({
                     ) : (
                       <button
                         type="button"
-                        disabled={spend.capped}
-                        onClick={() => sendPrompt()}
+                        disabled={spend.capped || sendingPrompt}
+                        onClick={() => void sendPrompt()}
                         className="inline-flex items-center gap-1.5 rounded-lg bg-stone-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
                       >
-                        <Send className="h-3 w-3" /> Send
+                        {sendingPrompt ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}{' '}
+                        {sendingPrompt ? 'Sending…' : 'Send'}
                       </button>
                     )}
                   </div>
@@ -2223,8 +1839,8 @@ export function EditorPage({
                     try {
                       const rt = await api.getRoutes(sessionId);
                       setSiteRoutes(rt.routes);
-                    } catch {
-                      // ignore
+                    } catch (err) {
+                      reportIgnored(err, 'route list refresh failed; showing cached routes');
                     }
                   }
                 }}
@@ -2447,7 +2063,7 @@ export function EditorPage({
           canEdit={session.canEdit}
           currentRoute={currentRoute}
           astroBase={session.astroBase}
-          knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+          knownRoutes={knownRoutes}
           persona={persona}
           spend={spend}
           entries={entries}
@@ -2471,7 +2087,7 @@ export function EditorPage({
           uploading={uploading}
           onTriggerPhotoUpload={() => fileInputRef.current?.click()}
           onSend={(whenBusy, overrideText) => sendPrompt(whenBusy, overrideText)}
-          onAbort={() => dispatchClientMessage({ type: 'abort' })}
+          onAbort={() => void dispatchClientMessage({ type: 'abort' })}
           onOpenNewPage={() => {
             setMobileChatOpen(false);
             openNewPageWizard();
@@ -2531,7 +2147,7 @@ export function EditorPage({
                             setMobileSheet(null);
                             navigatePreview(r);
                           }}
-                          knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                          knownRoutes={knownRoutes}
                           astroBase={session.astroBase}
                         />
                       </div>
@@ -2564,7 +2180,7 @@ export function EditorPage({
                 <p className="py-8 text-center text-xs text-stone-500">No messages yet.</p>
               )
             ) : (
-              groupTranscriptEntries(entries, persona === 'non-technical').map((block) => {
+              transcriptBlocks.map((block) => {
                 if (block.kind === 'steps') {
                   const isOpen = expandedTool === `m-${block.id}`;
                   const toolSteps = block.items.filter((i) => i.role === 'tool');
@@ -2681,7 +2297,7 @@ export function EditorPage({
                         setMobileSheet(null);
                         navigatePreview(r);
                       }}
-                      knownRoutes={new Set(siteRoutes.map((r) => r.route))}
+                      knownRoutes={knownRoutes}
                       astroBase={session.astroBase}
                     />
                   </div>
@@ -2907,7 +2523,10 @@ export function EditorPage({
                     onClick={async () => {
                       const next = persona === 'non-technical' ? 'developer' : 'non-technical';
                       setPersona(next);
-                      await api.updatePreferences(next).catch(() => {});
+                      await api.updatePreferences(next).catch((err) => {
+                        setPersona(persona);
+                        reportIgnored(err, 'saving persona preference failed; reverted');
+                      });
                     }}
                     className="flex min-h-[48px] w-full items-center justify-between px-4 text-left text-sm font-medium text-stone-800"
                   >

@@ -1,15 +1,17 @@
+import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { discoverSiteRoutes, inspectAstroElement } from '../src/index.js';
 
-const CROSSING_ROOT = '/home/antigravity/vrwarp/thecrossing.website';
+// Real-site fixtures live outside the repo; override with HALLEY_CROSSING_ROOT. When absent these
+// tests are reported as skipped (not silently passed).
+const CROSSING_ROOT =
+  process.env.HALLEY_CROSSING_ROOT || '/home/antigravity/vrwarp/thecrossing.website';
+const CROSSING_EXISTS = existsSync(CROSSING_ROOT);
 
-describe('real thecrossing.website templates', () => {
+describe.skipIf(!CROSSING_EXISTS)('real thecrossing.website templates', () => {
   it('classifies hero h1 and static subtitle as editable-static in index.astro', async () => {
-    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
-    if (!exists) return;
-
     const src = await fs.readFile(path.join(CROSSING_ROOT, 'src/pages/index.astro'), 'utf8');
     // Line 78: <h1 ...>Crossing generations &amp; cultures{' '}<span ...>together in Christ.</span></h1>
     const h1 = await inspectAstroElement(src, '78:11');
@@ -36,9 +38,6 @@ describe('real thecrossing.website templates', () => {
   });
 
   it('discovers internal routes from src/pages for bubble menu autocomplete', async () => {
-    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
-    if (!exists) return;
-
     const routes = await discoverSiteRoutes(CROSSING_ROOT);
     const paths = routes.map((r) => r.route);
     expect(paths).toContain('/');
@@ -47,9 +46,6 @@ describe('real thecrossing.website templates', () => {
   });
 
   it('parses and round-trip patches static elements across every .astro page without byte drift', async () => {
-    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
-    if (!exists) return;
-
     const { parse } = await import('@astrojs/compiler');
     const os = await import('node:os');
     const { PerFileMutex, patchStaticSpan } = await import('../src/index.js');

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import type {
   AllowlistEntryDto,
   AstroAuditReportDto,
@@ -15,7 +15,15 @@ import type {
   UserDto,
 } from '@halley/shared';
 import { deriveWorkspaceToken, hashWorkspaceToken, safeEqualToken } from '@halley/shared/auth';
+import { realClock, type Clock } from './clock.js';
 import type { HalleyConfig } from './config.js';
+import { ignore } from './log.js';
+import {
+  ALLOWED_STATUS_SOURCES,
+  IN_FLIGHT_PUBLISH_STATES_SQL,
+  PUBLISH_STATE_SET,
+  SESSION_STATUS_SET,
+} from './session-state.js';
 
 export interface SessionRecord {
   id: string;
@@ -26,6 +34,10 @@ export interface SessionRecord {
   reverts_sha: string | null;
   revert_reason: string | null;
   initial_revert_sha: string | null;
+  /** Pending revert-start inputs (JSON {shas, targetTitle, srcSessionId}) until it succeeds (Undo drafts only). */
+  revert_pending_json?: string | null;
+  /** Last revert-start failure; a `retryable:` prefix means the request never reached the runner. */
+  revert_start_error?: string | null;
   owner_user_id: string;
   owner_name?: string;
   owner_email?: string;
@@ -80,29 +92,52 @@ export interface PublishRunRecord {
   updated_at: string;
 }
 
-export class ControlPlaneDb {
-  readonly db: DatabaseSync;
+/** Persisted crash-loop breaker state for one session (see CrashLoopTracker). */
+export interface CrashLoopRecord {
+  failures: number[];
+  openCount: number;
+  openUntil: number;
+  lastError: string;
+  oom: boolean;
+}
 
-  constructor(dbPath: string, private config: HalleyConfig) {
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-    this.migrate();
-    this.seedAllowlist();
+function parseFailures(json: string): number[] {
+  try {
+    const v: unknown = JSON.parse(json);
+    return Array.isArray(v) ? v.filter((x): x is number => typeof x === 'number') : [];
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    return []; // a corrupt row only loses the failure history, never blocks a boot
   }
+}
 
-  close(): void {
-    try {
-      if (this.db.isOpen) {
-        this.db.close();
-      }
-    } catch {
-      // ignore already-closed DB
-    }
+export class InvalidSessionStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidSessionStateError';
   }
+}
 
-  private migrate(): void {
-    this.db.exec(`
+function assertValidSessionPatch(patch: Partial<SessionRecord>): void {
+  if (patch.status !== undefined && !SESSION_STATUS_SET.has(patch.status)) {
+    throw new InvalidSessionStateError(`Unknown session status ${JSON.stringify(patch.status)}`);
+  }
+  if (patch.publish_state !== undefined && !PUBLISH_STATE_SET.has(patch.publish_state)) {
+    throw new InvalidSessionStateError(`Unknown publish_state ${JSON.stringify(patch.publish_state)}`);
+  }
+}
+
+const MAX_CACHED_STATEMENTS = 512;
+export const ACTIVITY_WRITE_INTERVAL_MS = 15_000;
+
+interface Migration {
+  version: number;
+  name: string;
+  up: (db: ControlPlaneDb) => void;
+}
+
+const BASELINE_SCHEMA_SQL = `
+
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
@@ -231,53 +266,308 @@ export class ControlPlaneDb {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-    `);
+`;
 
-    // Idempotent migrations for existing SQLite databases created before P0/v2
-    const cols = new Set(
-      (this.db.prepare('PRAGMA table_info(editor_sessions)').all() as Array<{ name: string }>).map(
-        (c) => c.name,
-      ),
-    );
-    const addCol = (name: string, def: string) => {
-      if (!cols.has(name)) {
-        this.db.exec(`ALTER TABLE editor_sessions ADD COLUMN ${name} ${def}`);
+/**
+ * Ordered schema migrations. Append only; never edit an applied one. Each must be idempotent
+ * against a database that already has its effect (pre-versioning databases replay them).
+ */
+const MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    name: 'baseline schema + pre-versioning column additions',
+    up: (d) => {
+      d.db.exec(BASELINE_SCHEMA_SQL);
+      const cols = d.tableColumns('editor_sessions');
+      const addCol = (name: string, def: string) => {
+        if (!cols.has(name)) d.db.exec(`ALTER TABLE editor_sessions ADD COLUMN ${name} ${def}`);
+      };
+      addCol('kind', "TEXT NOT NULL DEFAULT 'edit'");
+      addCol('parent_session_id', 'TEXT');
+      addCol('reverts_sha', 'TEXT');
+      addCol('revert_reason', 'TEXT');
+      addCol('initial_revert_sha', 'TEXT');
+      addCol('prev_base_sha', 'TEXT');
+      addCol('node_modules_pruned_at', 'TEXT');
+      addCol('volume_expired_at', 'TEXT');
+      addCol('optimize_escalation_allowed', 'INTEGER NOT NULL DEFAULT 0');
+      addCol('active_model_label', 'TEXT');
+      addCol('state_version', 'INTEGER NOT NULL DEFAULT 1');
+      addCol('lease_epoch', 'INTEGER NOT NULL DEFAULT 0');
+      addCol('token_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    },
+  },
+  {
+    version: 2,
+    name: 'indexes for hot lookups',
+    up: (d) => {
+      d.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON editor_sessions(workspace_token_hash);
+        CREATE INDEX IF NOT EXISTS idx_sessions_status_active ON editor_sessions(status, last_active_at);
+        CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON editor_sessions(last_active_at);
+        CREATE INDEX IF NOT EXISTS idx_sessions_owner ON editor_sessions(owner_user_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_reverts_sha ON editor_sessions(reverts_sha) WHERE reverts_sha IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_spend_events_user_day ON spend_events(user_id, utc_date);
+        CREATE INDEX IF NOT EXISTS idx_spend_events_day_purpose ON spend_events(utc_date, purpose);
+        CREATE INDEX IF NOT EXISTS idx_publish_runs_step ON publish_runs(step, updated_at);
+      `);
+    },
+  },
+  {
+    version: 3,
+    name: 'spend_daily_purpose rollup for spend_events retention',
+    up: (d) => {
+      d.db.exec(`
+        CREATE TABLE IF NOT EXISTS spend_daily_purpose (
+          user_id TEXT NOT NULL,
+          utc_date TEXT NOT NULL,
+          purpose TEXT NOT NULL,
+          request_count INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(user_id, utc_date, purpose)
+        );
+      `);
+    },
+  },
+  {
+    version: 4,
+    name: 'durable crash-loop breaker state and revert-start markers',
+    up: (d) => {
+      d.db.exec(`
+        CREATE TABLE IF NOT EXISTS workspace_crash_loops (
+          session_id TEXT PRIMARY KEY,
+          failures_json TEXT NOT NULL,
+          open_count INTEGER NOT NULL DEFAULT 0,
+          open_until INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT '',
+          oom INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+      const cols = d.tableColumns('editor_sessions');
+      // Undo draft whose revert-start has not succeeded yet: {shas, targetTitle, srcSessionId}
+      if (!cols.has('revert_pending_json')) d.db.exec('ALTER TABLE editor_sessions ADD COLUMN revert_pending_json TEXT');
+      // Last revert-start failure ('retryable:' prefix = the request never reached the runner)
+      if (!cols.has('revert_start_error')) d.db.exec('ALTER TABLE editor_sessions ADD COLUMN revert_start_error TEXT');
+    },
+  },
+];
+
+export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
+
+export class ControlPlaneDb {
+  readonly db: DatabaseSync;
+  /** Prepared statements cached per SQL string: preparing is the dominant cost of a point query. */
+  private statementCache = new Map<string, StatementSync>();
+  private txDepth = 0;
+  /** sessionId → epoch ms of the last last_active_at write done via touchSessionActivity. */
+  private lastActivityWriteAt = new Map<string, number>();
+
+  readonly path: string;
+
+  private readonly clock: Clock;
+  private readonly randomUUID: () => string;
+
+  constructor(
+    dbPath: string,
+    private config: HalleyConfig,
+    deps: { clock?: Clock; randomUUID?: () => string } = {},
+  ) {
+    this.clock = deps.clock ?? realClock;
+    this.randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
+    this.path = dbPath;
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    this.db = new DatabaseSync(dbPath);
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+    this.migrate();
+    this.seedAllowlist();
+  }
+
+  /** Current time as an ISO-8601 string, from the injected clock. */
+  nowIso(): string {
+    return new Date(this.clock.now()).toISOString();
+  }
+
+  /** Today's UTC date (YYYY-MM-DD), from the injected clock. */
+  private todayUtc(): string {
+    return this.nowIso().slice(0, 10);
+  }
+
+  close(): void {
+    this.statementCache.clear();
+    if (!this.db.isOpen) return;
+    try {
+      this.db.close();
+    } catch (err) {
+      ignore(err, 'closing the database failed');
+    }
+  }
+
+  /** Cheap liveness probe: a trivial query on the shared connection. */
+  ping(): boolean {
+    try {
+      return this.db.isOpen && (this.prepared('SELECT 1 AS ok').get() as { ok: number } | undefined)?.ok === 1;
+    } catch (err) {
+      ignore(err, 'database ping failed', {}, 'debug');
+      return false;
+    }
+  }
+
+  /** Returns a cached prepared statement for `sql` (prepared once per distinct SQL string). */
+  prepared(sql: string): StatementSync {
+    let stmt = this.statementCache.get(sql);
+    if (!stmt) {
+      if (this.statementCache.size >= MAX_CACHED_STATEMENTS) this.statementCache.clear();
+      stmt = this.db.prepare(sql);
+      this.statementCache.set(sql, stmt);
+    }
+    return stmt;
+  }
+
+  /**
+   * Marks a session as active (`last_active_at = now`), writing at most once per `minIntervalMs`
+   * per session. Hot paths (every preview asset, every LLM call, every chat frame) use this so
+   * idle tracking costs ~0 writes per request. Returns true when a write happened.
+   * Does not bump state_version: activity is not a state change.
+   */
+  touchSessionActivity(sessionId: string, nowMs = this.clock.now(), minIntervalMs = ACTIVITY_WRITE_INTERVAL_MS): boolean {
+    const prev = this.lastActivityWriteAt.get(sessionId);
+    if (prev !== undefined && nowMs - prev < minIntervalMs) return false;
+    this.lastActivityWriteAt.set(sessionId, nowMs);
+    if (this.lastActivityWriteAt.size > 10_000) {
+      // Bound memory: drop entries old enough that they would not throttle anything anyway.
+      for (const [id, at] of this.lastActivityWriteAt) {
+        if (nowMs - at >= minIntervalMs) this.lastActivityWriteAt.delete(id);
       }
-    };
-    addCol('kind', "TEXT NOT NULL DEFAULT 'edit'");
-    addCol('parent_session_id', 'TEXT');
-    addCol('reverts_sha', 'TEXT');
-    addCol('revert_reason', 'TEXT');
-    addCol('initial_revert_sha', 'TEXT');
-    addCol('prev_base_sha', 'TEXT');
-    addCol('node_modules_pruned_at', 'TEXT');
-    addCol('volume_expired_at', 'TEXT');
-    addCol('optimize_escalation_allowed', 'INTEGER NOT NULL DEFAULT 0');
-    addCol('active_model_label', 'TEXT');
-    addCol('state_version', 'INTEGER NOT NULL DEFAULT 1');
-    addCol('lease_epoch', 'INTEGER NOT NULL DEFAULT 0');
-    addCol('token_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    }
+    this.prepared('UPDATE editor_sessions SET last_active_at = ? WHERE id = ?').run(
+      new Date(nowMs).toISOString(),
+      sessionId,
+    );
+    return true;
+  }
 
-    const existingCap = this.db
-      .prepare('SELECT value FROM settings WHERE key = ?')
+  /**
+   * Runs `fn` inside a single SQLite write transaction (BEGIN IMMEDIATE). Nested calls join the
+   * outer transaction. `fn` must be synchronous: never await inside a transaction.
+   */
+  transaction<T>(fn: () => T): T {
+    if (this.txDepth > 0) {
+      this.txDepth += 1;
+      try {
+        return fn();
+      } finally {
+        this.txDepth -= 1;
+      }
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    this.txDepth = 1;
+    try {
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
+        throw new Error('db.transaction callback must be synchronous');
+      }
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      if (this.db.isOpen && this.db.isTransaction) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch (rollbackErr) {
+          ignore(rollbackErr, 'rollback failed; surfacing the original error');
+        }
+      }
+      // else: SQLite already rolled back (e.g. SQLITE_FULL) or the db was closed: nothing to undo
+      throw err;
+    } finally {
+      this.txDepth = 0;
+    }
+  }
+
+  /** Applied migrations, newest last (`schema_version` holds one row per applied version). */
+  schemaVersion(): number {
+    const row = this.prepared('SELECT MAX(version) AS v FROM schema_version').get() as { v: number | null } | undefined;
+    return row?.v ?? 0;
+  }
+
+  /**
+   * Runs every migration newer than the recorded schema version, in order, each in its own
+   * transaction. Migration 1 is the pre-versioning schema and is idempotent, so databases created
+   * before `schema_version` existed are adopted safely.
+   */
+  private migrate(): void {
+    this.db.exec(
+      'CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)',
+    );
+    const current = this.schemaVersion();
+    for (const m of MIGRATIONS) {
+      if (m.version <= current) continue;
+      this.transaction(() => {
+        m.up(this);
+        this.prepared('INSERT INTO schema_version (version, name, applied_at) VALUES (?, ?, ?)').run(
+          m.version,
+          m.name,
+          this.nowIso(),
+        );
+      });
+    }
+
+    const existingCap = this.prepared('SELECT value FROM settings WHERE key = ?')
       .get('daily_cost_cap_usd') as { value: string } | undefined;
     if (!existingCap) {
-      this.db
-        .prepare('INSERT INTO settings (key, value) VALUES (?, ?)')
+      this.prepared('INSERT INTO settings (key, value) VALUES (?, ?)')
         .run('daily_cost_cap_usd', String(this.config.dailyCostCapUsd));
     }
   }
 
+  /** Columns of `table` (used by idempotent ADD COLUMN migrations). */
+  tableColumns(table: string): Set<string> {
+    return new Set(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+  }
+
+  /**
+   * Retention: spend_events older than `retentionDays` are rolled up into spend_daily_purpose
+   * (per user/day/purpose) and daily_spend (backfilled only where missing: recordSpend already
+   * keeps it current), then deleted. Returns the number of events removed.
+   */
+  pruneSpendEvents(retentionDays: number, nowMs = this.clock.now()): number {
+    const cutoff = new Date(nowMs - retentionDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    return this.transaction(() => {
+      this.prepared(
+        `INSERT INTO spend_daily_purpose (user_id, utc_date, purpose, request_count, cost_usd, input_tokens, output_tokens)
+         SELECT user_id, utc_date, purpose, COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+         FROM spend_events WHERE utc_date < ?
+         GROUP BY user_id, utc_date, purpose
+         ON CONFLICT(user_id, utc_date, purpose) DO UPDATE SET
+           request_count = request_count + excluded.request_count,
+           cost_usd = cost_usd + excluded.cost_usd,
+           input_tokens = input_tokens + excluded.input_tokens,
+           output_tokens = output_tokens + excluded.output_tokens`,
+      ).run(cutoff);
+      this.prepared(
+        `INSERT INTO daily_spend (user_id, utc_date, cost_usd, input_tokens, output_tokens, extra_granted_usd)
+         SELECT user_id, utc_date, COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), 0
+         FROM spend_events WHERE utc_date < ?
+         GROUP BY user_id, utc_date
+         ON CONFLICT(user_id, utc_date) DO NOTHING`,
+      ).run(cutoff);
+      return Number(this.prepared('DELETE FROM spend_events WHERE utc_date < ?').run(cutoff).changes);
+    });
+  }
+
   private seedAllowlist(): void {
-    const now = new Date().toISOString();
-    const insert = this.db.prepare(
+    const now = this.nowIso();
+    const insert = this.prepared(
       'INSERT OR IGNORE INTO allowlist (id, kind, value, added_by, created_at) VALUES (?, ?, ?, ?, ?)',
     );
     for (const email of [...this.config.adminEmails, ...this.config.allowedEmails]) {
-      insert.run(crypto.randomUUID(), 'email', email.toLowerCase(), 'env', now);
+      insert.run(this.randomUUID(), 'email', email.toLowerCase(), 'env', now);
     }
     for (const domain of this.config.allowedDomains) {
-      insert.run(crypto.randomUUID(), 'domain', domain.toLowerCase(), 'env', now);
+      insert.run(this.randomUUID(), 'domain', domain.toLowerCase(), 'env', now);
     }
   }
 
@@ -285,8 +575,7 @@ export class ControlPlaneDb {
     const norm = email.trim().toLowerCase();
     if (this.config.adminEmails.includes(norm)) return true;
     const domain = norm.split('@')[1] ?? '';
-    const row = this.db
-      .prepare(
+    const row = this.prepared(
         "SELECT 1 FROM allowlist WHERE (kind = 'email' AND value = ?) OR (kind = 'domain' AND value = ?) LIMIT 1",
       )
       .get(norm, domain);
@@ -295,11 +584,10 @@ export class ControlPlaneDb {
 
   upsertUser(input: { email: string; name: string; picture: string | null }): UserDto {
     const email = input.email.trim().toLowerCase();
-    const now = new Date().toISOString();
+    const now = this.nowIso();
     const isAdminEnv = this.config.adminEmails.includes(email);
 
-    const existing = this.db
-      .prepare('SELECT * FROM users WHERE email = ?')
+    const existing = this.prepared('SELECT * FROM users WHERE email = ?')
       .get(email) as
       | { id: string; email: string; name: string; picture: string | null; is_admin: number; persona?: string }
       | undefined;
@@ -307,8 +595,7 @@ export class ControlPlaneDb {
     if (existing) {
       const nextAdmin = isAdminEnv ? 1 : existing.is_admin;
       const persona = existing.persona === 'developer' ? 'developer' : 'non-technical';
-      this.db
-        .prepare('UPDATE users SET name = ?, picture = ?, is_admin = ?, last_login_at = ? WHERE id = ?')
+      this.prepared('UPDATE users SET name = ?, picture = ?, is_admin = ?, last_login_at = ? WHERE id = ?')
         .run(input.name, input.picture, nextAdmin, now, existing.id);
       return {
         id: existing.id,
@@ -320,10 +607,9 @@ export class ControlPlaneDb {
       };
     }
 
-    const id = crypto.randomUUID();
+    const id = this.randomUUID();
     const isAdmin = isAdminEnv ? 1 : 0;
-    this.db
-      .prepare(
+    this.prepared(
         'INSERT INTO users (id, email, name, picture, is_admin, persona, created_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(id, email, input.name, input.picture, isAdmin, 'non-technical', now, now);
@@ -339,7 +625,7 @@ export class ControlPlaneDb {
   }
 
   getUserById(id: string): UserDto | null {
-    const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
+    const row = this.prepared('SELECT * FROM users WHERE id = ?').get(id) as
       | { id: string; email: string; name: string; picture: string | null; is_admin: number; persona?: string }
       | undefined;
     if (!row) return null;
@@ -354,7 +640,7 @@ export class ControlPlaneDb {
   }
 
   listUsers(): UserDto[] {
-    const rows = this.db.prepare('SELECT * FROM users ORDER BY email ASC').all() as Array<{
+    const rows = this.prepared('SELECT * FROM users ORDER BY email ASC').all() as Array<{
       id: string;
       email: string;
       name: string;
@@ -373,16 +659,15 @@ export class ControlPlaneDb {
   }
 
   setUserPersona(userId: string, persona: 'non-technical' | 'developer'): void {
-    this.db.prepare('UPDATE users SET persona = ? WHERE id = ?').run(persona, userId);
+    this.prepared('UPDATE users SET persona = ? WHERE id = ?').run(persona, userId);
   }
 
   setUserAdmin(userId: string, isAdmin: boolean): void {
-    this.db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(isAdmin ? 1 : 0, userId);
+    this.prepared('UPDATE users SET is_admin = ? WHERE id = ?').run(isAdmin ? 1 : 0, userId);
   }
 
   listAllowlist(): AllowlistEntryDto[] {
-    const rows = this.db
-      .prepare('SELECT * FROM allowlist ORDER BY kind ASC, value ASC')
+    const rows = this.prepared('SELECT * FROM allowlist ORDER BY kind ASC, value ASC')
       .all() as Array<{
       id: string;
       kind: 'email' | 'domain';
@@ -401,35 +686,31 @@ export class ControlPlaneDb {
 
   addAllowlist(kind: 'email' | 'domain', value: string, addedBy: string): AllowlistEntryDto {
     const clean = value.trim().toLowerCase().replace(/^@/, '');
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-    this.db
-      .prepare('INSERT OR IGNORE INTO allowlist (id, kind, value, added_by, created_at) VALUES (?, ?, ?, ?, ?)')
+    const id = this.randomUUID();
+    const now = this.nowIso();
+    this.prepared('INSERT OR IGNORE INTO allowlist (id, kind, value, added_by, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(id, kind, clean, addedBy, now);
     return { id, kind, value: clean, addedBy, createdAt: now };
   }
 
   removeAllowlist(id: string): void {
-    this.db.prepare('DELETE FROM allowlist WHERE id = ?').run(id);
+    this.prepared('DELETE FROM allowlist WHERE id = ?').run(id);
   }
 
   getDailyCapUsd(): number {
-    const row = this.db
-      .prepare('SELECT value FROM settings WHERE key = ?')
+    const row = this.prepared('SELECT value FROM settings WHERE key = ?')
       .get('daily_cost_cap_usd') as { value: string } | undefined;
     return row ? Number(row.value) : this.config.dailyCostCapUsd;
   }
 
   setDailyCapUsd(cap: number): void {
-    this.db
-      .prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+    this.prepared('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
       .run('daily_cost_cap_usd', String(cap));
   }
 
-  getSpendStatus(userId: string, utcDate = new Date().toISOString().slice(0, 10)): SpendStatusDto {
+  getSpendStatus(userId: string, utcDate = this.todayUtc()): SpendStatusDto {
     const cap = this.getDailyCapUsd();
-    const row = this.db
-      .prepare('SELECT cost_usd, extra_granted_usd FROM daily_spend WHERE user_id = ? AND utc_date = ?')
+    const row = this.prepared('SELECT cost_usd, extra_granted_usd FROM daily_spend WHERE user_id = ? AND utc_date = ?')
       .get(userId, utcDate) as { cost_usd: number; extra_granted_usd: number } | undefined;
     const spent = row?.cost_usd ?? 0;
     const extra = row?.extra_granted_usd ?? 0;
@@ -446,11 +727,10 @@ export class ControlPlaneDb {
     costUsd: number,
     inputTokens: number,
     outputTokens: number,
-    utcDate = new Date().toISOString().slice(0, 10),
+    utcDate = this.todayUtc(),
     meta?: { sessionId?: string; purpose?: string; model?: string },
   ): SpendStatusDto {
-    this.db
-      .prepare(
+    this.prepared(
         `INSERT INTO daily_spend (user_id, utc_date, cost_usd, input_tokens, output_tokens, extra_granted_usd)
          VALUES (?, ?, ?, ?, ?, 0)
          ON CONFLICT(user_id, utc_date) DO UPDATE SET
@@ -460,13 +740,12 @@ export class ControlPlaneDb {
       )
       .run(userId, utcDate, costUsd, inputTokens, outputTokens);
     if (meta) {
-      this.db
-        .prepare(
+      this.prepared(
           `INSERT INTO spend_events (id, user_id, session_id, utc_date, purpose, model, cost_usd, input_tokens, output_tokens, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          crypto.randomUUID(),
+          this.randomUUID(),
           userId,
           meta.sessionId ?? null,
           utcDate,
@@ -475,15 +754,14 @@ export class ControlPlaneDb {
           costUsd,
           inputTokens,
           outputTokens,
-          new Date().toISOString(),
+          this.nowIso(),
         );
     }
     return this.getSpendStatus(userId, utcDate);
   }
 
-  listTodaySpendByPurpose(utcDate = new Date().toISOString().slice(0, 10)) {
-    return this.db
-      .prepare(
+  listTodaySpendByPurpose(utcDate = this.todayUtc()) {
+    return this.prepared(
         `SELECT purpose,
                 COUNT(*) as requestCount,
                 COALESCE(SUM(cost_usd), 0) as costUsd,
@@ -503,9 +781,8 @@ export class ControlPlaneDb {
     }>;
   }
 
-  grantExtraSpend(userId: string, extraUsd: number, utcDate = new Date().toISOString().slice(0, 10)): void {
-    this.db
-      .prepare(
+  grantExtraSpend(userId: string, extraUsd: number, utcDate = this.todayUtc()): void {
+    this.prepared(
         `INSERT INTO daily_spend (user_id, utc_date, cost_usd, input_tokens, output_tokens, extra_granted_usd)
          VALUES (?, ?, 0, 0, 0, ?)
          ON CONFLICT(user_id, utc_date) DO UPDATE SET
@@ -514,9 +791,8 @@ export class ControlPlaneDb {
       .run(userId, utcDate, extraUsd);
   }
 
-  listTodaySpendByUser(utcDate = new Date().toISOString().slice(0, 10)) {
-    return this.db
-      .prepare(
+  listTodaySpendByUser(utcDate = this.todayUtc()) {
+    return this.prepared(
         `SELECT u.id as userId, u.email, u.name, u.is_admin as isAdmin,
                 COALESCE(d.cost_usd, 0) as costUsd,
                 COALESCE(d.input_tokens, 0) as inputTokens,
@@ -545,9 +821,9 @@ export class ControlPlaneDb {
     volumeName: string;
     workspaceTokenHash: string;
   }): SessionRecord {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
+    const now = this.nowIso();
+    this.tokenMisses.clear();
+    this.prepared(
         `INSERT INTO editor_sessions (
            id, title, slug, kind, parent_session_id, reverts_sha, revert_reason,
            owner_user_id, repo, base_branch, working_branch, base_sha,
@@ -576,8 +852,7 @@ export class ControlPlaneDb {
   }
 
   getSession(id: string): SessionRecord | null {
-    const row = this.db
-      .prepare(
+    const row = this.prepared(
         `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
          FROM editor_sessions s
          JOIN users u ON u.id = s.owner_user_id
@@ -588,8 +863,7 @@ export class ControlPlaneDb {
   }
 
   getSessionByTokenHash(hash: string): SessionRecord | null {
-    const row = this.db
-      .prepare(
+    const row = this.prepared(
         `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
          FROM editor_sessions s
          JOIN users u ON u.id = s.owner_user_id
@@ -599,11 +873,36 @@ export class ControlPlaneDb {
     return row ?? null;
   }
 
+  /**
+   * Token hashes that matched no session, with their expiry (clock ms). The token is an HKDF output
+   * that does not embed the session id, so a miss on the indexed hash lookup needs an O(sessions)
+   * HKDF scan (for rows whose stored hash went stale); caching misses keeps repeated bad tokens O(1).
+   * Cleared whenever a session's token can change (create, token hash/epoch update, delete).
+   */
+  private tokenMisses = new Map<string, number>();
+  static readonly TOKEN_MISS_TTL_MS = 60_000;
+  static readonly TOKEN_MISS_MAX = 1024;
+
   resolveSessionByWorkspaceToken(rawToken: string): SessionRecord | null {
     if (!rawToken) return null;
-    const direct = this.getSessionByTokenHash(hashWorkspaceToken(rawToken));
+    const hash = hashWorkspaceToken(rawToken);
+    const direct = this.getSessionByTokenHash(hash);
     if (direct) return direct;
+    const now = this.clock.now();
+    const missUntil = this.tokenMisses.get(hash);
+    if (missUntil !== undefined) {
+      if (missUntil > now) return null;
+      this.tokenMisses.delete(hash);
+    }
+    const found = this.scanForDerivedToken(rawToken);
+    if (!found) {
+      if (this.tokenMisses.size >= ControlPlaneDb.TOKEN_MISS_MAX) this.tokenMisses.clear();
+      this.tokenMisses.set(hash, now + ControlPlaneDb.TOKEN_MISS_TTL_MS);
+    }
+    return found;
+  }
 
+  private scanForDerivedToken(rawToken: string): SessionRecord | null {
     for (const s of this.listSessions()) {
       const derived = deriveWorkspaceToken(this.config.sessionSecret, s.id, s.token_epoch ?? 0);
       if (safeEqualToken(rawToken, derived)) {
@@ -618,8 +917,7 @@ export class ControlPlaneDb {
   }
 
   listSessions(): SessionRecord[] {
-    return this.db
-      .prepare(
+    return this.prepared(
         `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
          FROM editor_sessions s
          JOIN users u ON u.id = s.owner_user_id
@@ -628,7 +926,38 @@ export class ControlPlaneDb {
       .all() as unknown as SessionRecord[];
   }
 
+  /** Sessions with a PR that is not yet recorded as merged/published (manual-merge reconciliation). */
+  listSessionsWithUnmergedPr(): SessionRecord[] {
+    return this.prepared(
+        `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
+         FROM editor_sessions s
+         JOIN users u ON u.id = s.owner_user_id
+         WHERE s.pr_number IS NOT NULL AND s.status NOT IN ('published', 'merged')
+         ORDER BY s.last_active_at DESC`,
+      )
+      .all() as unknown as SessionRecord[];
+  }
+
+  /** Session ids owned by `userId` (indexed; used for per-user spend broadcasts). */
+  listSessionIdsByOwner(userId: string): string[] {
+    return (
+      this.prepared('SELECT id FROM editor_sessions WHERE owner_user_id = ?').all(userId) as Array<{ id: string }>
+    ).map((r) => r.id);
+  }
+
+  listSessionsByOwner(userId: string): SessionRecord[] {
+    return this.prepared(
+      `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
+       FROM editor_sessions s
+       JOIN users u ON u.id = s.owner_user_id
+       WHERE s.owner_user_id = ?
+       ORDER BY s.last_active_at DESC`,
+    ).all(userId) as unknown as SessionRecord[];
+  }
+
   updateSession(id: string, patch: Partial<SessionRecord>): void {
+    assertValidSessionPatch(patch);
+    if (patch.workspace_token_hash !== undefined || patch.token_epoch !== undefined) this.tokenMisses.clear();
     const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
     if (entries.length === 0) return;
     const hasStateVer = entries.some(([k]) => k === 'state_version');
@@ -637,7 +966,7 @@ export class ControlPlaneDb {
       setClauses.push('state_version = state_version + 1');
     }
     const vals = entries.map(([, v]) => v as string | number | null);
-    this.db.prepare(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE id = ?`).run(...vals, id);
+    this.prepared(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE id = ?`).run(...vals, id);
   }
 
   /**
@@ -655,6 +984,8 @@ export class ControlPlaneDb {
       patch: Partial<SessionRecord>;
     },
   ): SessionRecord | null {
+    assertValidSessionPatch(opts.patch);
+    if (opts.patch.workspace_token_hash !== undefined || opts.patch.token_epoch !== undefined) this.tokenMisses.clear();
     const entries = Object.entries(opts.patch).filter(
       ([k, v]) => v !== undefined && k !== 'state_version' && k !== 'lease_epoch',
     );
@@ -686,11 +1017,27 @@ export class ControlPlaneDb {
       whereClauses.push("status NOT IN ('merged', 'published')");
     }
 
-    const res = this.db
-      .prepare(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE ${whereClauses.join(' AND ')}`)
+    const res = this.prepared(`UPDATE editor_sessions SET ${setClauses.join(', ')} WHERE ${whereClauses.join(' AND ')}`)
       .run(...vals);
     if (res.changes === 0) return null;
     return this.getSession(id);
+  }
+
+  /**
+   * The single sanctioned way to change `status` outside explicit lease CAS transitions: only
+   * moves allowed by ALLOWED_STATUS_SOURCES are applied (e.g. never published → running).
+   * Returns the updated row, or null when the transition was refused.
+   */
+  setSessionStatus(
+    id: string,
+    status: SessionStatus,
+    patch: Omit<Partial<SessionRecord>, 'status'> = {},
+  ): SessionRecord | null {
+    return this.transitionSession(id, {
+      fromStatuses: ALLOWED_STATUS_SOURCES[status],
+      allowUnfreeze: status === 'merged' || status === 'published',
+      patch: { ...patch, status },
+    });
   }
 
   upsertPublishRun(input: {
@@ -709,9 +1056,8 @@ export class ControlPlaneDb {
     nativeAutoMerge?: boolean;
     error?: string | null;
   }): PublishRunRecord {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
+    const now = this.nowIso();
+    this.prepared(
         `INSERT INTO publish_runs (
            session_id, run_id, actor_user_id, title, summary, exclude_paths_json, step,
            local_head_sha, pre_exclude_sha, pr_number, pr_url, merged_sha, native_auto_merge,
@@ -755,28 +1101,68 @@ export class ControlPlaneDb {
   }
 
   getPublishRun(sessionId: string): PublishRunRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM publish_runs WHERE session_id = ?')
+    const row = this.prepared('SELECT * FROM publish_runs WHERE session_id = ?')
       .get(sessionId) as PublishRunRecord | undefined;
     return row ?? null;
   }
 
   listActivePublishRuns(): PublishRunRecord[] {
-    return this.db
-      .prepare(
+    return this.prepared(
         `SELECT * FROM publish_runs
-         WHERE step IN ('rebasing', 'resolving_conflicts', 'verifying', 'pushing_pr', 'waiting_ci', 'deploying_pages')
+         WHERE step IN ${IN_FLIGHT_PUBLISH_STATES_SQL}
          ORDER BY updated_at ASC`,
       )
       .all() as unknown as PublishRunRecord[];
   }
 
   deletePublishRun(sessionId: string): void {
-    this.db.prepare('DELETE FROM publish_runs WHERE session_id = ?').run(sessionId);
+    this.prepared('DELETE FROM publish_runs WHERE session_id = ?').run(sessionId);
   }
 
   deleteSession(id: string): void {
-    this.db.prepare('DELETE FROM editor_sessions WHERE id = ?').run(id);
+    this.lastActivityWriteAt.delete(id);
+    this.tokenMisses.clear();
+    this.transaction(() => {
+      this.prepared('DELETE FROM editor_sessions WHERE id = ?').run(id);
+      this.prepared('DELETE FROM workspace_crash_loops WHERE session_id = ?').run(id);
+    });
+  }
+
+  // ---- crash-loop breaker state (CrashLoopTracker's durable store) ----
+
+  listCrashLoopRecords(): Array<{ sessionId: string; record: CrashLoopRecord }> {
+    const rows = this.prepared('SELECT * FROM workspace_crash_loops').all() as Array<{
+      session_id: string;
+      failures_json: string;
+      open_count: number;
+      open_until: number;
+      last_error: string;
+      oom: number;
+    }>;
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      record: {
+        failures: parseFailures(r.failures_json),
+        openCount: Number(r.open_count),
+        openUntil: Number(r.open_until),
+        lastError: r.last_error,
+        oom: r.oom === 1,
+      },
+    }));
+  }
+
+  saveCrashLoopRecord(sessionId: string, rec: CrashLoopRecord): void {
+    this.prepared(
+      `INSERT INTO workspace_crash_loops (session_id, failures_json, open_count, open_until, last_error, oom)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         failures_json = excluded.failures_json, open_count = excluded.open_count,
+         open_until = excluded.open_until, last_error = excluded.last_error, oom = excluded.oom`,
+    ).run(sessionId, JSON.stringify(rec.failures), rec.openCount, rec.openUntil, rec.lastError, rec.oom ? 1 : 0);
+  }
+
+  deleteCrashLoopRecord(sessionId: string): void {
+    this.prepared('DELETE FROM workspace_crash_loops WHERE session_id = ?').run(sessionId);
   }
 
   upsertSessionArchive(input: {
@@ -787,9 +1173,8 @@ export class ControlPlaneDb {
     mergedSha?: string | null;
     prUrl?: string | null;
   }): SessionArchiveDto {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
+    const now = this.nowIso();
+    this.prepared(
         `INSERT INTO session_archives (
            session_id, transcript_json, handoff_summary, diff_summary, merged_sha, pr_url, created_at, updated_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -815,8 +1200,7 @@ export class ControlPlaneDb {
   }
 
   getSessionArchive(sessionId: string): SessionArchiveDto | null {
-    const row = this.db
-      .prepare('SELECT * FROM session_archives WHERE session_id = ?')
+    const row = this.prepared('SELECT * FROM session_archives WHERE session_id = ?')
       .get(sessionId) as
       | {
           session_id: string;
@@ -843,21 +1227,19 @@ export class ControlPlaneDb {
   }
 
   setArchiveHandoffSummary(sessionId: string, handoffSummary: string): void {
-    this.db
-      .prepare('UPDATE session_archives SET handoff_summary = ?, updated_at = ? WHERE session_id = ?')
-      .run(handoffSummary, new Date().toISOString(), sessionId);
+    this.prepared('UPDATE session_archives SET handoff_summary = ?, updated_at = ? WHERE session_id = ?')
+      .run(handoffSummary, this.nowIso(), sessionId);
   }
 
   hasInFlightRevertForSha(revertsSha: string, excludeSessionId?: string): SessionRecord | null {
-    const row = this.db
-      .prepare(
+    const row = this.prepared(
         `SELECT s.*, u.name as owner_name, u.email as owner_email, u.picture as owner_picture
          FROM editor_sessions s
          JOIN users u ON u.id = s.owner_user_id
          WHERE s.kind = 'revert'
            AND s.reverts_sha = ?
            AND s.id != ?
-           AND s.publish_state IN ('verifying', 'rebasing', 'resolving_conflicts', 'pushing_pr', 'waiting_ci', 'deploying_pages')
+           AND s.publish_state IN ${IN_FLIGHT_PUBLISH_STATES_SQL}
          LIMIT 1`,
       )
       .get(revertsSha, excludeSessionId ?? '') as SessionRecord | undefined;
@@ -949,8 +1331,7 @@ export class ControlPlaneDb {
     const staticFindings = parsed.findings.filter((f) => f.source !== 'ai');
     const mergedFindings = [...staticFindings, ...aiFindings];
 
-    const prevRow = this.db
-      .prepare(
+    const prevRow = this.prepared(
         `SELECT sha, score, inline_editable_pct, created_at
          FROM astro_audit_reports
          WHERE base_branch = ?
@@ -987,8 +1368,7 @@ export class ControlPlaneDb {
   }
 
   getAuditReport(sha: string): { report: AstroAuditReportDto; digest: string } | null {
-    const row = this.db
-      .prepare('SELECT * FROM astro_audit_reports WHERE sha = ?')
+    const row = this.prepared('SELECT * FROM astro_audit_reports WHERE sha = ?')
       .get(sha) as
       | {
           sha: string;
@@ -1010,8 +1390,7 @@ export class ControlPlaneDb {
   }
 
   getLatestAuditReport(baseBranch: string): { report: AstroAuditReportDto; digest: string } | null {
-    const row = this.db
-      .prepare(
+    const row = this.prepared(
         'SELECT * FROM astro_audit_reports WHERE base_branch = ? ORDER BY created_at DESC, rowid DESC LIMIT 1',
       )
       .get(baseBranch) as
@@ -1040,9 +1419,8 @@ export class ControlPlaneDb {
     report: AstroAuditReportDto;
     digest: string;
   }): AstroAuditReportDto {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
+    const now = this.nowIso();
+    this.prepared(
         `INSERT INTO astro_audit_reports (
            sha, base_branch, score, inline_editable_pct, report_json, digest_text, created_at, updated_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1073,9 +1451,8 @@ export class ControlPlaneDb {
     costUsd: number;
     updatedScore?: number;
   }): AstroAuditReportDto | null {
-    const now = new Date().toISOString();
-    this.db
-      .prepare(
+    const now = this.nowIso();
+    this.prepared(
         `UPDATE astro_audit_reports
          SET ai_reviewed_at = ?,
              ai_summary = ?,

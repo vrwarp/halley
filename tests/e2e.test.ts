@@ -702,32 +702,170 @@ function startFakeGitHubServer(repoDir: string): Promise<{
   });
 }
 
-describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playwright)', () => {
-  let tmpDir = '';
-  let cpProc: ChildProcess | null = null;
-  let fakeAnthropic: Awaited<ReturnType<typeof startFakeAnthropicServer>>;
-  let fakeGitHub: Awaited<ReturnType<typeof startFakeGitHubServer>>;
-  let cpPort = 0;
+type Browser = import('playwright').Browser;
+type Page = import('playwright').Page;
+type Frame = import('playwright').Frame;
 
-  let cpLogs: string[] = [];
+/**
+ * One fully isolated Halley stack per scenario: its own fixture repo, data dir (SQLite +
+ * workspaces + git mirror), fake Anthropic, fake GitHub and control-plane process. A failure (or
+ * leftover state such as a merged PR advancing `main`) in one scenario cannot leak into another.
+ */
+interface HalleyStack {
+  baseUrl: string;
+  fakeGitHub: Awaited<ReturnType<typeof startFakeGitHubServer>>;
+  logs: string[];
+  close: () => Promise<void>;
+}
 
-  beforeAll(async () => {
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-e2e-'));
-    const repoDir = path.join(tmpDir, 'fixture-repo');
-    const dataDir = path.join(tmpDir, 'data');
-    await fs.mkdir(dataDir, { recursive: true });
-    await createFixtureAstroRepo(repoDir);
+const CP_START_ATTEMPTS = 5;
+const CP_HEALTH_TIMEOUT_MS = 30_000;
 
-    fakeAnthropic = await startFakeAnthropicServer();
-    fakeGitHub = await startFakeGitHubServer(repoDir);
-    cpPort = await getFreePort();
+/**
+ * Resolves 'healthy' once /api/health answers OK, 'exited' if the process dies first. Throws if
+ * neither happens in time.
+ */
+async function waitForControlPlane(proc: ChildProcess, port: number): Promise<'healthy' | 'exited'> {
+  let exited = proc.exitCode !== null || proc.signalCode !== null;
+  const onExit = () => {
+    exited = true;
+  };
+  proc.once('exit', onExit);
+  try {
+    const deadline = Date.now() + CP_HEALTH_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (exited) return 'exited';
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+        if (res.ok) return 'healthy';
+      } catch (err) {
+        // Not listening yet: keep polling until the deadline or the process exits.
+        void err;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`control plane did not become healthy on port ${port} within ${CP_HEALTH_TIMEOUT_MS}ms`);
+  } finally {
+    proc.off('exit', onExit);
+  }
+}
 
-    cpProc = spawn(process.execPath, ['packages/control-plane/dist/index.js'], {
+function signalGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
+  if (!proc.pid) return;
+  try {
+    process.kill(-proc.pid, signal); // the whole process group (spawned detached)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+  }
+}
+
+/**
+ * Kills every process whose environment mentions `marker` (this stack's private tmp dir). Runners and
+ * `astro dev` run in their own process groups, so a group kill of the control plane cannot reach them
+ * if something upstream died abruptly; without this sweep a leaked child can keep running after the
+ * suite and hold the runner's event loop / ports open.
+ */
+async function sweepProcessesMentioning(marker: string): Promise<number[]> {
+  if (process.platform !== 'linux') return [];
+  const killed: number[] = [];
+  for (const entry of await fs.readdir('/proc')) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid === process.pid) continue;
+    let environ: string;
+    try {
+      environ = await fs.readFile(`/proc/${pid}/environ`, 'utf8');
+    } catch {
+      continue; // exited meanwhile, or not ours to read
+    }
+    if (!environ.includes(marker)) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+      killed.push(pid);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err;
+    }
+  }
+  return killed;
+}
+
+async function stopProcess(proc: ChildProcess, marker?: string): Promise<void> {
+  if (proc.exitCode === null && proc.signalCode === null) {
+    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+    signalGroup(proc, 'SIGTERM');
+    const timer = setTimeout(() => signalGroup(proc, 'SIGKILL'), 5_000);
+    await exited;
+    clearTimeout(timer);
+  }
+  proc.stdout?.destroy();
+  proc.stderr?.destroy();
+  if (marker) {
+    const leaked = await sweepProcessesMentioning(marker);
+    if (leaked.length > 0) console.warn(`[e2e] killed ${leaked.length} leaked process(es) after stop: ${leaked.join(', ')}`);
+  }
+}
+
+/**
+ * The control plane derives its public/internal URLs from PORT, so PORT=0 cannot work. Instead
+ * pick a free port and, if another process grabs it between our probe and the child's bind
+ * (EADDRINUSE), retry with a fresh port.
+ */
+async function startControlPlane(
+  env: NodeJS.ProcessEnv,
+  logs: string[],
+): Promise<{ proc: ChildProcess; port: number }> {
+  for (let attempt = 1; ; attempt++) {
+    const port = await getFreePort();
+    const attemptLogs: string[] = [];
+    const proc = spawn(process.execPath, ['packages/control-plane/dist/index.js'], {
       cwd: process.cwd(),
-      env: {
+      env: { ...env, PORT: String(port), HALLEY_PUBLIC_URL: `http://127.0.0.1:${port}` },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // own process group so teardown can kill the whole tree
+    });
+    const onData = (d: Buffer) => {
+      const text = d.toString();
+      logs.push(text);
+      attemptLogs.push(text);
+    };
+    proc.stdout?.on('data', onData);
+    proc.stderr?.on('data', onData);
+    let outcome: 'healthy' | 'exited';
+    try {
+      outcome = await waitForControlPlane(proc, port);
+    } catch (err) {
+      await stopProcess(proc, env.DATA_DIR);
+      throw new Error(`${(err as Error).message}\n${attemptLogs.join('')}`);
+    }
+    if (outcome === 'healthy') return { proc, port };
+    const output = attemptLogs.join('');
+    if (/EADDRINUSE/.test(output) && attempt < CP_START_ATTEMPTS) {
+      logs.push(`[e2e] port ${port} was taken before the control plane bound it; retrying\n`);
+      continue;
+    }
+    throw new Error(`control plane exited during startup (code ${proc.exitCode})\n${output}`);
+  }
+}
+
+async function startStack(label: string): Promise<HalleyStack> {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `halley-e2e-${label}-`));
+  const repoDir = path.join(tmpDir, 'fixture-repo');
+  const dataDir = path.join(tmpDir, 'data');
+  const logs: string[] = [];
+  const cleanups: Array<() => Promise<void>> = [() => fs.rm(tmpDir, { recursive: true, force: true })];
+  const close = async () => {
+    for (const fn of cleanups.reverse()) {
+      await fn().catch((err: unknown) => console.warn(`[e2e:${label}] cleanup step failed`, err));
+    }
+  };
+  try {
+    await fs.mkdir(dataDir, { recursive: true });
+    const [, fakeAnthropic] = await Promise.all([createFixtureAstroRepo(repoDir), startFakeAnthropicServer()]);
+    cleanups.push(fakeAnthropic.close);
+    const fakeGitHub = await startFakeGitHubServer(repoDir);
+    cleanups.push(fakeGitHub.close);
+    const { proc, port } = await startControlPlane(
+      {
         ...process.env,
-        PORT: String(cpPort),
-        HALLEY_PUBLIC_URL: `http://127.0.0.1:${cpPort}`,
         DATA_DIR: dataDir,
         HALLEY_REPO: 'test/fixture-site',
         HALLEY_BASE_BRANCH: 'main',
@@ -742,52 +880,96 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
         HALLEY_ALLOWED_DOMAINS: 'thecrossing.website',
         HALLEY_WEB_DIST: path.resolve('packages/web/dist'),
         HALLEY_DEV_LOGIN: 'true',
+        // if this test worker dies abruptly, the control plane (and through it the supervisor,
+        // runners and astro dev servers) exits instead of leaking into the next run
+        HALLEY_EXIT_WITH_PARENT: '1',
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    cpProc.stdout?.on('data', (d) => cpLogs.push(d.toString()));
-    cpProc.stderr?.on('data', (d) => cpLogs.push(d.toString()));
+      logs,
+    );
+    cleanups.push(() => stopProcess(proc, tmpDir));
+    return { baseUrl: `http://127.0.0.1:${port}`, fakeGitHub, logs, close };
+  } catch (err) {
+    await close();
+    throw err;
+  }
+}
 
-    // Wait for control-plane /api/health
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      try {
-        const res = await fetch(`http://127.0.0.1:${cpPort}/api/health`);
-        if (res.ok) break;
-      } catch {
-        // retry
-      }
-      await new Promise((r) => setTimeout(r, 200));
-    }
+async function signIn(page: Page, baseUrl: string, email: string): Promise<void> {
+  await page.goto(baseUrl, { waitUntil: 'networkidle' });
+  await page.fill('input[placeholder="admin@example.com (optional)"]', email);
+  await page.click('button:has-text("Dev Sign In")');
+  await page.waitForSelector('input[placeholder*="Easter service times"]');
+}
+
+/** The preview iframe's Frame (re-resolved each call: the iframe navigates between routes). */
+async function previewFrame(page: Page): Promise<Frame> {
+  const handle = await page.waitForSelector('iframe');
+  const frame = await handle.contentFrame();
+  if (!frame) throw new Error('preview iframe has no content frame');
+  return frame;
+}
+
+/** Waits until the preview bridge has actually switched into Edit mode (it styles the cursor then). */
+async function waitForPreviewEditMode(page: Page): Promise<void> {
+  const frame = await previewFrame(page);
+  await frame.waitForFunction(
+    () => Boolean(document.getElementById('__halley-edit-cursor')?.textContent?.includes('cursor: pointer')),
+    undefined,
+    { timeout: 10_000 },
+  );
+}
+
+/**
+ * Arms a listener for the preview's `halley:patch-saved` message (posted to the editor page once
+ * the inline edit's POST /__editor/patch succeeded). Call before triggering the save, await after.
+ */
+async function armPatchSaved(page: Page): Promise<() => Promise<void>> {
+  const key = `__e2ePatch_${Math.random().toString(36).slice(2)}`;
+  await page.evaluate((k) => {
+    const w = window as unknown as Record<string, unknown>;
+    w[k] = 'pending';
+    const onMsg = (e: MessageEvent) => {
+      const type = (e.data as { type?: string } | null)?.type;
+      if (type === 'halley:patch-saved') w[k] = 'saved';
+      else if (type === 'halley:edit-error') w[k] = `error: ${(e.data as { message?: string }).message ?? ''}`;
+      else return;
+      window.removeEventListener('message', onMsg);
+    };
+    window.addEventListener('message', onMsg);
+  }, key);
+  return async () => {
+    const handle = await page.waitForFunction(
+      (k) => (window as unknown as Record<string, string>)[k] !== 'pending' && (window as unknown as Record<string, string>)[k],
+      key,
+      { timeout: 15_000 },
+    );
+    const state = await handle.jsonValue();
+    if (state !== 'saved') throw new Error(`inline edit was not saved (${String(state)})`);
+  };
+}
+
+describe.concurrent('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playwright)', () => {
+  let browser: Browser;
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
   });
 
   afterAll(async () => {
-    if (cpProc && cpProc.exitCode === null) {
-      cpProc.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 500));
-      if (cpProc.exitCode === null) cpProc.kill('SIGKILL');
-    }
-    await fakeAnthropic?.close();
-    await fakeGitHub?.close();
-    if (tmpDir) {
-      await fs.rm(tmpDir, { recursive: true, force: true });
-    }
+    await browser?.close();
   });
 
   it('signs in, creates unlisted page, edits inline, runs multi-page Pi turns, checks, and publishes via fake GitHub', async () => {
-    const baseUrl = `http://127.0.0.1:${cpPort}`;
-    const browser = await chromium.launch({ headless: true });
+    const stack = await startStack('main-flow');
+    const { baseUrl, fakeGitHub } = stack;
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
-    let page: import('playwright').Page | null = null;
+    let page: Page | null = null;
     try {
-      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       page = await context.newPage();
 
       // 1. Sign in via dev-login UI
-      await page.goto(baseUrl, { waitUntil: 'networkidle' });
-      await page.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
-      await page.click('button:has-text("Dev Sign In")');
-      await page.waitForSelector('input[placeholder*="Easter service times"]');
+      await signIn(page, baseUrl, 'editor-main@thecrossing.website');
 
       // 2. Create session
       await page.fill('input[placeholder*="Easter service times"]', 'E2E Fake Flow');
@@ -800,14 +982,18 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
 
       // 3. Switch to Edit mode (Browse is default) and apply inline fine-tuning edit
       await page.click('button:has-text("Edit")');
+      await waitForPreviewEditMode(page);
       const pEl = frameLocator.locator('p').first();
       await pEl.click();
+      // Desktop click begins editing once the bridge's inspect round-trip returns
+      await expect.poll(() => pEl.getAttribute('contenteditable'), { timeout: 10_000 }).toBe('true');
+      const patchSaved = await armPatchSaved(page);
       await pEl.evaluate((el) => {
         el.textContent = 'Join us every Sunday morning at 10am — coffee at 9:30am!';
         el.dispatchEvent(new Event('input', { bubbles: true }));
       });
       await pEl.evaluate((el) => el.blur());
-      await page.waitForTimeout(800);
+      await patchSaved();
 
       // 3b. Test expanded Edit Mode: Style preset (Center), Duplicate, and one-click Undo (zero reload)
       const initialPCount = await frameLocator.locator('p').count();
@@ -895,35 +1081,32 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       const iframeText = page ? await page.frameLocator('iframe').locator('body').innerText({ timeout: 2000 }).catch(() => null) : null;
       const chatText = page ? await page.locator('aside').innerText({ timeout: 2000 }).catch(() => null) : null;
       console.error('=== IFRAME STATE ===', { iframeSrc, iframeText, chatText });
-      console.error('=== CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      console.error('=== CONTROL PLANE LOGS ===\n' + stack.logs.join(''));
       throw err;
     } finally {
-      await browser.close();
+      await context.close();
+      await stack.close();
     }
   });
 
   it('supports phone-sized (390x844, touch) editor: 2-step tap-to-edit, Ask Halley compact card, and auto-loaded mobile publish screenshots', async () => {
-    const baseUrl = `http://127.0.0.1:${cpPort}`;
+    const stack = await startStack('mobile');
+    const { baseUrl } = stack;
     const shotsDir = process.env.HALLEY_CAPTURE_MOBILE_SHOTS_DIR;
     if (shotsDir) {
       await fs.mkdir(shotsDir, { recursive: true });
     }
-    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+    });
 
-    let page: import('playwright').Page | null = null;
     try {
-      const context = await browser.newContext({
-        viewport: { width: 390, height: 844 },
-        hasTouch: true,
-        isMobile: true,
-      });
-      page = await context.newPage();
+      const page = await context.newPage();
 
       // 1. Sign in on mobile and create a new draft
-      await page.goto(baseUrl, { waitUntil: 'networkidle' });
-      await page.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
-      await page.click('button:has-text("Dev Sign In")');
-      await page.waitForSelector('input[placeholder*="Easter service times"]');
+      await signIn(page, baseUrl, 'editor-mobile@thecrossing.website');
 
       await page.fill('input[placeholder*="Easter service times"]', 'Mobile E2E Edit');
       await page.click('button:has-text("New edit")');
@@ -944,8 +1127,7 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
 
       // 2. Switch to Edit mode -> Tap 1 selects paragraph without opening contentEditable
       await page.click('button:has-text("Edit")');
-      await frameLocator.locator('#__halley-edit-cursor').waitFor({ state: 'attached', timeout: 5_000 });
-      await page.waitForTimeout(150);
+      await waitForPreviewEditMode(page);
       const pEl = frameLocator.locator('p').first();
       await pEl.click();
 
@@ -960,15 +1142,17 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
 
       // 3. Tap 2 ("Edit text") enters contentEditable, edits text, taps Done -> saves
       await editTextBtn.click();
-      await page.waitForTimeout(150);
-      expect(await pEl.getAttribute('contenteditable')).toBe('true');
+      await expect.poll(() => pEl.getAttribute('contenteditable'), { timeout: 5_000 }).toBe('true');
+      const patchSaved = await armPatchSaved(page);
       await pEl.evaluate((el) => {
         el.textContent = 'Join us every Sunday morning at 10am — mobile edit saved!';
         el.dispatchEvent(new Event('input', { bubbles: true }));
       });
       await frameLocator.locator('button[data-act="done"]').click();
-      await page.waitForTimeout(800);
+      await patchSaved();
       await bubbleBtn.waitFor({ state: 'visible', timeout: 5_000 });
+      // The saved edit is reflected in the compact top bar ("Publish · 1") before the overflow check
+      await page.locator('header button:has-text("Publish · 1")').waitFor({ timeout: 10_000 });
 
       // Ensure compact mobile top bar (now showing "Publish · 1") never overflows viewport width
       const overflowCheck = await page.evaluate(() => {
@@ -1017,26 +1201,23 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
         await page.screenshot({ path: path.join(shotsDir, '04-mobile-publish-review.png') });
       }
     } catch (err) {
-      console.error('=== MOBILE E2E CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      console.error('=== MOBILE E2E CONTROL PLANE LOGS ===\n' + stack.logs.join(''));
       throw err;
     } finally {
-      await browser.close();
+      await context.close();
+      await stack.close();
     }
   });
 
   it('shows confirmation dialog explaining Branch off and navigates to the new instance from Editor and Dashboard', async () => {
-    const baseUrl = `http://127.0.0.1:${cpPort}`;
-    const browser = await chromium.launch({ headless: true });
+    const stack = await startStack('branch-off');
+    const { baseUrl } = stack;
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
-    let page: import('playwright').Page | null = null;
     try {
-      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-      page = await context.newPage();
+      const page = await context.newPage();
 
-      await page.goto(baseUrl, { waitUntil: 'networkidle' });
-      await page.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
-      await page.click('button:has-text("Dev Sign In")');
-      await page.waitForSelector('input[placeholder*="Easter service times"]');
+      await signIn(page, baseUrl, 'editor-branch@thecrossing.website');
 
       // Create source draft
       await page.fill('input[placeholder*="Easter service times"]', 'Branch Source Draft');
@@ -1091,27 +1272,25 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
       expect(thirdIframeSrc).not.toBe(firstIframeSrc);
       expect(thirdIframeSrc).not.toBe(secondIframeSrc);
     } catch (err) {
-      console.error('=== BRANCH OFF E2E CONTROL PLANE LOGS ===\n' + cpLogs.join(''));
+      console.error('=== BRANCH OFF E2E CONTROL PLANE LOGS ===\n' + stack.logs.join(''));
       throw err;
     } finally {
-      await browser.close();
+      await context.close();
+      await stack.close();
     }
   });
 
   it('isolates two concurrent preview tabs via Service Worker, completes durable background publish, and syncs second session from advanced main', async () => {
-    const baseUrl = `http://127.0.0.1:${cpPort}`;
-    const browser = await chromium.launch({ headless: true });
+    const stack = await startStack('two-tabs');
+    const { baseUrl } = stack;
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 
     try {
-      const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       const pageA = await context.newPage();
       const pageB = await context.newPage();
 
       // Sign in on pageA (shares auth cookie across context)
-      await pageA.goto(baseUrl, { waitUntil: 'networkidle' });
-      await pageA.fill('input[placeholder="admin@example.com (optional)"]', 'editor@thecrossing.website');
-      await pageA.click('button:has-text("Dev Sign In")');
-      await pageA.waitForSelector('input[placeholder*="Easter service times"]');
+      await signIn(pageA, baseUrl, 'editor-tabs@thecrossing.website');
 
       // Create Session B first so it starts at the current main SHA
       await pageB.goto(baseUrl, { waitUntil: 'networkidle' });
@@ -1136,30 +1315,36 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
 
       // Edit h1 inline on Tab A ONLY
       await pageA.click('button:has-text("Edit")');
+      await waitForPreviewEditMode(pageA);
       const h1A = frameA.locator('h1').first();
       await h1A.click();
+      await expect.poll(() => h1A.getAttribute('contenteditable'), { timeout: 10_000 }).toBe('true');
+      const patchSaved = await armPatchSaved(pageA);
       await h1A.evaluate((el) => {
         el.textContent = 'Welcome to Crossing — Live From Tab A';
         el.dispatchEvent(new Event('input', { bubbles: true }));
       });
       await h1A.evaluate((el) => el.blur());
-      await pageA.waitForTimeout(800);
+      await patchSaved();
 
       // Tab B must remain completely isolated with original h1!
       await pageB.reload({ waitUntil: 'networkidle' });
       await frameB.locator('h1:has-text("Welcome to our community")').waitFor({ timeout: 30_000 });
 
-      // Publish Tab A and dismiss modal via "Continue in background" (or close × if instant)
+      // Publish Tab A. Depending on timing the modal either offers "Continue in background" (still
+      // running) or completes outright ("Start new edit"): wait for whichever appears first.
       await pageA.click('button:has-text("Publish")');
       await pageA.click('button:has-text("Publish to Live Site")');
       const bgBtn = pageA.locator('button:has-text("Continue in background")');
-      if (await bgBtn.isVisible({ timeout: 1_500 }).catch(() => false)) {
+      const doneBtn = pageA.locator('button:has-text("Start new edit")');
+      await bgBtn.or(doneBtn).first().waitFor({ timeout: 30_000 });
+      if (await bgBtn.isVisible()) {
         await bgBtn.click();
         await pageA.waitForSelector('header:has-text("Published"), button:has-text("Undo publication")', {
           timeout: 30_000,
         });
       } else {
-        await pageA.waitForSelector('button:has-text("Start new edit")', { timeout: 30_000 });
+        await doneBtn.waitFor({ timeout: 30_000 });
       }
 
       // Now Tab B pulls latest from advanced `main` via "Get latest" and receives Tab A's published h1!
@@ -1168,10 +1353,11 @@ describe('Halley E2E (with fake Anthropic SSE + fake GitHub + real Astro & Playw
         timeout: 30_000,
       });
     } catch (err) {
-      console.error('=== 2-TAB ISOLATION & BG PUBLISH LOGS ===\n' + cpLogs.join(''));
+      console.error('=== 2-TAB ISOLATION & BG PUBLISH LOGS ===\n' + stack.logs.join(''));
       throw err;
     } finally {
-      await browser.close();
+      await context.close();
+      await stack.close();
     }
   });
 });

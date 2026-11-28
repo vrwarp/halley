@@ -15,6 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../api.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   sessionId: string;
@@ -230,8 +231,8 @@ export function DebugTraceDrawer({
       await navigator.clipboard.writeText(text);
       setCopiedId(id);
       setTimeout(() => setCopiedId((prev) => (prev === id ? null : prev)), 1800);
-    } catch {
-      // ignore clipboard errors
+    } catch (err) {
+      reportIgnored(err, 'clipboard write denied');
     }
   };
 

@@ -50,7 +50,8 @@ interface Props {
   onRemoveAttachment: (stagedId: string) => void;
   uploading: boolean;
   onTriggerPhotoUpload: () => void;
-  onSend: (whenBusy?: 'steer' | 'followUp', overrideText?: string) => void;
+  /** May resolve to false when the send failed (the draft is kept and an error shown by the parent). */
+  onSend: (whenBusy?: 'steer' | 'followUp', overrideText?: string) => void | Promise<boolean>;
   onAbort: () => void;
   onOpenNewPage: () => void;
   onNavigateRouteAndClose: (route: string) => void;
@@ -186,7 +187,9 @@ export function MobileChatCard({
     if (!live.busy) {
       setPendingSend({ text: displayText, baselineEntryCount: entries.length });
     }
-    onSend(whenBusy, overrideText);
+    void Promise.resolve(onSend(whenBusy, overrideText)).then((ok) => {
+      if (ok === false) setPendingSend(null);
+    });
   };
 
   // Scope the compact view strictly to the latest turn so older replies never flicker back while working

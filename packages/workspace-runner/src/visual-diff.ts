@@ -1,23 +1,33 @@
-import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import type {
   ChangeCardDto,
   ConflictResolutionRecordDto,
   GitFileChange,
 } from '@halley/shared';
 import { inferRouteFromFilePath } from './conflict-protocol.js';
+import { readFileOr } from './fs-util.js';
+import { logger } from './log.js';
+import { getProcessRunner } from './proc.js';
 
-const execFileAsync = promisify(execFile);
+/** `git show <ref>:<path>` / `git log` on a path or range the base does not have: an expected miss. */
+const GIT_MISSING_OBJECT_RE = /does not exist in|exists on disk, but not in|bad revision|unknown revision|invalid object name|path '.*' does not exist/i;
 
+/**
+ * stdout of a read-only git command, or '' on failure. Change cards are best-effort, so a failure
+ * never fails the request, but only "object/path not in that revision" is expected (debug); any
+ * other failure (timeout, corrupt repo, missing git) is logged at warn.
+ */
 async function gitQuiet(cwd: string, args: string[]): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 8 * 1024 * 1024 });
-    return stdout;
-  } catch {
-    return '';
+  const r = await getProcessRunner().exec('git', args, { cwd, maxBuffer: 8 * 1024 * 1024, timeoutMs: 60_000 });
+  if (r.code === 0) return r.stdout;
+  const fields = { cwd, args: args.slice(0, 3), code: r.code, stderr: r.stderr.slice(0, 500) };
+  if (!r.timedOut && !r.spawnError && GIT_MISSING_OBJECT_RE.test(r.stderr)) {
+    logger.debug('visual-diff: git object not in revision', fields);
+  } else {
+    logger.warn('visual-diff: git command failed; change card degraded', { ...fields, timedOut: r.timedOut });
   }
+  return '';
 }
 
 const IMAGE_EXT_RE = /\.(?:webp|png|jpe?g|gif|svg|avif)$/i;
@@ -105,7 +115,9 @@ export function computeJsonFieldDiff(
       }
     }
     return rows.slice(0, 15);
-  } catch {
+  } catch (err) {
+    // Not JSON (or not an object) on one side: no field-level rows; the card still shows the file
+    logger.debug('visual-diff: JSON field diff unavailable', { err: err instanceof Error ? err.message : String(err) });
     return [];
   }
 }
@@ -283,7 +295,8 @@ export async function buildChangeCards(
 
     if (c.path.endsWith('.json') && !isImage) {
       const beforeJson = await gitQuiet(repoRoot, ['show', `${opts.baseRef}:${c.path}`]);
-      const afterJson = await fs.readFile(path.join(repoRoot, c.path), 'utf8').catch(() => '');
+      // deleted files have no working-tree side
+      const afterJson = await readFileOr(path.join(repoRoot, c.path), '', 'visual-diff: read changed JSON file');
       jsonFields = computeJsonFieldDiff(beforeJson, afterJson);
     } else if (!isImage) {
       const snippets = extractDiffTextSnippets(c.diff);

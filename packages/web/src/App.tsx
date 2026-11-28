@@ -1,7 +1,9 @@
 import type { EditorSessionDto, SpendStatusDto } from '@halley/shared';
-import { type ReactNode, useEffect, useState } from 'react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { api, type AuthMeResponse } from './api.js';
+import { LoadErrorScreen } from './components/ErrorBoundary.js';
 import { PwaUpdateToast } from './components/PwaUpdateToast.js';
+import { backoffDelayMs, errorMessage, reportIgnored } from './lib/retry.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
 import { EditorPage } from './pages/EditorPage.js';
@@ -19,7 +21,8 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(() => {
     try {
       return new URLSearchParams(window.location.search).get('session') || null;
-    } catch {
+    } catch (err) {
+      reportIgnored(err, 'reading ?session= from the URL failed');
       return null;
     }
   });
@@ -36,8 +39,8 @@ export function App() {
         next.searchParams.delete('session');
       }
       window.history.replaceState(null, '', `${next.pathname}${next.search}${next.hash}`);
-    } catch {
-      // ignore
+    } catch (err) {
+      reportIgnored(err, 'history.replaceState for ?session= failed');
     }
   };
 
@@ -51,31 +54,102 @@ export function App() {
         setSessions(list.sessions);
         setSpend(list.spend);
       })
-      .catch(() => {});
+      .catch((err) => reportIgnored(err, 'background session list refresh failed; next refresh retries'));
   };
 
   const params = new URLSearchParams(window.location.search);
   const authError = params.get('authError');
   const deniedEmail = params.get('email');
 
-  const refresh = async () => {
-    const me = await api.me();
-    setAuth(me);
-    if (me.authenticated) {
-      if (me.spend) setSpend(me.spend);
-      const list = await api.listSessions();
-      setSessions(list.sessions);
-      setSpend(list.spend);
+  const [loadError, setLoadError] = useState<{ message: string; retryInMs: number | null } | null>(
+    null,
+  );
+  const refreshGenRef = useRef(0);
+  const retryAttemptRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * Never rejects: failures surface as `loadError` (full-screen before the first successful
+   * load, a banner afterwards) and schedule an automatic retry with exponential backoff.
+   * A generation counter drops responses from superseded calls.
+   */
+  const refresh = async (opts?: { manual?: boolean }): Promise<void> => {
+    const gen = ++refreshGenRef.current;
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (opts?.manual) retryAttemptRef.current = 0;
+    try {
+      const me = await api.me();
+      if (gen !== refreshGenRef.current) return;
+      setAuth(me);
+      if (me.authenticated) {
+        if (me.spend) setSpend(me.spend);
+        const list = await api.listSessions();
+        if (gen !== refreshGenRef.current) return;
+        setSessions(list.sessions);
+        setSpend(list.spend);
+      }
+      retryAttemptRef.current = 0;
+      setLoadError(null);
+    } catch (err) {
+      if (gen !== refreshGenRef.current) return;
+      const delay = backoffDelayMs(retryAttemptRef.current++);
+      console.warn(`[halley] refresh failed, retrying in ${delay}ms`, err);
+      setLoadError({ message: errorMessage(err, 'Could not reach Halley'), retryInMs: delay });
+      retryTimerRef.current = setTimeout(() => {
+        retryTimerRef.current = null;
+        void refresh();
+      }, delay);
     }
   };
 
   useEffect(() => {
     void refresh();
+    return () => {
+      refreshGenRef.current++;
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
   }, []);
+
+  const loadErrorBanner =
+    loadError && auth ? (
+      <div
+        role="alert"
+        className="fixed inset-x-0 top-2 z-[100] mx-auto flex w-fit max-w-[calc(100%-32px)] items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 shadow"
+      >
+        <span className="min-w-0 break-words">{loadError.message}</span>
+        <button
+          type="button"
+          onClick={() => void refresh({ manual: true })}
+          className="shrink-0 rounded-md bg-red-700 px-2 py-0.5 font-semibold text-white hover:bg-red-800"
+        >
+          Retry
+        </button>
+        <button
+          type="button"
+          aria-label="Dismiss"
+          onClick={() => setLoadError(null)}
+          className="shrink-0 px-1 text-red-700 hover:text-red-950"
+        >
+          ×
+        </button>
+      </div>
+    ) : null;
 
   let view: ReactNode;
 
-  if (!auth) {
+  if (!auth && loadError) {
+    view = (
+      <LoadErrorScreen
+        title="Couldn't load Halley"
+        message={loadError.message}
+        retryInMs={loadError.retryInMs}
+        onRetry={() => void refresh({ manual: true })}
+      />
+    );
+  } else if (!auth) {
     view = (
       <div className="flex h-dvh items-center justify-center bg-[#FAF9F7] text-sm text-stone-500">
         Loading Halley…
@@ -143,7 +217,12 @@ export function App() {
         }}
         onRefresh={refresh}
         onLogout={async () => {
-          await api.logout();
+          try {
+            await api.logout();
+          } catch (err) {
+            setLoadError({ message: `Sign out failed: ${errorMessage(err)}`, retryInMs: null });
+            return;
+          }
           setActiveSessionId(null);
           syncSessionUrl(null);
           await refresh();
@@ -154,6 +233,7 @@ export function App() {
 
   return (
     <>
+      {loadErrorBanner}
       {view}
       <PwaUpdateToast />
     </>

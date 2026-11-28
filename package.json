@@ -10,13 +10,14 @@
   "scripts": {
     "build": "pnpm -r --sort build",
     "typecheck": "pnpm -r typecheck",
+    "check:no-silent-catch": "node scripts/check-no-silent-catch.mjs",
     "test": "pnpm -r test",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:docker-smoke": "tsx tests/docker-smoke.ts",
     "dev:control-plane": "pnpm --filter @halley/control-plane dev",
     "dev:web": "pnpm --filter @halley/web dev",
-    "docker:build:workspace": "docker build -f docker/workspace.Dockerfile -t halley-workspace:latest .",
-    "docker:build:control-plane": "docker build -f docker/control-plane.Dockerfile -t halley-control-plane:latest .",
+    "docker:build:workspace": "docker build $HALLEY_DOCKER_BUILD_ARGS -f docker/workspace.Dockerfile -t halley-workspace:latest -t halley-workspace:ci-smoke .",
+    "docker:build:control-plane": "docker build $HALLEY_DOCKER_BUILD_ARGS -f docker/control-plane.Dockerfile -t halley-control-plane:latest -t halley-control-plane:ci-smoke .",
     "docker:build": "pnpm docker:build:workspace && pnpm docker:build:control-plane"
   },
   "devDependencies": {

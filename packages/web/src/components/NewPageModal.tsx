@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   sessionId: string;
@@ -99,8 +100,9 @@ export function NewPageModal({
           setNavGroup(opts.navGroups[0]!);
         }
       })
-      .catch(() => {
-        // fallback gracefully
+      .catch((err) => {
+        // Falls back to the defaults already in state.
+        reportIgnored(err, 'page options unavailable; using defaults');
       })
       .finally(() => {
         if (active) setLoadingOptions(false);

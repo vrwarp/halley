@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { normalizeHref } from './serializer.js';
+import { ignoreMissingPath, isMissingPathError } from './diagnostics.js';
+import { normalizeHref, writeFileAtomic } from './serializer.js';
 
 export interface SiteImageEntry {
   /** Public root-relative path, e.g. `/images/community/youth.webp`. */
@@ -24,7 +25,9 @@ async function walkImages(
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // A missing images folder simply has no images; anything else is worth a warning.
+    ignoreMissingPath(`listing images in ${dir}`, err);
     return;
   }
   for (const entry of entries) {
@@ -42,8 +45,9 @@ async function walkImages(
     try {
       const st = await fs.stat(full);
       sizeBytes = st.size;
-    } catch {
-      // ignore
+    } catch (err) {
+      // Removed between readdir and stat: list it with an unknown (0) size.
+      ignoreMissingPath(`reading size of ${full}`, err);
     }
     const rel = path.relative(publicRoot, full).split(path.sep).join('/');
     const folder = path.dirname(rel) === '.' ? '' : path.dirname(rel);
@@ -74,13 +78,14 @@ export async function listSiteImages(repoRoot: string, maxCount = 300): Promise<
       let sizeBytes = 0;
       try {
         sizeBytes = (await fs.stat(path.join(publicRoot, entry.name))).size;
-      } catch {
-        // ignore
+      } catch (err) {
+        ignoreMissingPath(`reading size of public/${entry.name}`, err);
       }
       out.push({ path: p, folder: '', filename: entry.name, sizeBytes });
     }
-  } catch {
+  } catch (err) {
     // public/ may not exist yet
+    ignoreMissingPath('listing public/', err);
   }
 
   out.sort((a, b) => a.folder.localeCompare(b.folder) || a.filename.localeCompare(b.filename));
@@ -158,19 +163,20 @@ export async function writeSiteImage(input: WriteSiteImageInput): Promise<WriteS
   let absDest = path.join(absDir, candidateName);
 
   // Never overwrite an existing image file (protects references on other pages)
-  const exists = await fs
-    .access(absDest)
-    .then(() => true)
-    .catch(() => false);
+  let exists = true;
+  try {
+    await fs.access(absDest);
+  } catch (err) {
+    if (!isMissingPathError(err)) throw err;
+    exists = false;
+  }
   if (exists) {
     const suffix = crypto.randomBytes(3).toString('hex');
     candidateName = `${baseSlug}-${suffix}${finalExt}`;
     absDest = path.join(absDir, candidateName);
   }
 
-  const tmpPath = `${absDest}.halley-tmp-${process.pid}-${Date.now()}`;
-  await fs.writeFile(tmpPath, finalBytes);
-  await fs.rename(tmpPath, absDest);
+  await writeFileAtomic(absDest, finalBytes);
 
   const relFromPublic = path.relative(absPublic, absDest).split(path.sep).join('/');
   const diskRelPath = path.relative(path.resolve(input.repoRoot), absDest).split(path.sep).join('/');

@@ -1,0 +1,32 @@
+{
+  "astro-dev-edit": {
+    "emptyCatch": 0,
+    "emptyCatchCallback": 0,
+    "catchToDefault": 0,
+    "catchReturnSilently": 0
+  },
+  "control-plane": {
+    "emptyCatch": 0,
+    "emptyCatchCallback": 0,
+    "catchToDefault": 0,
+    "catchReturnSilently": 0
+  },
+  "shared": {
+    "emptyCatch": 0,
+    "emptyCatchCallback": 0,
+    "catchToDefault": 0,
+    "catchReturnSilently": 0
+  },
+  "web": {
+    "emptyCatch": 0,
+    "emptyCatchCallback": 0,
+    "catchToDefault": 0,
+    "catchReturnSilently": 0
+  },
+  "workspace-runner": {
+    "emptyCatch": 0,
+    "emptyCatchCallback": 0,
+    "catchToDefault": 0,
+    "catchReturnSilently": 0
+  }
+}

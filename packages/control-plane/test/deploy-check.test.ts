@@ -10,6 +10,7 @@ import { ControlPlaneDb } from '../src/db.js';
 import type { WorkspaceDriver } from '../src/drivers/workspace-driver.js';
 import { GitHubService, matchesDeployWorkflow } from '../src/github/client.js';
 import { PublishService } from '../src/routes/publish.js';
+import { FakeClock } from './helpers/fake-clock.js';
 
 interface MockRouteHandler {
   (req: http.IncomingMessage, res: http.ServerResponse, url: URL): void;
@@ -118,7 +119,10 @@ describe('deploy workflow matching & deploy check reliability', () => {
 
     const stopped: string[] = [];
     const broadcasts: PublishProgressPayload[] = [];
-    const github = new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0 });
+    // Virtual time: deploy polling and GitHub retry backoff never wait on the wall clock
+    const clock = new FakeClock({ autoAdvance: true });
+    // Retry backoff (100ms, 200ms, 400ms) must fit several polls inside the 3s deploy timeout
+    const github = new GitHubService(cfg, { baseDelayMs: 100, jitterRatio: 0 }, { clock });
     const publish = new PublishService(
       cfg,
       db,
@@ -134,6 +138,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
         maxConsecutiveErrors: 3,
         ...pollOverrides,
       },
+      { clock },
     );
 
     return { db, github, publish, session: db.getSession(session.id)!, broadcasts, stopped };
@@ -360,7 +365,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
     const second = await setupSession(failingMock.url);
     await second.publish.retryDeployCheck(second.session);
 
-    // 3 consecutive poll failures * (1 initial + 3 client retries) = 12 attempts
+    // 3 deploy polls (maxConsecutiveErrors) x 4 attempts each (GitHubService retries idempotent GETs on 5xx)
     expect(failCalls).toBe(12);
     expect(second.db.getSession(second.session.id)?.status).toBe('merged');
     expect(second.db.getSession(second.session.id)?.publish_state).toBe('failed_deploy');
@@ -495,7 +500,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       }
       if (url.pathname === '/internal/git/changes') {
         res.writeHead(200);
-        res.end(JSON.stringify({ changes: [] }));
+        // checkpoints[0] is the runner HEAD: the commit verify ran on and the PR must point at
+        res.end(JSON.stringify({ changes: [], checkpoints: [{ sha: 'head999' }] }));
         return;
       }
       res.writeHead(404);
@@ -715,6 +721,15 @@ describe('deploy workflow matching & deploy check reliability', () => {
         res.end(JSON.stringify({ clean: true, protectedFiles: [] }));
         return;
       }
+      if (url.pathname === '/internal/git/changes') {
+        // checkpoints[0] is the runner HEAD: the verified commit the PR must point at
+        res.end(JSON.stringify({ changes: [], checkpoints: [{ sha: 'head500' }] }));
+        return;
+      }
+      if (url.pathname === '/internal/transcript') {
+        res.end(JSON.stringify({ entries: [], usageUsd: 0 }));
+        return;
+      }
       res.end(JSON.stringify({ ok: true }));
     });
     cleanups.push(() => runner.close());
@@ -821,6 +836,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       workspaceTokenHash: 'hash-sync-500',
     });
 
+    // Virtual time: CI polling and GitHub retry backoff (real 1s/2s/4s delays) never wait on the wall clock
+    const clock = new FakeClock({ autoAdvance: true });
     const broadcasts: PublishProgressPayload[] = [];
     const driver: WorkspaceDriver = {
       ...createStubDriver(),
@@ -835,7 +852,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
       cfg,
       db,
       driver,
-      new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0 }),
+      new GitHubService(cfg, { jitterRatio: 0 }, { clock }),
       (_id, payload) => broadcasts.push(payload),
       undefined,
       {
@@ -847,6 +864,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
         maxConsecutiveErrors: 3,
         timeoutMs: 5000,
       },
+      { clock },
     );
 
     await publish.publish(
@@ -875,6 +893,15 @@ describe('deploy workflow matching & deploy check reliability', () => {
       }
       if (url.pathname === '/internal/git/protected-diff') {
         res.end(JSON.stringify({ clean: true, protectedFiles: [] }));
+        return;
+      }
+      if (url.pathname === '/internal/git/changes') {
+        // checkpoints[0] is the runner HEAD: the verified commit the PR must point at
+        res.end(JSON.stringify({ changes: [], checkpoints: [{ sha: 'head500fail' }] }));
+        return;
+      }
+      if (url.pathname === '/internal/transcript') {
+        res.end(JSON.stringify({ entries: [], usageUsd: 0 }));
         return;
       }
       res.end(JSON.stringify({ ok: true }));
@@ -944,6 +971,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       workspaceTokenHash: 'hash-sync-500-fail',
     });
 
+    // Virtual time: CI polling and GitHub retry backoff (real 1s/2s/4s delays) never wait on the wall clock
+    const clock = new FakeClock({ autoAdvance: true });
     const broadcasts: PublishProgressPayload[] = [];
     const driver: WorkspaceDriver = {
       ...createStubDriver(),
@@ -958,7 +987,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
       cfg,
       db,
       driver,
-      new GitHubService(cfg, { baseDelayMs: 0, jitterRatio: 0, maxRetries: 1 }),
+      new GitHubService(cfg, { jitterRatio: 0, maxRetries: 1 }, { clock }),
       (_id, payload) => broadcasts.push(payload),
       undefined,
       {
@@ -968,6 +997,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
         maxConsecutiveErrors: 2,
         timeoutMs: 5000,
       },
+      { clock },
     );
 
     await publish.publish(

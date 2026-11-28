@@ -20,8 +20,24 @@ const UNQUOTED_PARENT_PATH_RE = /(?:^|[\s=:(;|&])\.\.(?:\/|[\s;|&)]|$)/;
 const QUOTED_FS_PARENT_PATH_RE =
   /(?:^|[;&|(\n`])\s*(?:cd|ls|cat|head|tail|rm|mv|cp|mkdir|rmdir|touch|ln|chmod|chown|sed|find)\b[^\n;|&`]*['"]\.\.(?:\/|['"])/i;
 
-const DEP_MUTATION_RE =
-  /(?:^|[;&|(\n`])\s*(?:npm\s+(?:install|i|ci|uninstall|rm|remove|update|up|dedupe|pkg|exec)\b|npx\b|pnpm\s+(?:add|install|i|remove|rm|uninstall|update|up|dlx)\b|yarn\s+(?:add|install|remove|upgrade|dlx)\b|corepack\b)/i;
+// Only commands that genuinely rewrite the workspace's `node_modules` (or its manifest) count as
+// dependency mutations. `npx`, `npm exec`, `npm pkg get`, `pnpm dlx`, `yarn dlx` and `corepack`
+// run tools from a separate cache and must NOT trigger a node_modules detach under live `astro dev`.
+const DEP_MUTATION_RE = new RegExp(
+  [
+    '(?:^|[;&|(\\n`])\\s*(?:',
+    // npm install/i/add/ci/uninstall/un/rm/r/remove/update/up/upgrade/dedupe/ddp/prune/link
+    'npm\\s+(?:install|i|add|ci|uninstall|un|rm|r|remove|update|up|upgrade|dedupe|ddp|prune|link)\\b',
+    // npm pkg set|delete (rewrites package.json); `npm pkg get` is read-only
+    '|npm\\s+pkg\\s+(?:set|delete)\\b',
+    '|pnpm\\s+(?:add|install|i|remove|rm|uninstall|un|update|up|upgrade|prune|link)\\b',
+    '|yarn\\s+(?:add|install|remove|upgrade|up)\\b',
+    // bare `yarn` installs
+    '|yarn\\s*(?:$|[;&|)\\n])',
+    ')',
+  ].join(''),
+  'i',
+);
 
 /**
  * High-trust safety rails preventing accidental agent footguns on the shared workspace server:

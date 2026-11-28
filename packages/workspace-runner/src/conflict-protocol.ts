@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import type {
   ConflictCategory,
   ConflictConfidence,
@@ -12,27 +10,18 @@ import type {
   UpstreamCommitInfoDto,
 } from '@halley/shared';
 import { findFilesWithConflictMarkers } from './checkpoints-and-git.js';
-
-const execFileAsync = promisify(execFile);
+import { realClock, type Clock } from './clock.js';
+import { writeFileAtomic } from './fs-util.js';
+import { ignore, ignoreExpected, isMissingPathError, orDefault } from './log.js';
+import { getProcessRunner, processResultError } from './proc.js';
 
 async function gitRaw(
   cwd: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  try {
-    const res = await execFileAsync('git', args, {
-      cwd,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return { stdout: res.stdout, stderr: res.stderr, code: 0 };
-  } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string; code?: number };
-    return {
-      stdout: e.stdout ?? '',
-      stderr: e.stderr ?? (err instanceof Error ? err.message : String(err)),
-      code: typeof e.code === 'number' ? e.code : 1,
-    };
-  }
+  const r = await getProcessRunner().exec('git', args, { cwd, maxBuffer: 16 * 1024 * 1024 });
+  if (r.code === 0 || r.stderr) return r;
+  return { ...r, stderr: processResultError('git', args, r).message };
 }
 
 export interface ConflictEvidencePack {
@@ -161,7 +150,9 @@ export async function buildConflictEvidencePack(
   let diskSample: Buffer | undefined;
   try {
     diskSample = await fs.readFile(path.join(repoRoot, relPath));
-  } catch {
+  } catch (err) {
+    // deleted on one side: file type is inferred from the path alone
+    if (!isMissingPathError(err)) ignore(err, 'conflict: read working-tree sample', { relPath });
     diskSample = undefined;
   }
 
@@ -552,8 +543,9 @@ export function tryDeterministicResolve(
           modelUsed: 'deterministic',
         };
       }
-    } catch {
+    } catch (err) {
       // Fall through to Pi if JSON cannot be parsed cleanly
+      ignoreExpected(err, 'conflict: deterministic JSON merge not applicable', { path: pack.path });
     }
   }
 
@@ -844,7 +836,14 @@ export function buildConflictPromptForPack(
   return { system, user: parts.join('\n\n'), ...(useHunkMode ? { hunks: parsedHunks } : {}) };
 }
 
+/** Deadline for one conflict-resolution LLM call (thinking + an 8k-token answer). */
+const CONFLICT_LLM_TIMEOUT_MS = Number(process.env.HALLEY_CONFLICT_LLM_TIMEOUT_MS || 180_000);
+/** Deadline for one token-count call (cheap; falls back to a character estimate). */
+const COUNT_TOKENS_TIMEOUT_MS = 15_000;
+
 export interface LlmConflictCaller {
+  /** Clock for the request deadline (defaults to the real clock). */
+  clock?: Clock;
   controlPlaneInternalUrl: string;
   workspaceToken: string;
   modelId: string;
@@ -892,14 +891,26 @@ export async function resolvePackWithLlm(
     body.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
   }
 
-  const res = await fetch(`${caller.controlPlaneInternalUrl}/internal/llm/anthropic/v1/messages`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${caller.controlPlaneInternalUrl}/internal/llm/anthropic/v1/messages`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: (caller.clock ?? realClock).timeoutSignal(CONFLICT_LLM_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // timeout / control plane unreachable: the user chooses, exactly like a refused call
+    ignore(err, 'conflict: LLM resolution request failed', { path: pack.path });
+    return {
+      record: buildContradictionRecord(pack, { modelUsed: caller.modelId }),
+      usageUsd: 0,
+    };
+  }
 
   if (res.status === 429) {
-    const errText = await res.text().catch(() => '');
+    // body only refines the message (ceiling vs daily budget); a failed read means "daily budget"
+    const errText = await orDefault(res.text(), '', 'conflict: read 429 response body');
     const stoppedAtCeiling = errText.includes('run_ceiling_reached');
     return {
       record: buildContradictionRecord(pack, {
@@ -920,10 +931,20 @@ export async function resolvePackWithLlm(
     };
   }
 
-  const json = (await res.json()) as {
+  let json: {
     content?: Array<{ type: string; text?: string }>;
     usage?: { input_tokens?: number; output_tokens?: number };
   };
+  try {
+    json = (await res.json()) as typeof json;
+  } catch (err) {
+    // body read timed out / was cut off: same outcome as a refused call
+    ignore(err, 'conflict: read LLM resolution response', { path: pack.path });
+    return {
+      record: buildContradictionRecord(pack, { modelUsed: caller.modelId }),
+      usageUsd: 0,
+    };
+  }
   const textBlock = json.content?.find((b) => b.type === 'text')?.text ?? '';
   const inp = json.usage?.input_tokens ?? 0;
   const out = json.usage?.output_tokens ?? 0;
@@ -1005,7 +1026,9 @@ export async function resolvePackWithLlm(
       },
       usageUsd,
     };
-  } catch {
+  } catch (err) {
+    // the user is asked to choose instead; the reason is logged for diagnosis
+    ignore(err, 'conflict: AI resolution failed; falling back to a manual choice', { path: pack.path });
     return {
       record: buildContradictionRecord(pack, { modelUsed: caller.modelId }),
       usageUsd,
@@ -1021,6 +1044,8 @@ export async function estimateEscalationCost(opts: {
   packs: ConflictEvidencePack[];
   controlPlaneInternalUrl: string;
   workspaceToken: string;
+  /** Clock for the per-call deadline (defaults to the real clock). */
+  clock?: Clock;
   escalationModelId: string;
   hardCeilingUsd: number;
   remainingBudgetUsd: number;
@@ -1046,6 +1071,7 @@ export async function estimateEscalationCost(opts: {
             system,
             messages: [{ role: 'user', content: user }],
           }),
+          signal: (opts.clock ?? realClock).timeoutSignal(COUNT_TOKENS_TIMEOUT_MS),
         },
       );
       if (res.ok) {
@@ -1053,8 +1079,9 @@ export async function estimateEscalationCost(opts: {
         totalInputTokens += data.input_tokens ?? 0;
         continue;
       }
-    } catch {
+    } catch (err) {
       // Fallback to character estimate (~4 chars/token)
+      ignore(err, 'conflict: token count request failed; using character estimate');
     }
     totalInputTokens += Math.ceil((system.length + user.length) / 4);
   }
@@ -1110,7 +1137,8 @@ export async function applyResolvedFile(
   if (!validation.valid) return { ok: false, error: validation.error };
 
   await fs.mkdir(path.dirname(abs), { recursive: true });
-  await fs.writeFile(abs, content, 'utf8');
+  // astro dev / the agent may read it right away: never a half-written resolution
+  await writeFileAtomic(abs, content);
   const markers = await findFilesWithConflictMarkers(repoRoot, [relPath]);
   if (markers.length > 0) {
     return { ok: false, error: `Conflict markers detected in ${relPath}` };

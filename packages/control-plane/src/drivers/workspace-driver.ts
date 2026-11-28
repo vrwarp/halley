@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { AstroAuditReportDto, BootProgressDto } from '@halley/shared';
+import { realClock, type Clock } from '../clock.js';
 import type { SessionRecord } from '../db.js';
+import { ignore } from '../log.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -75,6 +77,13 @@ interface CrashRecord {
   oom: boolean;
 }
 
+/** Durable backing store for CrashLoopTracker (ControlPlaneDb implements it), so a restart can't re-arm a loop. */
+export interface CrashLoopStore {
+  listCrashLoopRecords(): Array<{ sessionId: string; record: CrashRecord }>;
+  saveCrashLoopRecord(sessionId: string, record: CrashRecord): void;
+  deleteCrashLoopRecord(sessionId: string): void;
+}
+
 const DEFAULT_CRASH_WINDOW_MS = 10 * 60_000;
 const DEFAULT_CRASH_THRESHOLD = 3;
 const DEFAULT_COOLDOWNS_MS = [60_000, 120_000, 300_000];
@@ -84,14 +93,38 @@ export class CrashLoopTracker {
   private readonly threshold: number;
   private readonly windowMs: number;
   private readonly cooldownsMs: number[];
+  private readonly clock: Clock;
 
-  constructor(opts?: { threshold?: number; windowMs?: number; cooldownsMs?: number[] }) {
+  private readonly store: CrashLoopStore | null;
+
+  /**
+   * With `store`, state is loaded once at construction and written through on every change; reads
+   * stay in memory (assertCanAttempt is on the boot path).
+   */
+  constructor(opts?: {
+    threshold?: number;
+    windowMs?: number;
+    cooldownsMs?: number[];
+    clock?: Clock;
+    store?: CrashLoopStore;
+  }) {
+    this.clock = opts?.clock ?? realClock;
     this.threshold = opts?.threshold ?? DEFAULT_CRASH_THRESHOLD;
     this.windowMs = opts?.windowMs ?? DEFAULT_CRASH_WINDOW_MS;
     this.cooldownsMs = opts?.cooldownsMs ?? DEFAULT_COOLDOWNS_MS;
+    this.store = opts?.store ?? null;
+    if (this.store) {
+      const now = this.clock.now();
+      for (const { sessionId, record } of this.store.listCrashLoopRecords()) {
+        // Drop rows that no longer matter (no recent failure, breaker closed)
+        const recent = record.failures.some((ts) => now - ts < this.windowMs);
+        if (!recent && record.openUntil <= now) this.store.deleteCrashLoopRecord(sessionId);
+        else this.records.set(sessionId, record);
+      }
+    }
   }
 
-  assertCanAttempt(sessionId: string, now = Date.now()): void {
+  assertCanAttempt(sessionId: string, now = this.clock.now()): void {
     const rec = this.records.get(sessionId);
     if (!rec) return;
     if (rec.openUntil > now) {
@@ -110,7 +143,7 @@ export class CrashLoopTracker {
     error: string,
     opts?: { oom?: boolean; now?: number },
   ): WorkspaceCrashInfo {
-    const now = opts?.now ?? Date.now();
+    const now = opts?.now ?? this.clock.now();
     const prev = this.records.get(sessionId) ?? {
       failures: [],
       openCount: 0,
@@ -139,18 +172,24 @@ export class CrashLoopTracker {
       oom,
     };
     this.records.set(sessionId, updated);
+    this.store?.saveCrashLoopRecord(sessionId, updated);
     return this.getInfo(sessionId, now)!;
   }
 
   recordSuccess(sessionId: string): void {
-    this.records.delete(sessionId);
+    this.forget(sessionId);
   }
 
   reset(sessionId: string): void {
-    this.records.delete(sessionId);
+    this.forget(sessionId);
   }
 
-  getInfo(sessionId: string, now = Date.now()): WorkspaceCrashInfo | null {
+  private forget(sessionId: string): void {
+    // Only touch the store when there was state: a boot success must not cost a write
+    if (this.records.delete(sessionId)) this.store?.deleteCrashLoopRecord(sessionId);
+  }
+
+  getInfo(sessionId: string, now = this.clock.now()): WorkspaceCrashInfo | null {
     const rec = this.records.get(sessionId);
     if (!rec) return null;
     const recent = rec.failures.filter((ts) => now - ts < this.windowMs);
@@ -185,7 +224,11 @@ export interface WorkspaceDriver {
     target: SessionRecord,
     mode?: DuplicateMode,
   ): Promise<void>;
-  pushSessionBranch(session: SessionRecord, token: string): Promise<void>;
+  /**
+   * Pushes the session branch to GitHub. With `opts.sha`, exactly that (verified) commit must be
+   * what lands on the branch; implementations fail closed otherwise.
+   */
+  pushSessionBranch(session: SessionRecord, token: string, opts?: { sha?: string }): Promise<void>;
   fetchIntoSession(session: SessionRecord, token: string): Promise<void>;
   setBootProgressListener?(listener: BootProgressListener): void;
   getBootProgress?(sessionId: string): BootProgressDto | null;
@@ -193,6 +236,8 @@ export interface WorkspaceDriver {
   getSessionLogs?(sessionId: string): Promise<string[]>;
   runDoctorChecks?(): Promise<DoctorCheckResult>;
   reconcileSessions?(): Promise<void>;
+  /** Readiness of the workspaces supervisor (cached, single-flight); absent → not checked. */
+  getSupervisorReadiness?(): Promise<{ ok: boolean; error?: string; ageMs?: number }>;
   startWarmPool?(): void;
   stopWarmPool?(): Promise<void>;
   reserveWarmWorkspace?(): Promise<WarmReservation | null> | WarmReservation | null;
@@ -237,7 +282,9 @@ esac
       HALLEY_GIT_TOKEN: token,
     });
   } finally {
-    await fs.rm(scriptPath, { force: true }).catch(() => {});
+    await fs
+      .rm(scriptPath, { force: true })
+      .catch((err) => ignore(err, 'removing transient GIT_ASKPASS script failed', { scriptPath }));
   }
 }
 
@@ -256,6 +303,31 @@ export async function runGit(
   return stdout.trim();
 }
 
+/** `git config --unset-all`; exit code 5 ("key not set") is the expected no-op case. */
+export async function unsetGitConfig(cwd: string, key: string): Promise<void> {
+  try {
+    await runGit(cwd, ['config', '--unset-all', key]);
+  } catch (err) {
+    if ((err as { code?: unknown }).code === 5) return;
+    ignore(err, 'git config --unset-all failed', { cwd, key });
+  }
+}
+
+/**
+ * True when `p` exists. Only "does not exist" (ENOENT/ENOTDIR) maps to false; any other access
+ * error (EACCES, EIO, ...) propagates instead of silently looking like a missing path.
+ */
+export async function pathExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw err;
+  }
+}
+
 export async function ensureBareMirror(
   mirrorDir: string,
   repoSlug: string,
@@ -267,10 +339,7 @@ export async function ensureBareMirror(
     ? localSourcePath
     : `https://github.com/${repoSlug}.git`;
 
-  const exists = await fs
-    .access(path.join(mirrorDir, 'HEAD'))
-    .then(() => true)
-    .catch(() => false);
+  const exists = await pathExists(path.join(mirrorDir, 'HEAD'));
 
   const runWithAuth = async (args: string[], cwd: string, timeoutMs = 45_000) => {
     if (token && !localSourcePath) {
@@ -284,9 +353,13 @@ export async function ensureBareMirror(
     await runGit(mirrorDir, ['init', '--bare']);
     await runGit(mirrorDir, ['remote', 'add', 'origin', remoteUrl]);
   } else {
-    await runGit(mirrorDir, ['remote', 'set-url', 'origin', remoteUrl]).catch(() => {});
+    await runGit(mirrorDir, ['remote', 'set-url', 'origin', remoteUrl]).catch(async (err) => {
+      // A mirror created without an origin remote: add it instead
+      ignore(err, 'mirror: set-url origin failed; adding remote', { mirrorDir }, 'debug');
+      await runGit(mirrorDir, ['remote', 'add', 'origin', remoteUrl]);
+    });
     // Self-heal legacy `git clone --mirror` volumes where remote.origin.mirror=true breaks explicit refspec pushes
-    await runGit(mirrorDir, ['config', '--unset-all', 'remote.origin.mirror']).catch(() => {});
+    await unsetGitConfig(mirrorDir, 'remote.origin.mirror');
   }
 
   await runWithAuth(
@@ -302,6 +375,8 @@ export async function ensureBareMirror(
     mirrorDir,
     45_000,
   );
-  await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch(() => {});
+  await runGit(mirrorDir, ['symbolic-ref', 'HEAD', `refs/heads/${baseBranch}`]).catch((err) =>
+    ignore(err, 'mirror: pointing HEAD at the base branch failed', { mirrorDir, baseBranch }),
+  );
   return mirrorDir;
 }

@@ -8,13 +8,25 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FifoBuildQueue } from '../src/build-queue.js';
 import { createCheckpoint } from '../src/checkpoints-and-git.js';
+import { ManualClock } from '../src/clock.js';
 import {
   clearVerificationCache,
   computeWorkingTreeKey,
+  configureVerification,
   invalidateSpeculativeVerification,
   runAllVerificationChecks,
+  runShell,
   runSpeculativeVerification,
 } from '../src/verify.js';
+
+/** Resolves on the next call of the returned callback (an event the code under test emits). */
+function nextEvent<T = void>(): { promise: Promise<T>; fire: (v: T) => void } {
+  let fire!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    fire = r;
+  });
+  return { promise, fire };
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -56,10 +68,12 @@ async function startMockBuildLockServer(): Promise<{
   url: string;
   queue: FifoBuildQueue;
   promotedLeases: string[];
+  onPromoted: (fn: (leaseId: string) => void) => void;
   close: () => Promise<void>;
 }> {
   const queue = new FifoBuildQueue(30_000);
   const promotedLeases: string[] = [];
+  const promotedListeners: Array<(leaseId: string) => void> = [];
   const streamClosers = new Map<string, () => void>();
 
   const server = http.createServer(async (req, res) => {
@@ -131,7 +145,10 @@ async function startMockBuildLockServer(): Promise<{
 
     if (req.method === 'POST' && req.url === '/internal/build-lock/promote') {
       const promoted = body.leaseId ? queue.promoteToForeground(body.leaseId) : false;
-      if (promoted && body.leaseId) promotedLeases.push(body.leaseId);
+      if (promoted && body.leaseId) {
+        promotedLeases.push(body.leaseId);
+        for (const fn of promotedListeners) fn(body.leaseId);
+      }
       if (body.leaseId) streamClosers.get(body.leaseId)?.();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, promoted }));
@@ -157,6 +174,7 @@ async function startMockBuildLockServer(): Promise<{
         url: `http://127.0.0.1:${addr.port}`,
         queue,
         promotedLeases,
+        onPromoted: (fn) => promotedListeners.push(fn),
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -260,37 +278,48 @@ describe('verification tree-SHA cache, coalescing, preemption & .astro retention
   it('coalesces a foreground Publish into an in-flight speculative build on the same tree and promotes its supervisor lease', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-vcoal-'));
     const mockLock = await startMockBuildLockServer();
+    // shell timeouts / kill escalation of these runs are on a manual clock: nothing is time-driven
+    const restoreClock = configureVerification(tmp, { clock: new ManualClock() });
     cleanups.push(async () => {
+      restoreClock();
       clearVerificationCache(tmp);
       await mockLock.close();
       await fs.rm(tmp, { recursive: true, force: true });
     });
 
     const counterFile = path.join(tmp, '..', `coalcount-${path.basename(tmp)}.txt`);
+    // the build blocks on this FIFO until the test opens the gate (no sleeps, no timing windows)
+    const gate = path.join(tmp, '..', `coalgate-${path.basename(tmp)}`);
+    await execFileAsync('mkfifo', [gate]);
     cleanups.push(async () => {
       await fs.rm(counterFile, { force: true });
+      await fs.rm(gate, { force: true });
     });
 
     await initTempAstroRepo(
       tmp,
-      `echo x >> ${JSON.stringify(counterFile)} && sleep 0.4 && echo ok`,
+      `echo x >> ${JSON.stringify(counterFile)} && cat ${JSON.stringify(gate)} >/dev/null && echo ok`,
     );
 
+    const leased = nextEvent();
     const specPromise = runSpeculativeVerification(tmp, {
       supervisorUrl: mockLock.url,
       sessionId: 'sess-A',
+      onLeaseAcquired: () => leased.fire(),
     });
+    await leased.promise; // speculative run is in flight and holds the supervisor lease
 
-    // Give speculative build time to acquire the lock and start sleeping
-    await new Promise((r) => setTimeout(r, 120));
-
-    const fgResult = await runAllVerificationChecks(tmp, {
+    const promoted = nextEvent<string>();
+    mockLock.onPromoted((id) => promoted.fire(id));
+    const fgPromise = runAllVerificationChecks(tmp, {
       supervisorUrl: mockLock.url,
       sessionId: 'sess-A',
       priority: 'foreground',
     });
-    const specResult = await specPromise;
+    await promoted.promise; // the foreground call joined the speculative run and promoted it
+    await fs.writeFile(gate, 'go\n'); // let the single build finish
 
+    const [fgResult, specResult] = await Promise.all([fgPromise, specPromise]);
     expect(fgResult.allPassed).toBe(true);
     expect(specResult?.allPassed).toBe(true);
     expect(mockLock.promotedLeases.length).toBe(1);
@@ -303,25 +332,34 @@ describe('verification tree-SHA cache, coalescing, preemption & .astro retention
     const tmpA = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-vpreempt-a-'));
     const tmpB = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-vpreempt-b-'));
     const mockLock = await startMockBuildLockServer();
+    const restoreA = configureVerification(tmpA, { clock: new ManualClock() });
+    const restoreB = configureVerification(tmpB, { clock: new ManualClock() });
+    // A's build never finishes on its own (blocks on a FIFO nobody writes): only an abort ends it
+    const neverOpened = path.join(tmpA, '..', `never-${path.basename(tmpA)}`);
+    await execFileAsync('mkfifo', [neverOpened]);
     cleanups.push(async () => {
+      restoreA();
+      restoreB();
       clearVerificationCache(tmpA);
       clearVerificationCache(tmpB);
       await mockLock.close();
       await fs.rm(tmpA, { recursive: true, force: true });
       await fs.rm(tmpB, { recursive: true, force: true });
+      await fs.rm(neverOpened, { force: true });
     });
 
-    await initTempAstroRepo(tmpA, 'sleep 5 && echo A-done');
+    await initTempAstroRepo(tmpA, `cat ${JSON.stringify(neverOpened)} && echo A-done`);
     await initTempAstroRepo(tmpB, 'echo B-done');
 
-    // 1. Cross-session preemption: A starts speculative, B starts foreground -> B wins fast & A aborts
-    const started = Date.now();
+    // 1. Cross-session preemption: A holds the lock speculatively, B's foreground build preempts it
+    //    (if preemption did not work, B would wait on A's never-ending build and the test would hang)
+    const leasedA = nextEvent();
     const specA = runSpeculativeVerification(tmpA, {
       supervisorUrl: mockLock.url,
       sessionId: 'sess-A',
+      onLeaseAcquired: () => leasedA.fire(),
     });
-
-    await new Promise((r) => setTimeout(r, 120));
+    await leasedA.promise;
 
     const resB = await runAllVerificationChecks(tmpB, {
       supervisorUrl: mockLock.url,
@@ -332,16 +370,59 @@ describe('verification tree-SHA cache, coalescing, preemption & .astro retention
 
     expect(resB.allPassed).toBe(true);
     expect(resA).toBeNull(); // Preempted & aborted
-    expect(Date.now() - started).toBeLessThan(3_000);
 
-    // 2. Own-session edit invalidation: start speculative again, invalidate immediately -> aborts cleanly
+    // 2. Own-session edit invalidation: speculative again, invalidated while running -> aborts cleanly
+    const leasedA2 = nextEvent();
     const specA2 = runSpeculativeVerification(tmpA, {
       supervisorUrl: mockLock.url,
       sessionId: 'sess-A',
+      onLeaseAcquired: () => leasedA2.fire(),
     });
-    await new Promise((r) => setTimeout(r, 120));
+    await leasedA2.promise;
     invalidateSpeculativeVerification(tmpA);
     const resA2 = await specA2;
     expect(resA2).toBeNull();
+    // nothing was cached for the aborted tree: the next foreground run would execute the build
+    expect(await computeWorkingTreeKey(tmpA)).toMatch(/^[0-9a-f]{40}$/);
+  });
+});
+
+describe('runShell timers on an injected clock', () => {
+  it('times out, then escalates SIGTERM -> SIGKILL, purely on the injected clock', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-vshell-'));
+    const ready = path.join(tmp, 'ready.fifo');
+    await execFileAsync('mkfifo', [ready]);
+    try {
+      // 1) plain timeout: SIGTERM ends the group as soon as the manual clock passes the deadline
+      const clock = new ManualClock();
+      const p1 = runShell(tmp, 'sleep 30', { timeoutMs: 60_000, clock });
+      clock.advance(59_999);
+      expect(clock.pendingTimers()).toBe(1); // still only the timeout timer: no escalation yet
+      clock.advance(1);
+      const r1 = await p1;
+      expect(r1.passed).toBe(false);
+      expect(r1.transient).toBe(true);
+      expect(r1.output).toContain('[Timed out after 60s]');
+      expect(r1.durationMs).toBe(60_000);
+
+      // 2) a build that ignores SIGTERM is SIGKILLed 1s (of injected time) later
+      const clock2 = new ManualClock();
+      const p2 = runShell(tmp, `trap '' TERM; echo $$ > ${JSON.stringify(ready)}; sleep 30`, {
+        timeoutMs: 10_000,
+        clock: clock2,
+      });
+      const pid = Number((await fs.readFile(ready, 'utf8')).trim()); // shell is up and ignoring TERM
+      clock2.advance(10_000); // timeout -> SIGTERM (ignored)
+      expect(() => process.kill(pid, 0)).not.toThrow(); // survived SIGTERM
+      expect(clock2.pendingTimers()).toBe(2); // kill escalation + force-resolve armed
+      clock2.advance(1_000); // -> SIGKILL of the group
+      const r2 = await p2;
+      expect(r2.passed).toBe(false);
+      expect(r2.output).toContain('[Timed out after 10s]');
+      expect(r2.durationMs).toBe(11_000);
+      expect(clock2.pendingTimers()).toBe(0);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
   });
 });

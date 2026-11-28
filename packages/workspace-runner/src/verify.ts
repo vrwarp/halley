@@ -1,10 +1,9 @@
-import { execFile, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { discoverSiteRoutes } from '@halley/astro-dev-edit';
 import {
   HALLEY_PLACEHOLDER_ATTR,
@@ -15,10 +14,62 @@ import {
 import { detectAstroBase } from './astro-manager.js';
 import type { BuildPriority } from './build-queue.js';
 import { withRepoGitLock } from './checkpoints-and-git.js';
-import { NodeModulesCacheManager } from './nm-cache.js';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { pathExists, readdirEntriesOrEmpty, readFileOr, realpathOrNull, writeFileAtomic } from './fs-util.js';
+import {
+  errCode,
+  ignore,
+  ignoreCodes,
+  ignoreExpected,
+  isMissingPathError,
+  logger,
+  MISSING_PATH_CODES,
+  orDefault,
+} from './log.js';
+import { computeDependencyHash, NodeModulesCacheManager } from './nm-cache.js';
+import { execFileGroup, getProcessRunner, killProcessGroup as killGroup, withMaxOldSpace } from './proc.js';
 
-const execFileAsync = promisify(execFile);
+// Every git/shell command goes through the injectable ProcessRunner (own process group each)
+const execFileAsync = execFileGroup;
+
+/** Process groups of every in-flight `runShell` child, so shutdown can kill orphan-prone builds. */
+const activeShellChildren = new Set<ChildProcess>();
+
+/** Signals every in-flight `runShell` process group (used by runner shutdown). */
+export function killActiveShellGroups(signal: NodeJS.Signals = 'SIGTERM'): number {
+  let n = 0;
+  for (const child of activeShellChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      killGroup(child, signal);
+      n++;
+    }
+  }
+  return n;
+}
 const HAS_NICE_BIN = fsSync.existsSync('/usr/bin/nice') || fsSync.existsSync('/bin/nice');
+
+/** Deadline for one-shot build-lock calls (acquire headers, promote, release). */
+const BUILD_LOCK_CALL_TIMEOUT_MS = 5_000;
+/** The acquire stream answers immediately (queue events follow in the body). */
+const BUILD_LOCK_ACQUIRE_HEADERS_TIMEOUT_MS = 15_000;
+
+function sleepOn(clock: Clock, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    clock.setTimeout(resolve, ms);
+  });
+}
+
+/** Missing file → debug; anything else (parse/schema/permission errors) → warn. */
+function ignoreUnlessMissing(err: unknown, reason: string, fields?: Record<string, unknown>): void {
+  if (isMissingPathError(err)) ignoreExpected(err, reason, fields);
+  else ignore(err, reason, fields);
+}
+
+/** Errors produced by aborting a run (AbortController / preemption / revocation). */
+function isAbortLikeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.name === 'AbortError' || /preempted|aborted/i.test(err.message);
+}
 
 const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 
@@ -62,18 +113,16 @@ export function formatCompactCheckSummary(results: VerificationCheckResult[]): s
 export async function ensureBuildArtifactsExcluded(repoRoot: string): Promise<void> {
   const gitInfoDir = path.join(repoRoot, '.git', 'info');
   const excludePath = path.join(gitInfoDir, 'exclude');
-  try {
-    await fs.access(path.join(repoRoot, '.git'));
-  } catch {
-    return;
-  }
+  // not a git checkout (plain directory verification): nothing to exclude from
+  if (!(await pathExists(path.join(repoRoot, '.git'), 'verify: probe .git'))) return;
   try {
     await fs.mkdir(gitInfoDir, { recursive: true });
     let content = '';
     try {
       content = await fs.readFile(excludePath, 'utf8');
-    } catch {
+    } catch (err) {
       // file does not exist yet
+      ignoreCodes(err, ['ENOENT'], 'verify: read .git/info/exclude');
     }
     const existingLines = new Set(content.split(/\r?\n/).map((l) => l.trim()));
     const toAdd: string[] = [];
@@ -84,10 +133,11 @@ export async function ensureBuildArtifactsExcluded(repoRoot: string): Promise<vo
     }
     if (toAdd.length > 0) {
       const prefix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
-      await fs.writeFile(excludePath, `${content}${prefix}${toAdd.join('\n')}\n`, 'utf8');
+      await writeFileAtomic(excludePath, `${content}${prefix}${toAdd.join('\n')}\n`);
     }
-  } catch {
+  } catch (err) {
     // non-fatal (e.g. git worktree with .git file)
+    ignoreCodes(err, ['ENOTDIR', 'ENOENT'], 'verify: add build artifacts to .git/info/exclude', { repoRoot });
   }
 }
 
@@ -99,66 +149,61 @@ export async function ensureBuildArtifactsExcluded(repoRoot: string): Promise<vo
  */
 export async function computeWorkingTreeKey(repoRoot: string): Promise<string | null> {
   return withRepoGitLock(repoRoot, async () => {
-    try {
-      const inside = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-        cwd: repoRoot,
-      });
-      if (inside.stdout.trim() !== 'true') return null;
-    } catch {
+    // Two git processes in every case (was 3 clean / 5 dirty): `add -A` into a throw-away copy of
+    // the index (excluding .github, like sanitizeProtectedPaths), then `write-tree`. A clean tree
+    // yields exactly HEAD^{tree}, so keys before and after createCheckpoint still match.
+    if (!(await pathExists(path.join(repoRoot, '.git'), 'verify: probe .git for tree key'))) {
+      logger.debug('verify: not a git work tree; tree-key cache disabled', { repoRoot });
       return null;
     }
-
-    await ensureBuildArtifactsExcluded(repoRoot);
-
-    // Fast path: clean working tree -> HEAD^{tree}
-    try {
-      const status = await execFileAsync('git', ['status', '--porcelain'], {
-        cwd: repoRoot,
-        maxBuffer: 8 * 1024 * 1024,
-      });
-      if (!status.stdout.trim()) {
-        const tree = await execFileAsync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repoRoot });
-        const sha = tree.stdout.trim();
-        if (sha) return sha;
-      }
-    } catch {
-      // Fall through to temp-index tree calculation (e.g. unborn HEAD)
+    const resolvedRoot = path.resolve(repoRoot);
+    if (!artifactsExcludedRepos.has(resolvedRoot)) {
+      await ensureBuildArtifactsExcluded(repoRoot);
+      artifactsExcludedRepos.add(resolvedRoot);
     }
 
-    // Dirty working tree: compute tree SHA using a temporary GIT_INDEX_FILE
     const tmpIndex = path.join(os.tmpdir(), `halley-tree-idx-${crypto.randomUUID()}`);
     try {
-      const realIndex = path.join(repoRoot, '.git', 'index');
       try {
-        await fs.copyFile(realIndex, tmpIndex);
-      } catch {
-        // No index yet; git will create tmpIndex on git add -A
+        await fs.copyFile(path.join(repoRoot, '.git', 'index'), tmpIndex);
+      } catch (err) {
+        // No index yet (fresh repo) or a worktree `.git` file: git creates tmpIndex on add
+        ignoreCodes(err, ['ENOENT', 'ENOTDIR'], 'verify: copy git index for tree key', { repoRoot });
       }
       const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
-      await execFileAsync('git', ['add', '-A'], { cwd: repoRoot, env, maxBuffer: 8 * 1024 * 1024 });
-      // Mirror sanitizeProtectedPaths so .github edits don't alter tree hash unexpectedly
-      await execFileAsync('git', ['reset', '-q', 'HEAD', '--', '.github'], { cwd: repoRoot, env }).catch(
-        async () => {
-          await execFileAsync('git', ['rm', '-r', '--cached', '-q', '--ignore-unmatch', '--', '.github'], {
-            cwd: repoRoot,
-            env,
-          }).catch(() => {});
-        },
-      );
-      const { stdout } = await execFileAsync('git', ['write-tree'], { cwd: repoRoot, env });
+      await execFileAsync('git', ['add', '-A', '--', '.', ':(exclude).github'], {
+        cwd: repoRoot,
+        env,
+        maxBuffer: 8 * 1024 * 1024,
+        timeoutMs: 60_000,
+      });
+      const { stdout } = await execFileAsync('git', ['write-tree'], { cwd: repoRoot, env, timeoutMs: 60_000 });
       return stdout.trim() || null;
-    } catch {
+    } catch (err) {
+      if (/not a git repository/i.test((err as { stderr?: string }).stderr ?? '')) {
+        logger.debug('verify: not a git work tree; tree-key cache disabled', { repoRoot });
+      } else {
+        logger.warn('verify: computing the working tree key failed; tree-key cache disabled for this run', {
+          repoRoot,
+          err,
+        });
+      }
       return null;
     } finally {
-      await fs.rm(tmpIndex, { force: true }).catch(() => {});
+      await fs.rm(tmpIndex, { force: true }).catch((e) => ignore(e, 'verify: remove temporary index'));
     }
   });
 }
+
+/** Repos whose `.git/info/exclude` already lists the build artifacts (checked once per process). */
+const artifactsExcludedRepos = new Set<string>();
 
 export interface RunShellOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   priority?: BuildPriority;
+  /** Drives the timeout, kill escalation and `durationMs` (tests pass a ManualClock). */
+  clock?: Clock;
 }
 
 export async function runShell(
@@ -176,6 +221,7 @@ export async function runShell(
     typeof timeoutOrOpts === 'number' ? { timeoutMs: timeoutOrOpts } : timeoutOrOpts;
   const timeoutMs = opts.timeoutMs ?? 180_000;
   const priority: BuildPriority = opts.priority ?? 'foreground';
+  const clock = opts.clock ?? realClock;
 
   if (opts.signal?.aborted) {
     return {
@@ -187,18 +233,18 @@ export async function runShell(
     };
   }
 
-  const start = Date.now();
-  const existingNodeOpts = process.env.NODE_OPTIONS || '';
-  const nodeOptions = existingNodeOpts.includes('--max-old-space-size')
-    ? existingNodeOpts
-    : `${existingNodeOpts} --max-old-space-size=1024`.trim();
+  const start = clock.now();
+  // Builds get their own heap cap (the runner's NODE_OPTIONS carries the runner's cap, which must
+  // not leak into `astro build`). Other inherited NODE_OPTIONS flags are preserved.
+  const buildHeapMb = Number(process.env.HALLEY_BUILD_MAX_OLD_SPACE_MB) || 1024;
+  const nodeOptions = withMaxOldSpace(process.env.NODE_OPTIONS, buildHeapMb);
 
   const niceLevel = priority === 'speculative' ? '15' : '10';
   const spawnCmd = HAS_NICE_BIN ? 'nice' : 'bash';
   const spawnArgs = HAS_NICE_BIN ? ['-n', niceLevel, 'bash', '-lc', command] : ['-lc', command];
 
   return new Promise((resolve) => {
-    const child = spawn(spawnCmd, spawnArgs, {
+    const child = getProcessRunner().spawn(spawnCmd, spawnArgs, {
       cwd,
       // Own process group so timeout/abort kills npm/astro/esbuild/pagefind grandchildren too;
       // otherwise orphaned grandchildren keep stdout/stderr pipes open and 'close' never fires.
@@ -214,6 +260,7 @@ export async function runShell(
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    activeShellChildren.add(child);
 
     const chunks: string[] = [];
     let totalBytes = 0;
@@ -221,8 +268,8 @@ export async function runShell(
     let timedOut = false;
     let aborted = false;
     let spawnErrored = false;
-    let killEscalationTimer: NodeJS.Timeout | null = null;
-    let forceResolveTimer: NodeJS.Timeout | null = null;
+    let killEscalationTimer: TimerHandle | null = null;
+    let forceResolveTimer: TimerHandle | null = null;
 
     const append = (buf: Buffer) => {
       if (totalBytes > 64_000) return;
@@ -231,26 +278,12 @@ export async function runShell(
       chunks.push(str);
     };
 
-    const killProcessGroup = (signal: NodeJS.Signals) => {
-      if (child.pid) {
-        try {
-          process.kill(-child.pid, signal);
-          return;
-        } catch {
-          // Process group may already have exited
-        }
-      }
-      try {
-        child.kill(signal);
-      } catch {
-        // ignore
-      }
-    };
+    const killProcessGroup = (signal: NodeJS.Signals) => killGroup(child, signal);
 
     const terminateWithEscalation = () => {
       killProcessGroup('SIGTERM');
       if (!killEscalationTimer) {
-        killEscalationTimer = setTimeout(() => {
+        killEscalationTimer = clock.setTimeout(() => {
           killProcessGroup('SIGKILL');
           child.stdout?.destroy();
           child.stderr?.destroy();
@@ -258,7 +291,7 @@ export async function runShell(
         killEscalationTimer.unref?.();
       }
       if (!forceResolveTimer) {
-        forceResolveTimer = setTimeout(() => {
+        forceResolveTimer = clock.setTimeout(() => {
           finish(false);
         }, 2_500);
         forceResolveTimer.unref?.();
@@ -275,13 +308,14 @@ export async function runShell(
     const finish = (passed: boolean) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      activeShellChildren.delete(child);
+      clock.clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
-      if (killEscalationTimer) clearTimeout(killEscalationTimer);
-      if (forceResolveTimer) clearTimeout(forceResolveTimer);
+      clock.clearTimeout(killEscalationTimer);
+      clock.clearTimeout(forceResolveTimer);
       resolve({
         passed: passed && !timedOut && !aborted && !spawnErrored,
-        durationMs: Date.now() - start,
+        durationMs: clock.now() - start,
         output: stripAnsi(chunks.join('')).trim(),
         ...(aborted ? { aborted: true } : {}),
         ...(aborted || timedOut || spawnErrored ? { transient: true } : {}),
@@ -295,7 +329,7 @@ export async function runShell(
     child.stdout?.on('data', append);
     child.stderr?.on('data', append);
 
-    const timer = setTimeout(() => {
+    const timer = clock.setTimeout(() => {
       timedOut = true;
       chunks.push(`\n[Timed out after ${Math.round(timeoutMs / 1000)}s]`);
       terminateWithEscalation();
@@ -316,12 +350,7 @@ export async function runShell(
 
 async function walkFiles(dir: string, extFilter?: Set<string>): Promise<string[]> {
   const out: string[] = [];
-  let entries;
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
+  const entries = await readdirEntriesOrEmpty(dir, 'verify: list directory for checks');
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
@@ -371,8 +400,9 @@ export async function runAstroHygieneGuard(
             issues.push(`${path.relative(repoRoot, jf)}: missing public asset ${parsed.coverImage}`);
           }
         }
-      } catch {
-        // ignore invalid json here (astro check catches schema)
+      } catch (err) {
+        // invalid json is reported by astro check (schema); only note it here
+        ignoreExpected(err, 'verify: unreadable content JSON during asset check', { file: jf });
       }
     }
 
@@ -415,8 +445,8 @@ export async function runUnfinishedPagesCheck(repoRoot: string): Promise<Verific
       if (text.includes(HALLEY_PLACEHOLDER_ATTR)) {
         issues.push(`${path.relative(repoRoot, file)}: still contains an unfinished Halley placeholder`);
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      ignoreCodes(err, ['ENOENT'], 'verify: read source file for placeholder check', { file });
     }
   }
 
@@ -427,8 +457,8 @@ export async function runUnfinishedPagesCheck(repoRoot: string): Promise<Verific
       if (text.includes(HALLEY_PLACEHOLDER_ATTR)) {
         issues.push(`${path.relative(repoRoot, file)}: built HTML still contains an unfinished Halley placeholder`);
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      ignoreCodes(err, ['ENOENT'], 'verify: read built HTML for placeholder check', { file });
     }
   }
 
@@ -465,10 +495,7 @@ export async function runUnlistedIntegrityCheck(
   }
 
   const distDir = path.join(repoRoot, 'dist');
-  const distExists = await fs
-    .access(distDir)
-    .then(() => true)
-    .catch(() => false);
+  const distExists = await pathExists(distDir, 'verify: probe dist/');
 
   if (!distExists) {
     return {
@@ -490,8 +517,8 @@ export async function runUnlistedIntegrityCheck(
         sitemapContents.push({ name: e.name, text });
       }
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    ignoreCodes(err, ['ENOENT'], 'verify: read sitemaps from dist', { distDir });
   }
 
   // Read header/nav/footer markup from dist/index.html
@@ -504,8 +531,8 @@ export async function runUnlistedIntegrityCheck(
       ...(indexHtml.match(/<footer\b[\s\S]*?<\/footer>/gi) ?? []),
     ];
     chromeHtml = blocks.join('\n');
-  } catch {
-    // ignore
+  } catch (err) {
+    ignoreCodes(err, ['ENOENT'], 'verify: read dist/index.html for site chrome', { distDir });
   }
 
   const basePrefix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
@@ -521,8 +548,8 @@ export async function runUnlistedIntegrityCheck(
       try {
         builtHtml = await fs.readFile(c, 'utf8');
         break;
-      } catch {
-        // try next
+      } catch (err) {
+        if (errCode(err) !== 'ENOENT') ignore(err, 'verify: read built page', { file: c });
       }
     }
 
@@ -582,9 +609,31 @@ export interface BuildLockClientOptions {
   onAcquired?: () => void;
   onLeaseAcquired?: (leaseId: string) => void;
   onPreempted?: () => void;
+  /**
+   * W7: the supervisor revoked this lease (max lease time exceeded or forced preemption). The build
+   * must stop immediately; the queue admits the next build only after this lease is released or the
+   * supervisor's kill fallback completes.
+   */
+  onLeaseRevoked?: () => void;
+  /** Clock for retry backoffs (defaults to the repo's verification clock, see configureVerification). */
+  clock?: Clock;
 }
 
-async function syncVerifySandboxToTree(
+const ASTRO_CONFIG_NAMES = ['astro.config.mjs', 'astro.config.ts', 'astro.config.js', 'astro.config.mts', 'astro.config.cjs'];
+
+/** sha256 over the dependency hash and the astro config of the checked-out sandbox tree. */
+async function sandboxAstroCacheKey(sandboxRepoDir: string): Promise<string> {
+  const h = crypto.createHash('sha256');
+  h.update(`deps\0${(await computeDependencyHash(sandboxRepoDir)) ?? 'none'}`);
+  for (const name of ASTRO_CONFIG_NAMES) {
+    const content = await readFileOr(path.join(sandboxRepoDir, name), null, 'verify: read astro config for cache key');
+    if (content !== null) h.update(`\0${name}\0${content}`);
+  }
+  return h.digest('hex').slice(0, 32);
+}
+
+/** Exported for tests. */
+export async function syncVerifySandboxToTree(
   sourceRepoRoot: string,
   treeSha: string,
   verifySandboxRoot: string,
@@ -594,10 +643,7 @@ async function syncVerifySandboxToTree(
   await fs.mkdir(sandboxRepoDir, { recursive: true });
   await fs.mkdir(sandboxStateDir, { recursive: true });
 
-  const hasGit = await fs
-    .access(path.join(sandboxRepoDir, '.git'))
-    .then(() => true)
-    .catch(() => false);
+  const hasGit = await pathExists(path.join(sandboxRepoDir, '.git'), 'verify: probe sandbox .git');
   if (!hasGit) {
     await execFileAsync('git', ['init', '-q'], { cwd: sandboxRepoDir });
   }
@@ -611,7 +657,7 @@ async function syncVerifySandboxToTree(
       alternates.push(mirrorObjs);
     }
   }
-  await fs.writeFile(path.join(infoDir, 'alternates'), `${alternates.join('\n')}\n`, 'utf8');
+  await writeFileAtomic(path.join(infoDir, 'alternates'), `${alternates.join('\n')}\n`);
 
   await execFileAsync('git', ['-c', 'safe.directory=*', 'read-tree', '--reset', '-u', treeSha], {
     cwd: sandboxRepoDir,
@@ -623,37 +669,60 @@ async function syncVerifySandboxToTree(
     { cwd: sandboxRepoDir, maxBuffer: 16 * 1024 * 1024 },
   );
 
-  const sourceNmReal = await fs
-    .realpath(path.join(sourceRepoRoot, 'node_modules'))
-    .catch(() => null);
+  // The sandbox is shared by every session in the container. Its warm `.astro/` cache (content
+  // layer store, generated types) is only valid for the dependency set + astro config that built
+  // it: keyed by both and wiped when the key changes (another session, a dependency/config edit).
+  const cacheKey = await sandboxAstroCacheKey(sandboxRepoDir);
+  const keyFile = path.join(sandboxStateDir, 'astro-cache-key');
+  const previousKey = await readFileOr(keyFile, null, 'verify: read sandbox .astro cache key');
+  if (previousKey?.trim() !== cacheKey) {
+    await fs.rm(path.join(sandboxRepoDir, '.astro'), { recursive: true, force: true });
+    await writeFileAtomic(keyFile, `${cacheKey}\n`);
+  }
+
+  // node_modules ALWAYS points at the CURRENT session's dependency tree (never a previous
+  // session's link left in the shared sandbox).
+  const sourceNmReal = await realpathOrNull(
+    path.join(sourceRepoRoot, 'node_modules'),
+    'verify: resolve session node_modules',
+  );
   const sandboxNmPath = path.join(sandboxRepoDir, 'node_modules');
+  const sandboxNmIsLink = await fs.lstat(sandboxNmPath).then(
+    (st) => st.isSymbolicLink(),
+    (err) => {
+      if (!isMissingPathError(err)) ignore(err, 'verify: lstat sandbox node_modules');
+      return false;
+    },
+  );
   if (sourceNmReal) {
-    const currentSandboxNm = await fs.realpath(sandboxNmPath).catch(() => null);
-    if (currentSandboxNm !== sourceNmReal) {
-      await fs.rm(sandboxNmPath, { recursive: true, force: true }).catch(() => {});
+    // missing or dangling sandbox link: replaced below
+    const currentSandboxNm = await realpathOrNull(sandboxNmPath, 'verify: resolve sandbox node_modules');
+    if (currentSandboxNm !== sourceNmReal || !sandboxNmIsLink) {
+      await fs
+        .rm(sandboxNmPath, { recursive: true, force: true })
+        .catch((e) => ignore(e, 'verify: remove stale sandbox node_modules link'));
       await fs.symlink(sourceNmReal, sandboxNmPath, 'dir');
     }
-  } else if (
-    await fs
-      .access(path.join(sandboxRepoDir, 'package-lock.json'))
-      .then(() => true)
-      .catch(() =>
-        fs
-          .access(path.join(sandboxRepoDir, 'pnpm-lock.yaml'))
-          .then(() => true)
-          .catch(() => false),
-      )
-  ) {
-    const nmCacheDir =
-      process.env.HALLEY_NM_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'nm-cache');
-    const pkgCacheDir =
-      process.env.HALLEY_PKG_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'pkg-cache');
-    const nmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
-    await nmCache.ensureSessionNodeModules({
-      workspaceDir: sandboxRepoDir,
-      stateDir: sandboxStateDir,
-      devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
-    });
+  } else {
+    // this session has no tree of its own: a link into another session's tree must not be reused
+    if (sandboxNmIsLink) {
+      await fs.rm(sandboxNmPath, { force: true }).catch((e) => ignore(e, 'verify: remove foreign sandbox node_modules link'));
+    }
+    if (
+      (await pathExists(path.join(sandboxRepoDir, 'package-lock.json'), 'verify: probe sandbox lockfile')) ||
+      (await pathExists(path.join(sandboxRepoDir, 'pnpm-lock.yaml'), 'verify: probe sandbox lockfile'))
+    ) {
+      const nmCacheDir =
+        process.env.HALLEY_NM_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'nm-cache');
+      const pkgCacheDir =
+        process.env.HALLEY_PKG_CACHE_DIR || path.join(path.dirname(verifySandboxRoot), 'pkg-cache');
+      const nmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
+      await nmCache.ensureSessionNodeModules({
+        workspaceDir: sandboxRepoDir,
+        stateDir: sandboxStateDir,
+        devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
+      });
+    }
   }
 
   return sandboxRepoDir;
@@ -663,6 +732,7 @@ export async function promoteSupervisorBuildLock(
   supervisorUrl: string,
   hostSecret: string | undefined,
   leaseId: string,
+  clock: Clock = realClock,
 ): Promise<boolean> {
   const base = supervisorUrl.replace(/\/+$/, '');
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -672,11 +742,20 @@ export async function promoteSupervisorBuildLock(
       method: 'POST',
       headers,
       body: JSON.stringify({ leaseId }),
+      signal: clock.timeoutSignal(BUILD_LOCK_CALL_TIMEOUT_MS),
     });
-    if (!res.ok) return false;
-    const data = (await res.json().catch(() => ({}))) as { promoted?: boolean };
+    if (!res.ok) {
+      logger.warn('verify: build lock promotion refused by supervisor', { leaseId, status: res.status });
+      return false;
+    }
+    // an unreadable answer is treated as "not promoted": the caller restarts the run in foreground
+    const data = (await orDefault(res.json(), {}, 'verify: parse build lock promotion response', {
+      fields: { leaseId },
+    })) as { promoted?: boolean };
     return Boolean(data.promoted);
-  } catch {
+  } catch (err) {
+    // supervisor unreachable: same safe answer (caller aborts the speculative run and starts fresh)
+    ignore(err, 'verify: promote build lock lease', { leaseId });
     return false;
   }
 }
@@ -701,15 +780,35 @@ export async function withSupervisorBuildLock<T>(
     headers['Authorization'] = `Bearer ${opts.hostSecret}`;
   }
 
-  const res = await fetch(`${supervisorUrl}/internal/build-lock/acquire`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ sessionId: opts?.sessionId || 'unknown', priority }),
-    signal: opts?.signal,
-  });
+  // The response headers must arrive within BUILD_LOCK_ACQUIRE_HEADERS_TIMEOUT_MS (on the injected clock); the
+  // NDJSON body then stays open while queued / holding the lease, bounded by the caller's signal and
+  // the supervisor's own queue timeout + lease ceiling.
+  const clock = opts?.clock ?? realClock;
+  const acquireAc = new AbortController();
+  const onCallerAbort = () => acquireAc.abort(opts?.signal?.reason);
+  if (opts?.signal?.aborted) onCallerAbort();
+  else opts?.signal?.addEventListener('abort', onCallerAbort, { once: true });
+  const headerTimer = clock.setTimeout(() => {
+    acquireAc.abort(new DOMException('Build lock acquire: no response from supervisor', 'TimeoutError'));
+  }, BUILD_LOCK_ACQUIRE_HEADERS_TIMEOUT_MS);
+  headerTimer.unref?.();
+  let res: Response;
+  try {
+    res = await fetch(`${supervisorUrl}/internal/build-lock/acquire`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ sessionId: opts?.sessionId || 'unknown', priority }),
+      signal: acquireAc.signal,
+    });
+  } catch (err) {
+    opts?.signal?.removeEventListener('abort', onCallerAbort);
+    throw err;
+  } finally {
+    clock.clearTimeout(headerTimer);
+  }
 
   if (!res.ok || !res.body) {
-    const text = await res.text().catch(() => res.statusText);
+    const text = await orDefault(res.text(), res.statusText, 'build lock: read acquire error body');
     throw new Error(`Failed to acquire build lock (${res.status}): ${text}`);
   }
 
@@ -719,9 +818,10 @@ export async function withSupervisorBuildLock<T>(
   let leaseId = '';
   let preempted = false;
 
-  const parseLine = (line: string): 'acquired' | 'preempted' | 'other' => {
+  let revoked = false;
+  const parseLine = (line: string): 'acquired' | 'preempted' | 'revoked' | 'other' => {
     const evt = JSON.parse(line) as {
-      event: 'queued' | 'acquired' | 'preempted' | 'timeout' | 'error';
+      event: 'queued' | 'acquired' | 'preempted' | 'revoked' | 'heartbeat' | 'timeout' | 'error';
       position?: number;
       leaseId?: string;
       message?: string;
@@ -744,6 +844,14 @@ export async function withSupervisorBuildLock<T>(
       opts?.onPreempted?.();
       return 'preempted';
     }
+    if (evt.event === 'revoked') {
+      if (!revoked) {
+        revoked = true;
+        logger.warn('build lock revoked by supervisor; aborting build', { leaseId, reason: evt.message });
+        opts?.onLeaseRevoked?.();
+      }
+      return 'revoked';
+    }
     if (evt.event === 'timeout' || evt.event === 'error') {
       throw new Error(evt.message || 'Timed out waiting for build queue');
     }
@@ -756,13 +864,13 @@ export async function withSupervisorBuildLock<T>(
     readerClosed = true;
     try {
       await reader.cancel();
-    } catch {
-      // ignore
+    } catch (err) {
+      ignoreExpected(err, 'build lock: cancel stream reader');
     }
     try {
       reader.releaseLock();
-    } catch {
-      // ignore
+    } catch (err) {
+      ignoreExpected(err, 'build lock: release stream reader');
     }
   };
 
@@ -800,8 +908,9 @@ export async function withSupervisorBuildLock<T>(
     throw new Error('Build lock stream closed before lock was acquired');
   }
 
-  // For speculative leases, keep reading the open NDJSON stream so preemption events fire immediately
-  if (priority === 'speculative') {
+  // Keep reading the open NDJSON stream for every lease so preemption (speculative) and revocation
+  // (any priority, W7) events abort the running build immediately.
+  {
     void (async () => {
       try {
         while (!readerClosed) {
@@ -814,9 +923,10 @@ export async function withSupervisorBuildLock<T>(
               buffer = buffer.slice(nl + 1);
               if (line) {
                 try {
-                  if (parseLine(line) === 'preempted') return;
-                } catch {
-                  // ignore malformed trailing line
+                  const kind = parseLine(line);
+                  if (kind === 'preempted' || kind === 'revoked') return;
+                } catch (e) {
+                  ignore(e, 'build lock: malformed stream line');
                 }
               }
               nl = buffer.indexOf('\n');
@@ -824,12 +934,11 @@ export async function withSupervisorBuildLock<T>(
           }
           if (done) break;
         }
-      } catch {
-        // stream aborted on release/promote
+      } catch (err) {
+        // stream aborted on release/promote: expected
+        ignoreExpected(err, 'build lock: stream watcher ended');
       }
     })();
-  } else {
-    await closeReader();
   }
 
   try {
@@ -842,12 +951,15 @@ export async function withSupervisorBuildLock<T>(
           method: 'POST',
           headers,
           body: JSON.stringify({ leaseId }),
-          signal: AbortSignal.timeout(5_000),
+          signal: clock.timeoutSignal(BUILD_LOCK_CALL_TIMEOUT_MS),
         });
         if (relRes.ok) break;
-      } catch {
-        if (attempt === 0) await new Promise((r) => setTimeout(r, 150));
+        logger.warn('build lock: release refused', { leaseId, status: relRes.status, attempt });
+      } catch (err) {
+        // the supervisor also reclaims the lease when this stream closes / the lease times out
+        ignore(err, 'build lock: release lease', { leaseId, attempt });
       }
+      if (attempt === 0) await sleepOn(clock, 150);
     }
   }
 }
@@ -876,6 +988,8 @@ interface InFlightVerify {
 interface RepoVerifyState {
   cache: Map<string, { allPassed: boolean; results: VerificationCheckResult[] }>;
   inFlight: InFlightVerify | null;
+  /** Drives every timer of this repo's verification runs (shell timeouts, kill escalation, backoff). */
+  clock: Clock;
 }
 
 const MAX_CACHE_ENTRIES = 8;
@@ -885,10 +999,23 @@ function getRepoState(repoRoot: string): RepoVerifyState {
   const key = path.resolve(repoRoot);
   let state = repoStates.get(key);
   if (!state) {
-    state = { cache: new Map(), inFlight: null };
+    state = { cache: new Map(), inFlight: null, clock: realClock };
     repoStates.set(key, state);
   }
   return state;
+}
+
+/**
+ * Injects the clock used by verification runs for `repoRoot` (createRunner passes its clock; tests
+ * pass a ManualClock). Returns a function restoring the previous clock.
+ */
+export function configureVerification(repoRoot: string, deps: { clock?: Clock }): () => void {
+  const state = getRepoState(repoRoot);
+  const prev = state.clock;
+  state.clock = deps.clock ?? realClock;
+  return () => {
+    state.clock = prev;
+  };
 }
 
 function setCachedResult(
@@ -938,7 +1065,11 @@ export async function runSpeculativeVerification(
       priority: 'speculative',
     });
     return res.aborted ? null : res;
-  } catch {
+  } catch (err) {
+    // Speculative work is optional: preemption / invalidation aborts are routine (debug); anything
+    // else (supervisor down, git failure) is logged and the foreground verify will retry for real
+    if (isAbortLikeError(err)) ignoreExpected(err, 'verify: speculative run aborted', { repoRoot });
+    else ignore(err, 'verify: speculative run failed', { repoRoot });
     return null;
   }
 }
@@ -978,11 +1109,12 @@ export async function runAllVerificationChecks(
               existing.supervisorUrl,
               existing.hostSecret,
               existing.leaseId,
+              state.clock,
             );
             if (!promoted) {
               // Lease was already preempted by another session: abort the speculative run and start fresh
               existing.abortController.abort();
-              await existing.promise.catch(() => {});
+              await existing.promise.catch((e) => ignoreExpected(e, 'verify: aborted speculative run'));
               continue;
             }
           }
@@ -1002,7 +1134,7 @@ export async function runAllVerificationChecks(
       if (existing.priority === 'speculative') {
         // Abort stale speculative run (different tree or already aborting)
         existing.abortController.abort();
-        await existing.promise.catch(() => {});
+        await existing.promise.catch((e) => ignoreExpected(e, 'verify: aborted stale speculative run'));
         continue;
       }
 
@@ -1010,7 +1142,8 @@ export async function runAllVerificationChecks(
       if (priority === 'speculative') {
         return { allPassed: false, results: [], aborted: true };
       }
-      await existing.promise.catch(() => {});
+      // the other run's outcome belongs to its caller; we only wait for it to finish
+      await existing.promise.catch((e) => ignoreExpected(e, 'verify: waited on foreground run for another tree'));
       continue;
     }
 
@@ -1037,6 +1170,7 @@ export async function runAllVerificationChecks(
         const outcome = await withSupervisorBuildLock(
           {
             ...lockOpts,
+            clock: lockOpts?.clock ?? state.clock,
             priority,
             signal: ac.signal,
             onLeaseAcquired: (leaseId) => {
@@ -1052,6 +1186,7 @@ export async function runAllVerificationChecks(
                   runEntry.supervisorUrl,
                   runEntry.hostSecret,
                   leaseId,
+                  state.clock,
                 );
               }
             },
@@ -1060,6 +1195,11 @@ export async function runAllVerificationChecks(
                 ac.abort();
                 lockOpts?.onPreempted?.();
               }
+            },
+            // Revocation applies to foreground leases too: stop the build (runShell kills its group)
+            onLeaseRevoked: () => {
+              ac.abort();
+              lockOpts?.onLeaseRevoked?.();
             },
           },
           async () => {
@@ -1070,14 +1210,16 @@ export async function runAllVerificationChecks(
               try {
                 targetRepoDir = await syncVerifySandboxToTree(repoRoot, treeSha, sandboxRoot);
               } catch (err) {
-                console.warn(
-                  '[halley-verify] Falling back to session workspace after verify-sandbox sync error:',
+                logger.warn('verify: sandbox sync failed; verifying in the session workspace', {
+                  repoRoot,
+                  treeSha,
                   err,
-                );
+                });
                 targetRepoDir = repoRoot;
               }
             }
             return runAllVerificationChecksUnlocked(targetRepoDir, {
+              clock: state.clock,
               signal: ac.signal,
               getPriority: () => runEntry.priority,
             });
@@ -1122,7 +1264,7 @@ export async function runAllVerificationChecks(
 
 async function runAllVerificationChecksUnlocked(
   repoRoot: string,
-  opts?: { signal?: AbortSignal; getPriority?: () => BuildPriority },
+  opts?: { signal?: AbortSignal; getPriority?: () => BuildPriority; clock?: Clock },
 ): Promise<InternalVerifyRunResult> {
   const results: VerificationCheckResult[] = [];
   const originalBase = await detectAstroBase(repoRoot);
@@ -1132,7 +1274,10 @@ async function runAllVerificationChecksUnlocked(
   try {
     const raw = await fs.readFile(path.join(repoRoot, '.halley.json'), 'utf8');
     halleyConfig = HalleyRepoConfigSchema.parse(JSON.parse(raw));
-  } catch {
+  } catch (err) {
+    // no .halley.json is the default setup; an invalid one silently falling back to the default
+    // checks would hide the repo's own checks, so that is a warning
+    ignoreUnlessMissing(err, 'verify: unreadable .halley.json; using default checks', { repoRoot });
     halleyConfig = undefined;
   }
 
@@ -1156,6 +1301,7 @@ async function runAllVerificationChecksUnlocked(
           break;
         }
         const res = await runShell(repoRoot, c.command, {
+          clock: opts?.clock,
           signal: opts?.signal,
           priority: opts?.getPriority?.() ?? 'foreground',
         });
@@ -1178,7 +1324,8 @@ async function runAllVerificationChecksUnlocked(
           scripts?: Record<string, string>;
         };
         scripts = pkg.scripts ?? {};
-      } catch {
+      } catch (err) {
+        ignoreUnlessMissing(err, 'verify: unreadable package.json; no npm checks', { repoRoot });
         scripts = {};
       }
 
@@ -1198,6 +1345,7 @@ async function runAllVerificationChecksUnlocked(
           break;
         }
         const res = await runShell(repoRoot, item.script, {
+          clock: opts?.clock,
           signal: opts?.signal,
           priority: opts?.getPriority?.() ?? 'foreground',
         });
@@ -1234,7 +1382,9 @@ async function runAllVerificationChecksUnlocked(
     };
   } finally {
     // Reclaim large dist/ output while keeping .astro/ warm across verification runs
-    await fs.rm(path.join(repoRoot, 'dist'), { recursive: true, force: true }).catch(() => {});
+    await fs
+      .rm(path.join(repoRoot, 'dist'), { recursive: true, force: true })
+      .catch((e) => ignore(e, 'verify: remove dist/ after verification'));
   }
 }
 

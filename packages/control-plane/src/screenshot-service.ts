@@ -1,5 +1,7 @@
 import type { VisualDiffHighlightDto, VisualDiffPageDto } from '@halley/shared';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { ignore, logger, orDefault } from './log.js';
 
 export type ScreenshotViewport = 'desktop' | 'mobile';
 
@@ -23,6 +25,34 @@ const DEFAULT_MAX_CONCURRENCY = Math.max(
   Number(process.env.HALLEY_SCREENSHOT_CONCURRENCY || 2) || 2,
 );
 const DEFAULT_SETTLE_WAIT_MS = 40;
+const DEFAULT_MAX_QUEUE = Math.max(0, Number(process.env.HALLEY_SCREENSHOT_MAX_QUEUE || 16) || 16);
+/** Covers queue wait + newContext + goto + readiness + screenshot + close. */
+const DEFAULT_CAPTURE_DEADLINE_MS = 60_000;
+const DEFAULT_RECYCLE_AFTER_CAPTURES = 200;
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+
+/** Too many captures already waiting: callers should answer 503 and let the client retry. */
+export class ScreenshotBusyError extends Error {
+  readonly status = 503;
+  constructor(queued: number) {
+    super(`Screenshot service is busy (${queued} captures already queued); please retry shortly`);
+    this.name = 'ScreenshotBusyError';
+  }
+}
+
+export class ScreenshotTimeoutError extends Error {
+  readonly status = 504;
+  constructor(ms: number) {
+    super(`Screenshot capture did not finish within ${ms}ms`);
+    this.name = 'ScreenshotTimeoutError';
+  }
+}
+
+/** Per-capture bookkeeping: the browser it used and the contexts it opened (closed on timeout). */
+interface CaptureLease {
+  browser: Browser | null;
+  contexts: Set<BrowserContext>;
+}
 const DEFAULT_LIVE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
 const DEFAULT_LIVE_CACHE_TTL_MS = 10 * 60_000;
 
@@ -59,6 +89,14 @@ export interface ScreenshotServiceOptions {
   liveCacheMaxBytes?: number;
   /** TTL for cached Live site captures (default: 10 minutes). */
   liveCacheTtlMs?: number;
+  /** Max captures waiting for a slot before new ones are rejected with ScreenshotBusyError (default 16). */
+  maxQueue?: number;
+  /** Deadline per capture including queue wait (default 60s). */
+  captureDeadlineMs?: number;
+  /** Relaunch Chromium after this many captures to bound leaks (default 200). */
+  recycleAfterCaptures?: number;
+  /** Time source for deadlines, idle close, launch/close bounds and cache TTLs (default: real time). */
+  clock?: Clock;
 }
 
 interface ByteCacheEntry<T> {
@@ -75,12 +113,13 @@ class ByteLruCache<T> {
     private readonly maxBytes: number,
     private readonly maxEntries: number,
     private readonly ttlMs: number,
+    private readonly clock: Clock,
   ) {}
 
   get(key: string): T | undefined {
     const entry = this.map.get(key);
     if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
+    if (this.clock.now() > entry.expiresAt) {
       this.delete(key);
       return undefined;
     }
@@ -102,7 +141,7 @@ class ByteLruCache<T> {
       this.delete(oldestKey);
     }
 
-    this.map.set(key, { value, bytes, expiresAt: Date.now() + this.ttlMs });
+    this.map.set(key, { value, bytes, expiresAt: this.clock.now() + this.ttlMs });
     this.totalBytes += bytes;
   }
 
@@ -145,21 +184,36 @@ export class ScreenshotService {
 
   private browser: Browser | null = null;
   private launchPromise: Promise<Browser> | null = null;
-  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleTimer: TimerHandle | null = null;
+  private readonly clock: Clock;
+  private readonly maxQueue: number;
+  private readonly captureDeadlineMs: number;
+  private readonly recycleAfterCaptures: number;
   private activeSlots = 0;
+  /** Waiters are granted a slot directly by the releasing capture (no window for queue-jumping). */
   private readonly waitQueue: Array<() => void> = [];
   private closed = false;
+  private capturesOnBrowser = 0;
+  private browserLeases = new Map<Browser, number>();
+  private retiredBrowsers = new Set<Browser>();
+  /** Counters for tests/metrics. */
+  readonly stats = { timeouts: 0, rejectedBusy: 0, recycles: 0 };
 
   private readonly liveCache: ByteLruCache<CompressedCapture>;
 
   constructor(opts: ScreenshotServiceOptions = {}) {
+    this.clock = opts.clock ?? realClock;
     this.idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.settleWaitMs = opts.settleWaitMs ?? DEFAULT_SETTLE_WAIT_MS;
     this.maxConcurrency = Math.max(1, opts.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY);
+    this.maxQueue = Math.max(0, opts.maxQueue ?? DEFAULT_MAX_QUEUE);
+    this.captureDeadlineMs = Math.max(1, opts.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS);
+    this.recycleAfterCaptures = Math.max(1, opts.recycleAfterCaptures ?? DEFAULT_RECYCLE_AFTER_CAPTURES);
     this.liveCache = new ByteLruCache<CompressedCapture>(
       opts.liveCacheMaxBytes ?? DEFAULT_LIVE_CACHE_MAX_BYTES,
       32,
       opts.liveCacheTtlMs ?? DEFAULT_LIVE_CACHE_TTL_MS,
+      this.clock,
     );
     this.launchBrowser =
       opts.launchBrowser ??
@@ -173,7 +227,7 @@ export class ScreenshotService {
 
   private clearIdleTimer(): void {
     if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
+      this.clock.clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
   }
@@ -183,13 +237,13 @@ export class ScreenshotService {
     if (this.closed || !this.browser || this.activeSlots > 0 || this.idleTimeoutMs <= 0) {
       return;
     }
-    this.idleTimer = setTimeout(() => {
+    // realClock timers are unref'd: a warm idle browser never keeps the process alive.
+    this.idleTimer = this.clock.setTimeout(() => {
       this.idleTimer = null;
       if (this.activeSlots === 0 && this.browser) {
         void this.closeBrowser();
       }
     }, this.idleTimeoutMs);
-    this.idleTimer.unref?.();
   }
 
   private async ensureBrowser(): Promise<Browser> {
@@ -199,18 +253,18 @@ export class ScreenshotService {
     this.browser = null;
 
     if (!this.launchPromise) {
-      let launchTimer: ReturnType<typeof setTimeout> | null = null;
+      let launchTimer: TimerHandle | null = null;
       let timedOut = false;
       const rawLaunch = this.launchBrowser();
       rawLaunch
         .then((b) => {
           if (timedOut || this.closed) {
-            void b.close().catch(() => {});
+            void b.close().catch((err) => ignore(err, 'screenshot: closing late-launched browser failed', {}, 'debug'));
           }
         })
-        .catch(() => {});
+        .catch((err) => ignore(err, 'screenshot: Chromium launch failed', {}, 'debug')); // surfaced via the race below
       const timeoutPromise = new Promise<never>((_, reject) => {
-        launchTimer = setTimeout(() => {
+        launchTimer = this.clock.setTimeout(() => {
           timedOut = true;
           reject(new Error('Timed out launching Chromium browser after 30s'));
         }, 30_000);
@@ -218,10 +272,11 @@ export class ScreenshotService {
       this.launchPromise = Promise.race([rawLaunch, timeoutPromise])
         .then((b) => {
           if (this.closed) {
-            void b.close().catch(() => {});
+            void b.close().catch((err) => ignore(err, 'screenshot: closing browser after shutdown failed', {}, 'debug'));
             throw new Error('ScreenshotService has been closed');
           }
           this.browser = b;
+          this.capturesOnBrowser = 0;
           b.on('disconnected', () => {
             if (this.browser === b) {
               this.browser = null;
@@ -231,7 +286,7 @@ export class ScreenshotService {
           return b;
         })
         .finally(() => {
-          if (launchTimer) clearTimeout(launchTimer);
+          this.clock.clearTimeout(launchTimer);
           this.launchPromise = null;
         });
     }
@@ -243,57 +298,180 @@ export class ScreenshotService {
     this.clearIdleTimer();
     const b = this.browser;
     this.browser = null;
-    if (b) {
-      await b.close().catch(() => {});
+    if (b) await this.closeBrowserBounded(b);
+  }
+
+  /** browser.close() can itself hang on a wedged Chromium: never wait more than a few seconds. */
+  private async closeBrowserBounded(b: Browser): Promise<void> {
+    let timer: TimerHandle | null = null;
+    await Promise.race([
+      b.close().catch((err) => ignore(err, 'screenshot: closing browser failed', {}, 'debug')),
+      new Promise<void>((resolve) => {
+        timer = this.clock.setTimeout(() => {
+          logger.warn('screenshot: browser close timed out; abandoning it');
+          resolve();
+        }, BROWSER_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+    this.clock.clearTimeout(timer);
+  }
+
+  /** Stops handing `b` to new captures; it is closed once its in-flight captures finish (or now). */
+  private retireBrowser(b: Browser, reason: string, force = false): void {
+    if (this.browser === b) {
+      this.browser = null;
+      this.capturesOnBrowser = 0;
+    }
+    if (this.retiredBrowsers.has(b) && !force) return;
+    this.retiredBrowsers.add(b);
+    this.stats.recycles += 1;
+    logger.info('screenshot: recycling Chromium', { reason });
+    if (force || (this.browserLeases.get(b) ?? 0) === 0) {
+      this.retiredBrowsers.delete(b);
+      void this.closeBrowserBounded(b);
     }
   }
 
-  private async withSlot<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  private async leaseBrowser(lease: CaptureLease): Promise<Browser> {
+    let b = await this.ensureBrowser();
+    if (this.capturesOnBrowser >= this.recycleAfterCaptures) {
+      this.retireBrowser(b, `served ${this.capturesOnBrowser} captures`);
+      b = await this.ensureBrowser();
+    }
+    this.capturesOnBrowser += 1;
+    this.browserLeases.set(b, (this.browserLeases.get(b) ?? 0) + 1);
+    lease.browser = b;
+    return b;
+  }
+
+  private releaseBrowser(lease: CaptureLease): void {
+    const b = lease.browser;
+    if (!b) return;
+    lease.browser = null;
+    const n = (this.browserLeases.get(b) ?? 1) - 1;
+    if (n <= 0) {
+      this.browserLeases.delete(b);
+      if (this.retiredBrowsers.delete(b)) void this.closeBrowserBounded(b);
+    } else {
+      this.browserLeases.set(b, n);
+    }
+  }
+
+  private async newLeasedContext(lease: CaptureLease, size: { width: number; height: number }): Promise<BrowserContext> {
+    const browser = await this.leaseBrowser(lease);
+    const context = await browser.newContext({
+      viewport: size,
+      deviceScaleFactor: 1,
+      reducedMotion: 'reduce',
+    });
+    lease.contexts.add(context);
+    return context;
+  }
+
+  private async closeContext(lease: CaptureLease, context: BrowserContext): Promise<void> {
+    lease.contexts.delete(context);
+    await context.close().catch((err) => ignore(err, 'screenshot: closing browser context failed', {}, 'debug'));
+  }
+
+  private acquireSlot(signal: AbortSignal | undefined, deadline: AbortSignal): Promise<void> {
+    if (this.activeSlots < this.maxConcurrency) {
+      this.activeSlots += 1;
+      return Promise.resolve();
+    }
+    if (this.waitQueue.length >= this.maxQueue) {
+      this.stats.rejectedBusy += 1;
+      return Promise.reject(new ScreenshotBusyError(this.waitQueue.length));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        signal?.removeEventListener('abort', onAbort);
+        deadline.removeEventListener('abort', onAbort);
+      };
+      // Called by releaseSlot(): the slot is transferred to us (activeSlots already counts it)
+      const grant = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        const idx = this.waitQueue.indexOf(grant);
+        if (idx !== -1) this.waitQueue.splice(idx, 1);
+        const reason = deadline.aborted ? deadline.reason : signal?.reason;
+        reject(reason instanceof Error ? reason : new Error('Screenshot request aborted'));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      deadline.addEventListener('abort', onAbort, { once: true });
+      this.waitQueue.push(grant);
+    });
+  }
+
+  private releaseSlot(): void {
+    const next = this.waitQueue.shift();
+    if (next) {
+      next(); // hand the slot over
+      return;
+    }
+    this.activeSlots -= 1;
+    if (this.activeSlots === 0) this.scheduleIdleClose();
+  }
+
+  /**
+   * Runs one capture under a concurrency slot and a hard deadline covering the queue wait and all
+   * browser work. On timeout the capture's contexts are closed and its browser is recycled: a
+   * hung-but-connected Chromium must not pin slots forever.
+   */
+  private async withSlot<T>(fn: (lease: CaptureLease) => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.closed) {
       throw new Error('ScreenshotService has been closed');
     }
     if (signal?.aborted) {
       throw signal.reason instanceof Error ? signal.reason : new Error('Screenshot request aborted');
     }
-    if (this.activeSlots >= this.maxConcurrency) {
-      await new Promise<void>((resolve, reject) => {
-        const wake = () => {
-          signal?.removeEventListener('abort', onAbort);
-          resolve();
-        };
-        const onAbort = () => {
-          const idx = this.waitQueue.indexOf(wake);
-          if (idx !== -1) this.waitQueue.splice(idx, 1);
-          reject(
-            signal?.reason instanceof Error
-              ? signal.reason
-              : new Error('Screenshot request aborted'),
-          );
-        };
-        signal?.addEventListener('abort', onAbort, { once: true });
-        this.waitQueue.push(wake);
-      });
-    }
-    if (this.closed) {
-      throw new Error('ScreenshotService has been closed');
-    }
-    if (signal?.aborted) {
-      const next = this.waitQueue.shift();
-      if (next) next();
-      throw signal.reason instanceof Error ? signal.reason : new Error('Screenshot request aborted');
-    }
-    this.activeSlots += 1;
-    this.clearIdleTimer();
+    const deadline = new AbortController();
+    const deadlineMs = this.captureDeadlineMs;
+    const timer = this.clock.setTimeout(() => deadline.abort(new ScreenshotTimeoutError(deadlineMs)), deadlineMs);
     try {
-      return await fn();
-    } finally {
-      this.activeSlots -= 1;
-      const next = this.waitQueue.shift();
-      if (next) {
-        next();
-      } else if (this.activeSlots === 0) {
-        this.scheduleIdleClose();
+      await this.acquireSlot(signal, deadline.signal);
+    } catch (err) {
+      this.clock.clearTimeout(timer);
+      if (err instanceof ScreenshotTimeoutError) this.stats.timeouts += 1;
+      throw err;
+    }
+    const lease: CaptureLease = { browser: null, contexts: new Set() };
+    try {
+      if (this.closed) {
+        throw new Error('ScreenshotService has been closed');
       }
+      if (signal?.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error('Screenshot request aborted');
+      }
+      this.clearIdleTimer();
+      const work = fn(lease);
+      const timedOut = new Promise<never>((_, reject) => {
+        const onDeadline = () => reject(deadline.signal.reason);
+        if (deadline.signal.aborted) onDeadline();
+        else deadline.signal.addEventListener('abort', onDeadline, { once: true });
+      });
+      try {
+        return await Promise.race([work, timedOut]);
+      } catch (err) {
+        if (err instanceof ScreenshotTimeoutError) {
+          this.stats.timeouts += 1;
+          // The hung work keeps running detached; make sure its eventual rejection is observed
+          work.catch((lateErr) => ignore(lateErr, 'screenshot: timed-out capture finished with an error', {}, 'debug'));
+          logger.warn('screenshot: capture timed out; closing its contexts and recycling Chromium', {
+            deadlineMs,
+            contexts: lease.contexts.size,
+          });
+          for (const ctx of lease.contexts) void this.closeContext(lease, ctx);
+          if (lease.browser) this.retireBrowser(lease.browser, 'capture timed out', true);
+        }
+        throw err;
+      }
+    } finally {
+      this.clock.clearTimeout(timer);
+      this.releaseBrowser(lease);
+      this.releaseSlot();
     }
   }
 
@@ -311,7 +489,7 @@ export class ScreenshotService {
           this.scheduleIdleClose();
         }
       })
-      .catch(() => {});
+      .catch((err) => ignore(err, 'screenshot: prewarming Chromium failed', {}));
   }
 
   private async gotoAndReady(
@@ -411,14 +589,16 @@ export class ScreenshotService {
             });
           }
         }, DETERMINISTIC_CAPTURE_CSS)
-        .catch(() => {});
+        .catch((err) => ignore(err, 'screenshot: addInitScript failed', { url }, 'debug'));
     }
 
     const res = await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
 
     if (typeof (page as { addStyleTag?: unknown }).addStyleTag === 'function') {
-      await page.addStyleTag({ content: DETERMINISTIC_CAPTURE_CSS }).catch(() => {});
       await page
+        .addStyleTag({ content: DETERMINISTIC_CAPTURE_CSS })
+        .catch((err) => ignore(err, 'screenshot: addStyleTag failed', { url }, 'debug'));
+      const readiness = await page
         .evaluate(
           async ({ eagerAll, maxY }: { eagerAll: boolean; maxY: number }) => {
             type ImgLike = {
@@ -459,7 +639,9 @@ export class ScreenshotService {
               };
             };
             const doc = g.document;
-            if (!doc) return;
+            // Browser-side failures (font/image decode) are counted and reported back to Node
+            const failures = { fonts: 0, images: 0 };
+            if (!doc) return failures;
 
             const nextFrame = () =>
               new Promise<void>((resolve) => {
@@ -552,13 +734,19 @@ export class ScreenshotService {
             const waitFonts = async () => {
               if (!doc.fonts) return;
               if (doc.fonts.ready) {
-                await doc.fonts.ready.catch(() => {});
+                await doc.fonts.ready.catch(() => {
+                  failures.fonts += 1;
+                });
               }
               if (typeof doc.fonts[Symbol.iterator] === 'function') {
                 const activeFontLoads: Array<Promise<unknown>> = [];
                 for (const face of doc.fonts as Iterable<FontFaceLike>) {
                   if (face.status === 'loading' && face.loaded) {
-                    activeFontLoads.push(face.loaded.catch(() => {}));
+                    activeFontLoads.push(
+                      face.loaded.catch(() => {
+                        failures.fonts += 1;
+                      }),
+                    );
                   }
                 }
                 if (activeFontLoads.length > 0) {
@@ -599,7 +787,9 @@ export class ScreenshotService {
                     });
                   }
                   if (typeof img.decode === 'function' && (img.naturalWidth ?? 0) > 0) {
-                    await img.decode().catch(() => {});
+                    await img.decode().catch(() => {
+                      failures.images += 1;
+                    });
                   }
                 };
                 imgPromises.push(waitImg());
@@ -654,7 +844,9 @@ export class ScreenshotService {
                       });
                     }
                     if (typeof bgImg.decode === 'function' && (bgImg.naturalWidth ?? 0) > 0) {
-                      await bgImg.decode().catch(() => {});
+                      await bgImg.decode().catch(() => {
+                        failures.images += 1;
+                      });
                     }
                   })(),
                 );
@@ -673,10 +865,17 @@ export class ScreenshotService {
             }
             await nextFrame();
             await nextFrame();
+            return failures;
           },
           { eagerAll: loadAllImages, maxY: maxImageY },
         )
-        .catch(() => {});
+        .catch((err) => {
+          ignore(err, 'screenshot: readiness script failed; capturing anyway', { url }, 'debug');
+          return null;
+        });
+      if (readiness && (readiness.fonts > 0 || readiness.images > 0)) {
+        logger.debug('screenshot: some fonts/images failed to load before capture', { url, ...readiness });
+      }
     }
 
     if (this.settleWaitMs > 0) {
@@ -700,7 +899,7 @@ export class ScreenshotService {
     if (typeof (context as { newCDPSession?: unknown }).newCDPSession === 'function') {
       try {
         const cdp = await context.newCDPSession(page);
-        let cdpTimer: ReturnType<typeof setTimeout> | null = null;
+        let cdpTimer: TimerHandle | null = null;
         try {
           const result = (await Promise.race([
             cdp.send('Page.captureScreenshot', {
@@ -710,7 +909,7 @@ export class ScreenshotService {
               clip: { x: 0, y: 0, width, height: captureHeight, scale: 1 },
             }),
             new Promise<never>((_, reject) => {
-              cdpTimer = setTimeout(
+              cdpTimer = this.clock.setTimeout(
                 () => reject(new Error('CDP Page.captureScreenshot timed out after 20s')),
                 20_000,
               );
@@ -724,11 +923,12 @@ export class ScreenshotService {
             };
           }
         } finally {
-          if (cdpTimer) clearTimeout(cdpTimer);
-          await cdp.detach().catch(() => {});
+          this.clock.clearTimeout(cdpTimer);
+          await cdp.detach().catch((err) => ignore(err, 'screenshot: CDP detach failed', {}, 'debug'));
         }
-      } catch {
+      } catch (err) {
         // Fall back to Playwright JPEG screenshot below
+        ignore(err, 'screenshot: CDP WebP capture failed; falling back to JPEG', {}, 'debug');
       }
     }
 
@@ -753,14 +953,9 @@ export class ScreenshotService {
       return Promise.reject(new Error('ScreenshotService has been closed'));
     }
 
-    return this.withSlot(async () => {
+    return this.withSlot(async (lease) => {
       const size = VIEWPORT_SIZES[req.viewport];
-      const browser = await this.ensureBrowser();
-      const context = await browser.newContext({
-        viewport: size,
-        deviceScaleFactor: 1,
-        reducedMotion: 'reduce',
-      });
+      const context = await this.newLeasedContext(lease, size);
       try {
         const page = await context.newPage();
         await this.gotoAndReady(page, req.url, 25_000, {
@@ -770,11 +965,15 @@ export class ScreenshotService {
         if (req.fullPage) {
           let captureHeight = size.height;
           if (typeof page.evaluate === 'function') {
-            const docHeight = await page
-              .evaluate<number>(
+            const docHeight = await orDefault(
+              page.evaluate<number>(
                 'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
-              )
-              .catch(() => size.height);
+              ),
+              size.height,
+              'screenshot: measuring document height failed; using viewport height',
+              {},
+              'debug',
+            );
             captureHeight = Math.min(Math.max(docHeight || size.height, size.height), MAX_FULL_PAGE_HEIGHT);
           }
           const data = await page.screenshot({
@@ -788,7 +987,7 @@ export class ScreenshotService {
         const data = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
         return { data, mimeType: 'image/jpeg', width: size.width, height: size.height };
       } finally {
-        await context.close().catch(() => {});
+        await this.closeContext(lease, context);
       }
     });
   }
@@ -801,28 +1000,29 @@ export class ScreenshotService {
     fallbackTitle: string,
     signal?: AbortSignal,
   ): Promise<{ title: string; capture: CompressedCapture; highlights: VisualDiffHighlightDto[] } | null> {
-    return this.withSlot(async () => {
-      const browser = await this.ensureBrowser();
-      const context = await browser.newContext({
-        viewport: size,
-        deviceScaleFactor: 1,
-        reducedMotion: 'reduce',
-      });
+    return this.withSlot(async (lease) => {
+      const context = await this.newLeasedContext(lease, size);
       try {
         const page = await context.newPage();
         await this.gotoAndReady(page, draftUrl, 20_000, {
           loadAllImages: true,
           maxImageY: MAX_REVIEW_CAPTURE_HEIGHT,
         });
-        const title = (await page.title().catch(() => '')) || fallbackTitle;
+        const title =
+          (await orDefault(page.title(), '', 'screenshot: reading page title failed; using fallback', { draftUrl }, 'debug')) ||
+          fallbackTitle;
 
         let captureHeight = size.height;
         if (typeof page.evaluate === 'function') {
-          const docHeight = await page
-            .evaluate<number>(
+          const docHeight = await orDefault(
+            page.evaluate<number>(
               'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
-            )
-            .catch(() => size.height);
+            ),
+            size.height,
+            'screenshot: measuring document height failed; using viewport height',
+            {},
+            'debug',
+          );
           captureHeight = Math.min(
             Math.max(docHeight || size.height, size.height),
             MAX_REVIEW_CAPTURE_HEIGHT,
@@ -831,12 +1031,23 @@ export class ScreenshotService {
 
         const capture = await this.captureFullPageCompressed(context, page, size.width, captureHeight);
         return { title, capture, highlights: [] };
-      } catch {
+      } catch (err) {
+        // Review pages render a placeholder for a failed draft capture
+        ignore(err, 'screenshot: draft capture failed', { url: draftUrl });
         return null;
       } finally {
-        await context.close().catch(() => {});
+        await this.closeContext(lease, context);
       }
-    }, signal);
+    }, signal).catch((err) => this.nullOnTimeout(err, draftUrl));
+  }
+
+  /** Review captures degrade to "no screenshot" on timeout; busy/abort/closed still propagate. */
+  private nullOnTimeout(err: unknown, url: string): null {
+    if (err instanceof ScreenshotTimeoutError) {
+      ignore(err, 'screenshot: review capture timed out', { url });
+      return null;
+    }
+    throw err;
   }
 
   private async captureLiveFull(
@@ -850,16 +1061,11 @@ export class ScreenshotService {
     const cached = this.liveCache.get(cacheKey);
     if (cached) return cached;
 
-    return this.withSlot(async () => {
+    return this.withSlot(async (lease) => {
       const afterWait = this.liveCache.get(cacheKey);
       if (afterWait) return afterWait;
 
-      const browser = await this.ensureBrowser();
-      const context = await browser.newContext({
-        viewport: size,
-        deviceScaleFactor: 1,
-        reducedMotion: 'reduce',
-      });
+      const context = await this.newLeasedContext(lease, size);
       try {
         const livePage = await context.newPage();
         const liveRes = await this.gotoAndReady(livePage, liveUrl, 15_000, {
@@ -871,11 +1077,15 @@ export class ScreenshotService {
         }
         let liveHeight = size.height;
         if (typeof livePage.evaluate === 'function') {
-          const liveDocHeight = await livePage
-            .evaluate<number>(
+          const liveDocHeight = await orDefault(
+            livePage.evaluate<number>(
               'Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0)',
-            )
-            .catch(() => size.height);
+            ),
+            size.height,
+            'screenshot: measuring live document height failed; using viewport height',
+            {},
+            'debug',
+          );
           liveHeight = Math.min(
             Math.max(liveDocHeight || size.height, size.height),
             MAX_REVIEW_CAPTURE_HEIGHT,
@@ -884,12 +1094,13 @@ export class ScreenshotService {
         const captured = await this.captureFullPageCompressed(context, livePage, size.width, liveHeight);
         this.liveCache.set(cacheKey, captured, captured.byteLength);
         return captured;
-      } catch {
+      } catch (err) {
+        ignore(err, 'screenshot: live site capture failed', { url: liveUrl }, 'debug');
         return null;
       } finally {
-        await context.close().catch(() => {});
+        await this.closeContext(lease, context);
       }
-    }, signal);
+    }, signal).catch((err) => this.nullOnTimeout(err, liveUrl));
   }
 
   /**
@@ -1014,13 +1225,20 @@ export class ScreenshotService {
     this.closed = true;
     this.clearIdleTimer();
     this.liveCache.clear();
+    // Wake every waiter: each is granted a slot, sees `closed`, throws, and releases it again
     while (this.waitQueue.length > 0) {
+      this.activeSlots += 1;
       this.waitQueue.shift()?.();
     }
     if (this.launchPromise) {
-      const b = await this.launchPromise.catch(() => null);
-      if (b) await b.close().catch(() => {});
+      const b = await this.launchPromise.catch((err) => {
+        ignore(err, 'screenshot: pending launch failed during close', {}, 'debug');
+        return null;
+      });
+      if (b) await this.closeBrowserBounded(b);
     }
+    for (const b of this.retiredBrowsers) void this.closeBrowserBounded(b);
+    this.retiredBrowsers.clear();
     await this.closeBrowser();
   }
 }

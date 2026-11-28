@@ -254,7 +254,18 @@ export interface LiveRunStateDto {
   };
 }
 
-export type ChatServerMessage =
+/**
+ * Ordering metadata stamped by the workspace runner on every server→client WebSocket frame.
+ * Both fields are optional so clients keep working against older runners that omit them.
+ */
+export interface ServerFrameSequence {
+  /** Monotonic per-epoch frame counter (increments by 1 for every frame sent on the session). */
+  seq?: number;
+  /** Identifies one runner boot; a change means the server restarted and seq restarted too. */
+  epoch?: string;
+}
+
+export type ChatServerMessage = ServerFrameSequence & (
   | {
       type: 'transcript_state';
       entries: TranscriptEntryDto[];
@@ -316,7 +327,8 @@ export type ChatServerMessage =
   | {
       type: 'error';
       message: string;
-    };
+    }
+);
 
 export const HalleyRepoConfigSchema = z.object({
   checks: z

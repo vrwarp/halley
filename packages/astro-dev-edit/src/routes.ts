@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { parse } from '@astrojs/compiler';
+import { ignoreMissingPath } from './diagnostics.js';
 import type { PageSectionOptionDto, SiteRouteEntryDto } from '@halley/shared';
 
 export type SiteRouteEntry = SiteRouteEntryDto;
@@ -108,7 +109,8 @@ async function walkPages(
   let entries;
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    ignoreMissingPath(`reading pages directory ${dir}`, err);
     return;
   }
 
@@ -149,8 +151,9 @@ async function walkPages(
       const [src, stat] = await Promise.all([fs.readFile(full, 'utf8'), fs.stat(full)]);
       unlisted = await isPageSourceUnlisted(src, ext);
       mtimeMs = stat.mtimeMs;
-    } catch {
-      // ignore
+    } catch (err) {
+      // ENOENT: page removed between readdir and read — list it without metadata.
+      ignoreMissingPath(`reading page metadata for ${full}`, err);
     }
 
     routes.push({
@@ -185,8 +188,9 @@ async function discoverGeneratedContentRoutes(
         const slug = f.name.slice(0, -ext.length);
         generated.push(`/${prefix}/${slug}`);
       }
-    } catch {
-      // collection directory doesn't match route prefix — ignore
+    } catch (err) {
+      // collection directory doesn't match route prefix (ENOENT/ENOTDIR) — expected
+      ignoreMissingPath(`listing content collection ${collectionDir}`, err);
     }
   }
   generated.sort();

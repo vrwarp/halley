@@ -258,12 +258,21 @@ describe('PageCreationService & verification checks', () => {
       expect(blocked).toBeNull();
       await fs.rm(path.join(repoDir, '.git/MERGE_HEAD'), { force: true });
 
-      // FifoBuildQueue releases a stuck active lease automatically after maxLeaseMs
+      // FifoBuildQueue terminates a stuck active lease after maxLeaseMs (via its kill callback) and
+      // only then admits the next build (W7: it no longer just forgets the still-running holder)
       const queue = new FifoBuildQueue(1000, 80);
-      const lease1 = await queue.acquire('sess-stuck', { timeoutMs: 1000, priority: 'foreground' });
+      let killedStuck = false;
+      const lease1 = await queue.acquire('sess-stuck', {
+        timeoutMs: 1000,
+        priority: 'foreground',
+        onTerminate: () => {
+          killedStuck = true;
+        },
+      });
       const start = Date.now();
       const lease2 = await queue.acquire('sess-next', { timeoutMs: 1000, priority: 'foreground' });
       expect(Date.now() - start).toBeGreaterThanOrEqual(60);
+      expect(killedStuck).toBe(true);
       expect(lease1.leaseId).not.toBe(lease2.leaseId);
       lease2.release();
     } finally {

@@ -18,6 +18,7 @@ import { api } from '../api.js';
 import { BranchOffModal } from '../components/BranchOffModal.js';
 import { HalleyLogo } from '../components/HalleyLogo.js';
 import { InstallAppButton } from '../components/InstallAppButton.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   user: UserDto;
@@ -134,8 +135,8 @@ export function DashboardPage({
     try {
       const res = await api.listHistory();
       setHistory(res.entries);
-    } catch {
-      // ignore
+    } catch (err) {
+      reportIgnored(err, 'publish history unavailable');
     } finally {
       setLoadingHistory(false);
     }

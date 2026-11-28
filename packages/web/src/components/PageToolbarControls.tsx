@@ -7,6 +7,7 @@ import {
 import { Eye, EyeOff, Loader2, Pencil } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../api.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   sessionId: string;
@@ -61,8 +62,9 @@ export function PageToolbarControls({
     try {
       const opts = await api.getPageOptions(sessionId);
       setOptions(opts);
-    } catch {
-      // ignore
+    } catch (err) {
+      // The rename popover still works with free-form section/slug input.
+      reportIgnored(err, 'page options unavailable for rename popover');
     }
   };
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { reportIgnored } from '../lib/retry.js';
 
 export interface PwaUpdateState {
   updateAvailable: boolean;
@@ -58,8 +59,9 @@ export function usePwaUpdate(): PwaUpdateState {
             }
           });
         });
-      } catch {
+      } catch (err) {
         // Non-HTTPS LAN environments fall back cleanly to Referer-scoped routing
+        console.info('[halley] service worker not registered; using Referer-scoped routing', err);
       }
     };
 
@@ -68,7 +70,9 @@ export function usePwaUpdate(): PwaUpdateState {
     // Check for updates when returning to the tab/app
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible' && registrationRef) {
-        void registrationRef.update().catch(() => {});
+        void registrationRef
+          .update()
+          .catch((err) => reportIgnored(err, 'service worker update check failed; retried on next focus'));
       }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);

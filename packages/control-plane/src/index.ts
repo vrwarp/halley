@@ -3,71 +3,57 @@ import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import {
-  AdminAllowlistCreateSchema,
-  AdminGrantExtraSchema,
-  AdminSpendCapSchema,
-  CreateSessionRequestSchema,
-  PublishRequestSchema,
-  RevertSessionCreateSchema,
-  SyncStartRequestSchema,
-  UpdateSessionRequestSchema,
-  type ChatServerMessage,
-  type LiveHistoryEntryDto,
-  type PublishProgressPayload,
-  type RevertedCommitSummaryDto,
-  type UserDto,
-} from '@halley/shared';
-import { deriveWorkspaceToken } from '@halley/shared/auth';
+import { type ChatServerMessage, type PublishProgressPayload, type UserDto } from '@halley/shared';
 import { serve } from '@hono/node-server';
-import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from './auth/google.js';
 import { loadConfig, resolveLiveSiteUrl, type HalleyConfig } from './config.js';
+import { realClock, type Clock, type ControlPlaneDeps } from './clock.js';
 import { ControlPlaneDb } from './db.js';
-import { WorkspaceCrashLoopError, runGit, type WorkspaceDriver } from './drivers/workspace-driver.js';
+import { type WorkspaceDriver } from './drivers/workspace-driver.js';
 import { WorkspaceHostDriver } from './drivers/workspace-host-driver.js';
-import { createInternalGitHttpHandler } from './git-http.js';
 import { GitHubService } from './github/client.js';
-import { buildContinuationHandoffSummary, buildUndoHandoffSummary } from './handoff.js';
-import { createLlmProxyHandler, hashWorkspaceToken } from './proxy/llm-proxy.js';
-import {
-  HALLEY_PREVIEW_SW_JS,
-  createPreviewProxy,
-  isAllowedWsOrigin,
-} from './proxy/preview-proxy.js';
+import { ignore, isLogLevelEnabled, log, logger } from './log.js';
+import { REQUEST_ID_HEADER, resolveRequestId, runWithContext } from './request-context.js';
+import { createRunnerClient } from './runner-client.js';
 import { startSessionReaper } from './reaper.js';
 import { OptimizeService } from './routes/optimize.js';
 import { PublishService } from './routes/publish.js';
-import { ScreenshotService, type ScreenshotViewport } from './screenshot-service.js';
-
-type Env = {
-  Variables: {
-    user: UserDto;
-  };
-};
-
-function slugify(text: string): string {
-  return (
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 32) || 'edit'
-  );
-}
+import { ScreenshotBusyError, ScreenshotService } from './screenshot-service.js';
+import { register as registerHealth } from './routes/health.js';
+import { register as registerInternal } from './routes/internal.js';
+import { register as registerAuth } from './routes/auth.js';
+import { register as registerSessions } from './routes/sessions.js';
+import { register as registerWorkspace } from './routes/workspace.js';
+import { register as registerReview } from './routes/review.js';
+import { register as registerActions } from './routes/session-actions.js';
+import { register as registerAdmin } from './routes/admin.js';
+import { register as registerStatic } from './static.js';
+import { register as registerWs } from './ws-bridge.js';
+import { type ControlPlaneContext, type Env } from './control-plane-context.js';
 
 export function createControlPlane(
   config: HalleyConfig,
   customDriver?: WorkspaceDriver,
   customScreenshotService?: ScreenshotService,
+  deps: ControlPlaneDeps = {},
 ) {
-  const db = new ControlPlaneDb(path.join(config.dataDir, 'control-plane.sqlite'), config);
-  const auth = new AuthService(config, db);
-  const github = new GitHubService(config);
+  const clock = deps.clock ?? realClock;
+  const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
+  const nowIso = () => new Date(clock.now()).toISOString();
+  // Every workspace-runner call in this module goes through the injected transport
+  const { runnerFetch } = createRunnerClient(deps.fetch, clock);
+  const db =
+    deps.db ??
+    new ControlPlaneDb(path.join(config.dataDir, 'control-plane.sqlite'), config, { clock, randomUUID });
+  const auth = deps.auth ?? new AuthService(config, db, { clock, fetch: deps.fetch });
+  const github = deps.github ?? new GitHubService(config, undefined, { clock, fetch: deps.fetch });
 
-  const hostDriver = customDriver ? null : new WorkspaceHostDriver(config, db, github);
+  const hostDriver = customDriver
+    ? null
+    : new WorkspaceHostDriver(config, db, github, { clock, fetch: deps.fetch });
   const driver: WorkspaceDriver = customDriver ?? hostDriver!;
 
   const browserWsBySession = new Map<string, Set<WebSocket>>();
@@ -113,8 +99,23 @@ export function createControlPlane(
     (sessionId) => {
       broadcastToSession(sessionId, { type: 'session_meta_updated' });
     },
+    undefined,
+    { clock, randomUUID, fetch: deps.fetch },
   );
   publishService.resumeIncompletePublishes();
+  // Re-armed only after a pass settles, so a slow GitHub never stacks overlapping passes.
+  let reconcileTimer: ReturnType<typeof clock.setTimeout> | null = null;
+  let disposed = false;
+  const scheduleArmedRunReconcile = () => {
+    if (disposed) return;
+    reconcileTimer = clock.setTimeout(() => {
+      void publishService
+        .reconcileArmedRuns()
+        .catch((err) => ignore(err, 'publish: armed-run reconcile pass failed'))
+        .finally(scheduleArmedRunReconcile);
+    }, 5 * 60_000);
+  };
+  scheduleArmedRunReconcile();
 
   const optimizeService = new OptimizeService(
     config,
@@ -125,851 +126,78 @@ export function createControlPlane(
       broadcastToSession(sessionId, { type: 'session_meta_updated' });
     },
     (userId) => {
+      // Indexed per-owner lookup, and only sessions with an open browser socket get a frame
       const spend = db.getSpendStatus(userId);
-      for (const s of db.listSessions()) {
-        if (s.owner_user_id === userId) {
-          broadcastToSession(s.id, { type: 'spend_status', ...spend });
+      for (const sessionId of db.listSessionIdsByOwner(userId)) {
+        if (browserWsBySession.get(sessionId)?.size) {
+          broadcastToSession(sessionId, { type: 'spend_status', ...spend });
         }
       }
     },
+    { fetch: deps.fetch, randomUUID, clock },
   );
 
   const screenshotService =
     customScreenshotService ??
     new ScreenshotService({
       idleTimeoutMs: config.browserIdleTimeoutMs,
+      clock,
     });
 
   const app = new Hono<Env>();
 
+  // Correlation id + access log. The id lives in AsyncLocalStorage, so every log line written while
+  // handling the request (and every supervisor/runner call it makes) carries it automatically.
+  app.use('*', async (c, next) => {
+    const requestId = resolveRequestId(c.req.header('x-request-id'));
+    const startedAt = performance.now();
+    c.header(REQUEST_ID_HEADER, requestId);
+    await runWithContext({ requestId }, () => next());
+    if (!c.res.headers.has(REQUEST_ID_HEADER)) {
+      try {
+        c.res.headers.set(REQUEST_ID_HEADER, requestId);
+      } catch (err) {
+        // Immutable headers (a Response passed through from fetch): copy instead
+        ignore(err, 'access log: response headers immutable; cloning response', {}, 'debug');
+        c.res = new Response(c.res.body, c.res);
+        c.res.headers.set(REQUEST_ID_HEADER, requestId);
+      }
+    }
+    const p = c.req.path;
+    // Preview assets, static files and health probes are high-volume: debug only
+    const level =
+      (p.startsWith('/api/') && !p.startsWith('/api/health')) || p.startsWith('/internal/') ? 'info' : 'debug';
+    if (isLogLevelEnabled(level)) {
+      log(level, 'http request', {
+        requestId,
+        method: c.req.method,
+        path: p,
+        status: c.res.status,
+        durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      });
+    }
+  });
+
+  // Request body caps: JSON APIs 1 MB by default; uploads get their own cap (matches the runner).
+  const payloadTooLarge = (c: import('hono').Context) => c.json({ error: 'Request body is too large' }, 413);
+  const apiBodyLimit = bodyLimit({ maxSize: config.apiBodyLimitBytes, onError: payloadTooLarge });
+  const uploadBodyLimit = bodyLimit({ maxSize: config.uploadBodyLimitBytes, onError: payloadTooLarge });
+  app.use('/api/*', (c, next) => (c.req.path.endsWith('/uploads') ? uploadBodyLimit(c, next) : apiBodyLimit(c, next)));
+  app.use('/internal/session/*', apiBodyLimit);
+  app.use('/internal/workspaces/*', apiBodyLimit);
+  app.use('/internal/screenshot', apiBodyLimit);
+
   app.onError((err, c) => {
-    console.error(`[halley-control-plane] Unhandled error on ${c.req.method} ${c.req.path}:`, err);
+    logger.error('unhandled error in request handler', { method: c.req.method, path: c.req.path, err });
+    if (err instanceof ScreenshotBusyError) {
+      return c.json({ error: err.message, retryable: true }, 503);
+    }
     return c.json(
       { error: err instanceof Error ? err.message : 'Internal server error' },
       500,
     );
   });
 
-  // Unified preview-isolation + PWA app-shell Service Worker
-  app.get('/halley-preview-sw.js', async () => {
-    let indexHtml = '';
-    try {
-      indexHtml = await fs.readFile(path.join(config.webDistDir, 'index.html'), 'utf8');
-    } catch {
-      // Dev mode without built dist/index.html
-    }
-    const swVersion = crypto
-      .createHash('sha256')
-      .update(HALLEY_PREVIEW_SW_JS)
-      .update(indexHtml)
-      .digest('hex')
-      .slice(0, 12);
-    return new Response(HALLEY_PREVIEW_SW_JS.replace('__HALLEY_SW_VERSION__', swVersion), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Service-Worker-Allowed': '/',
-      },
-    });
-  });
-
-  // Health & Doctor preflight diagnostics
-  app.get('/api/health', (c) =>
-    c.json({ ok: true, repo: config.repo, baseBranch: config.baseBranch }),
-  );
-
-  app.get('/api/health/doctor', async (c) => {
-    if (driver.runDoctorChecks) {
-      const report = await driver.runDoctorChecks();
-      return c.json(report, report.ok ? 200 : 503);
-    }
-    return c.json({
-      ok: true,
-      warnings: [],
-      errors: [],
-      details: { workspaceHostUrl: config.workspaceHostUrl || '(local)', dataDir: config.dataDir },
-    });
-  });
-
-  // Internal Git Smart-HTTP mirror (keeps GitHub credentials strictly inside control-plane)
-  const internalGitHandler = createInternalGitHttpHandler(config, db, async () => {
-    if (hostDriver) {
-      await hostDriver.ensureControlPlaneMirror(config.baseBranch, { allowStaleOnError: true });
-    }
-  });
-  app.all('/internal/git/repo.git/*', internalGitHandler);
-  app.all('/internal/git/repo.git', internalGitHandler);
-
-  // LLM Proxy (authenticated via WORKSPACE_TOKEN, no user cookie)
-  app.all(
-    '/internal/llm/anthropic/*',
-    createLlmProxyHandler(config, db, (userId, sessionId) => {
-      const spend = db.getSpendStatus(userId);
-      broadcastToSession(sessionId, { type: 'spend_status', ...spend });
-    }),
-  );
-
-  // Shared Headless Chromium Screenshot Service (authenticated via WORKSPACE_TOKEN)
-  app.post('/internal/screenshot', async (c) => {
-    const authHeader = c.req.header('authorization') || '';
-    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (!rawToken) {
-      return c.json({ error: 'Missing workspace token' }, 401);
-    }
-
-    const session = db.resolveSessionByWorkspaceToken(rawToken);
-    if (!session) {
-      return c.json({ error: 'Invalid workspace token' }, 401);
-    }
-
-    db.updateSession(session.id, { last_active_at: new Date().toISOString() });
-
-    let astroUrl: string;
-    let originalBase: string;
-    try {
-      const ep = await driver.ensureRunning(session);
-      astroUrl = ep.astroUrl;
-      originalBase = ep.astroBase || '/';
-    } catch {
-      return c.json({ error: 'Workspace preview server is not running' }, 503);
-    }
-
-    const body = (await c.req.json().catch(() => ({}))) as {
-      route?: unknown;
-      viewport?: unknown;
-      fullPage?: unknown;
-    };
-    const rawRoute = typeof body.route === 'string' ? body.route.trim() : '/';
-    const viewport: ScreenshotViewport = body.viewport === 'mobile' ? 'mobile' : 'desktop';
-    const fullPage = body.fullPage === true;
-    let cleanRoute = rawRoute.startsWith('/') ? rawRoute : `/${rawRoute}`;
-
-    const astroOrigin = new URL(astroUrl);
-    const baseSuffix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
-    if (baseSuffix && (cleanRoute === baseSuffix || cleanRoute.startsWith(`${baseSuffix}/`))) {
-      cleanRoute = cleanRoute.slice(baseSuffix.length) || '/';
-    }
-
-    const sessionPrefix = `/p/${session.id}`;
-    const previewPath = `${sessionPrefix}${baseSuffix}${cleanRoute}`;
-    const targetUrl = new URL(previewPath, astroOrigin);
-    if (
-      targetUrl.origin !== astroOrigin.origin ||
-      (targetUrl.pathname !== sessionPrefix && !targetUrl.pathname.startsWith(`${sessionPrefix}/`))
-    ) {
-      return c.json({ error: 'Invalid route' }, 400);
-    }
-
-    try {
-      const result = await screenshotService.capture({
-        url: targetUrl.toString(),
-        viewport,
-        fullPage,
-      });
-      return new Response(new Uint8Array(result.data), {
-        status: 200,
-        headers: {
-          'Content-Type': result.mimeType,
-          'X-Screenshot-Width': String(result.width),
-          'X-Screenshot-Height': String(result.height),
-        },
-      });
-    } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Screenshot capture failed' },
-        500,
-      );
-    }
-  });
-
-  // Internal hook called by workspace-runner when an edit checkpoint is created
-  app.post('/internal/session/diverged', async (c) => {
-    const authHeader = c.req.header('authorization') || '';
-    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (!rawToken) {
-      return c.json({ error: 'Missing workspace token' }, 401);
-    }
-    const session = db.resolveSessionByWorkspaceToken(rawToken);
-    if (!session) {
-      return c.json({ error: 'Invalid workspace token' }, 401);
-    }
-    const body = (await c.req.json().catch(() => ({}))) as { changedFilesCount?: unknown };
-    if (typeof body.changedFilesCount === 'number' && Number.isFinite(body.changedFilesCount)) {
-      db.updateSession(session.id, { changed_files_count: body.changedFilesCount });
-    }
-    const converted = convertAndBroadcastIfRevert(session.id);
-    return c.json({ ok: true, converted: Boolean(converted), kind: converted?.kind ?? session.kind });
-  });
-
-  // Internal hook called when the initial Optimization Draft pass settles (clears escalation gate)
-  app.post('/internal/session/optimization-settled', (c) => {
-    const authHeader = c.req.header('authorization') || '';
-    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (!rawToken) {
-      return c.json({ error: 'Missing workspace token' }, 401);
-    }
-    const session = db.resolveSessionByWorkspaceToken(rawToken);
-    if (!session) {
-      return c.json({ error: 'Invalid workspace token' }, 401);
-    }
-    db.updateSession(session.id, {
-      optimize_escalation_allowed: 0,
-      active_model_label: null,
-    });
-    broadcastToSession(session.id, { type: 'session_meta_updated' });
-    return c.json({ ok: true });
-  });
-
-  // Auth routes
-  app.get('/api/auth/me', (c) => {
-    const user = auth.getUserFromContext(c);
-    if (!user) {
-      return c.json({
-        authenticated: false,
-        devLoginEnabled: config.devLoginEnabled,
-        googleEnabled: Boolean(config.googleClientId && config.googleClientSecret),
-        repo: config.repo,
-      });
-    }
-    return c.json({
-      authenticated: true,
-      user,
-      spend: db.getSpendStatus(user.id),
-      repo: config.repo,
-      baseBranch: config.baseBranch,
-    });
-  });
-
-  app.get('/api/auth/google', (c) => {
-    if (!config.googleClientId || !config.googleClientSecret) {
-      return c.text('Google OAuth is not configured', 500);
-    }
-    return c.redirect(auth.buildGoogleAuthUrl(c));
-  });
-
-  app.get('/api/auth/google/callback', async (c) => {
-    const code = c.req.query('code') || '';
-    const state = c.req.query('state') || '';
-    const err = c.req.query('error');
-    if (err || !code || !state) {
-      return c.redirect('/?authError=cancelled');
-    }
-    const result = await auth.handleGoogleCallback(c, code, state);
-    if (!result.ok) {
-      if (result.reason === 'not_allowed') {
-        return c.redirect(`/?authError=not_allowed&email=${encodeURIComponent(result.email || '')}`);
-      }
-      return c.redirect(`/?authError=${encodeURIComponent(result.reason)}`);
-    }
-    return c.redirect('/');
-  });
-
-  app.post('/api/auth/dev-login', async (c) => {
-    if (!config.devLoginEnabled) {
-      return c.json({ error: 'Dev login is disabled' }, 403);
-    }
-    const body = (await c.req.json().catch(() => ({}))) as {
-      email?: string;
-      name?: string;
-    };
-    const email = (body.email || config.adminEmails[0] || 'dev@example.com').toLowerCase();
-    if (!db.isEmailAllowed(email)) {
-      db.addAllowlist('email', email, 'dev-login');
-    }
-    const user = db.upsertUser({
-      email,
-      name: body.name || 'Dev Editor',
-      picture: null,
-    });
-    auth.issueSessionCookie(c, user.id);
-    return c.json({ user, spend: db.getSpendStatus(user.id) });
-  });
-
-  app.post('/api/auth/logout', (c) => {
-    auth.clearSessionCookie(c);
-    return c.json({ ok: true });
-  });
-
-  app.patch('/api/auth/preferences', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const body = (await c.req.json()) as { persona?: 'non-technical' | 'developer' };
-    const persona = body.persona === 'developer' ? 'developer' : 'non-technical';
-    db.setUserPersona(user.id, persona);
-    // Notify any running sessions owned by this user
-    for (const s of db.listSessions()) {
-      if (s.owner_user_id === user.id && s.status === 'running' && s.runner_url) {
-        void fetch(`${s.runner_url}/internal/persona`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ persona }),
-        }).catch(() => {});
-      }
-    }
-    return c.json({ user: db.getUserById(user.id) });
-  });
-
-  // Sessions
-  app.get('/api/sessions', auth.requireAuth, (c) => {
-    const user = c.get('user');
-    const sessions = db.listSessions().map((s) => enrichSessionDto(s, user));
-    return c.json({ sessions, spend: db.getSpendStatus(user.id) });
-  });
-
-  app.post('/api/sessions', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = CreateSessionRequestSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid session request' }, 400);
-    }
-    const title = (parsed.data.title || 'Website update').trim();
-    const warm = (await driver.reserveWarmWorkspace?.()) ?? null;
-    const id = warm ? warm.id : crypto.randomUUID();
-    const short = id.slice(0, 6);
-    const slug = slugify(title);
-    const workingBranch = `halley/${slug}-${short}`;
-    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
-    const volumeName = warm ? warm.volumeName : `halley-ws-${id}`;
-
-    let session;
-    try {
-      session = db.createSession({
-        id,
-        title,
-        slug,
-        ownerUserId: user.id,
-        repo: config.repo,
-        baseBranch: config.baseBranch,
-        workingBranch,
-        volumeName,
-        workspaceTokenHash: hashWorkspaceToken(rawToken),
-      });
-    } catch (err) {
-      if (warm) {
-        await driver.releaseWarmWorkspace?.(warm.id).catch(() => {});
-      }
-      throw err;
-    }
-
-    driver.setRawWorkspaceToken?.(id, rawToken);
-
-    // Start booting (or claiming warm standby) workspace asynchronously so the UI opens immediately
-    void driver.ensureRunning(session).catch((err) => {
-      db.transitionSession(id, {
-        expectedEpoch: session.lease_epoch,
-        patch: { status: 'error', publish_error: String(err) },
-      });
-    });
-    screenshotService.prewarm();
-
-    return c.json({ session: enrichSessionDto(session, user) }, 201);
-  });
-
-  app.patch('/api/sessions/:id', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if (s.owner_user_id !== user.id && !user.isAdmin) {
-      return c.json({ error: 'Forbidden' }, 403);
-    }
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = UpdateSessionRequestSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid title' }, 400);
-    }
-    db.updateSession(s.id, { title: parsed.data.title });
-    broadcastToSession(s.id, { type: 'session_meta_updated' });
-    return c.json({ session: enrichSessionDto(db.getSession(s.id)!, user) });
-  });
-
-  app.get('/api/sessions/:id', auth.requireAuth, (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if (s.status === 'running' || s.status === 'starting') {
-      screenshotService.prewarm();
-    }
-    return c.json({ session: enrichSessionDto(s, user), spend: db.getSpendStatus(user.id) });
-  });
-
-  app.post('/api/sessions/:id/wake', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-
-    if (s.status === 'sleeping' || s.status === 'error') {
-      db.transitionSession(s.id, {
-        fromStatuses: ['sleeping', 'error'],
-        patch: { status: 'starting', publish_error: null },
-      });
-    }
-    const updated = db.getSession(s.id)!;
-    void driver.ensureRunning(updated).catch((err) => {
-      db.transitionSession(s.id, {
-        expectedEpoch: updated.lease_epoch,
-        patch: { status: 'error', publish_error: String(err) },
-      });
-    });
-    screenshotService.prewarm();
-    return c.json({ session: enrichSessionDto(updated, user) });
-  });
-
-  app.post('/api/sessions/:id/restart', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if (s.owner_user_id !== user.id && !user.isAdmin) {
-      return c.json({ error: 'Only the session owner or an admin can restart this workspace.' }, 403);
-    }
-
-    const isFrozen = s.status === 'published' || s.status === 'merged';
-    db.transitionSession(s.id, {
-      allowUnfreeze: isFrozen,
-      patch: {
-        status: isFrozen ? s.status : 'starting',
-        publish_error: null,
-        runner_url: null,
-        astro_url: null,
-      },
-    });
-    const updated = db.getSession(s.id)!;
-    const starter = driver.restart
-      ? driver.restart(updated)
-      : driver.stop(updated).then(() => driver.ensureRunning(db.getSession(s.id) ?? updated));
-    void starter.catch((err) => {
-      const cur = db.getSession(s.id);
-      if (cur && cur.status !== 'published' && cur.status !== 'merged') {
-        db.updateSession(s.id, { status: 'error', publish_error: String(err) });
-      }
-    });
-    return c.json({ session: enrichSessionDto(updated, user) });
-  });
-
-  app.post('/api/sessions/:id/duplicate', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const src = db.getSession(c.req.param('id')!);
-    if (!src) return c.json({ error: 'Not found' }, 404);
-
-    // Ensure source transcript is captured in session_archives for unified Hybrid carry-over (Q18, Q19)
-    let srcArchive = db.getSessionArchive(src.id);
-    if (!srcArchive && !src.volume_expired_at && (src.runner_url || src.status === 'sleeping')) {
-      const srcEp = await driver.ensureRunning(src).catch(() => null);
-      if (srcEp?.runnerUrl) {
-        await publishService
-          .archiveSessionDeterministically(
-            src.id,
-            srcEp.runnerUrl,
-            src.base_branch,
-            src.merged_sha,
-            src.pr_url,
-          )
-          .catch(() => {});
-        srcArchive = db.getSessionArchive(src.id);
-      }
-    }
-
-    const parentArchive = src.parent_session_id ? db.getSessionArchive(src.parent_session_id) : null;
-    let handoffSummary = srcArchive?.handoffSummary ?? null;
-    if (!handoffSummary) {
-      handoffSummary = buildContinuationHandoffSummary(src, srcArchive, parentArchive?.handoffSummary);
-      if (srcArchive) {
-        db.setArchiveHandoffSummary(src.id, handoffSummary);
-      }
-    }
-
-    const isFinished = src.status === 'published' || src.status === 'merged';
-    const mode = isFinished ? 'fresh-from-main' : 'branch-off';
-    const kind = isFinished ? 'continuation' : 'edit';
-    const id = crypto.randomUUID();
-    const short = id.slice(0, 6);
-    const title = isFinished ? `Continued: ${src.title}` : `${src.title} (Copy)`;
-    const slug = slugify(title);
-    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
-
-    let copy = db.createSession({
-      id,
-      title,
-      slug,
-      kind,
-      parentSessionId: src.id,
-      ownerUserId: user.id,
-      repo: src.repo,
-      baseBranch: src.base_branch,
-      workingBranch: `halley/${slug}-${short}`,
-      baseSha: mode === 'branch-off' ? src.base_sha : '',
-      volumeName: `halley-ws-${id}`,
-      workspaceTokenHash: hashWorkspaceToken(rawToken),
-    });
-    if (mode === 'branch-off' && src.changed_files_count > 0) {
-      db.updateSession(copy.id, { changed_files_count: src.changed_files_count });
-      copy = db.getSession(copy.id) ?? copy;
-    }
-
-    driver.setRawWorkspaceToken?.(id, rawToken);
-
-    await driver.duplicateWorkspace(src, copy, mode);
-    void driver
-      .ensureRunning(copy)
-      .then(async (ep) => {
-        if (handoffSummary) {
-          await fetch(`${ep.runnerUrl}/internal/context-note`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ note: handoffSummary, persist: true }),
-            signal: AbortSignal.timeout(15_000),
-          }).catch(() => {});
-        }
-      })
-      .catch(() => {});
-
-    return c.json({ session: enrichSessionDto(copy, user) }, 201);
-  });
-
-  // Journey A: Any editor can undo a Halley publication or non-.github/** main commit (Q1, Q5, Q17)
-  app.post('/api/sessions/revert', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = RevertSessionCreateSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid revert request' }, 400);
-    }
-    const body = parsed.data;
-    const reason = (body.reason || '').trim();
-    if (!reason) {
-      return c.json({ error: 'Please enter a short reason for undoing this publication.' }, 400);
-    }
-
-    const srcSession = body.sessionId ? db.getSession(body.sessionId) : null;
-    const targetShas =
-      body.shas && body.shas.length > 0
-        ? body.shas
-        : body.sha
-          ? [body.sha]
-          : srcSession?.merged_sha
-            ? [srcSession.merged_sha]
-            : [];
-
-    if (targetShas.length === 0) {
-      return c.json({ error: 'No published commit SHA found to undo.' }, 400);
-    }
-
-    const primarySha = targetShas[0]!;
-    // In-flight publish lock checked across ALL target SHAs
-    for (const sha of targetShas) {
-      const inFlight = db.hasInFlightRevertForSha(sha);
-      if (inFlight) {
-        return c.json(
-          {
-            error: `${inFlight.owner_name || 'A teammate'} is already publishing an undo for this change.`,
-            inFlightSessionId: inFlight.id,
-          },
-          409,
-        );
-      }
-    }
-
-    // Block undoing developer commits that touch protected .github/** files (fail closed when GitHub or devLocalRepo is configured!)
-    if (!srcSession && (config.githubToken || config.githubAppId || config.devLocalRepo)) {
-      for (const sha of targetShas) {
-        let files: string[];
-        try {
-          if (config.devLocalRepo && !config.githubToken && !config.githubAppId) {
-            const out = await runGit(config.devLocalRepo, [
-              'diff-tree',
-              '--no-commit-id',
-              '--name-only',
-              '-r',
-              '-m',
-              sha,
-            ]);
-            files = out
-              .split(/\r?\n/)
-              .map((l) => l.trim())
-              .filter(Boolean);
-          } else {
-            files = await github.getCommitFilesOrThrow(sha);
-          }
-        } catch (err) {
-          return c.json(
-            {
-              error: `Could not verify commit files before undoing (${err instanceof Error ? err.message : 'GitHub unavailable'}). Please try again.`,
-            },
-            502,
-          );
-        }
-        if (files.some((f) => f === '.github' || f.startsWith('.github/'))) {
-          return c.json(
-            { error: 'Developer infrastructure update (.github/**) — revert directly on GitHub.' },
-            403,
-          );
-        }
-      }
-    }
-
-    // Ensure source transcript is captured if undoing a Halley session whose archive wasn't saved yet
-    let srcArchive = srcSession ? db.getSessionArchive(srcSession.id) : null;
-    if (srcSession && !srcArchive && srcSession.runner_url) {
-      const srcEp = await driver.ensureRunning(srcSession).catch(() => null);
-      if (srcEp?.runnerUrl) {
-        await publishService
-          .archiveSessionDeterministically(
-            srcSession.id,
-            srcEp.runnerUrl,
-            srcSession.base_branch,
-            srcSession.merged_sha,
-            srcSession.pr_url,
-          )
-          .catch(() => {});
-        srcArchive = db.getSessionArchive(srcSession.id);
-      }
-    }
-    const parentArchive = srcSession?.parent_session_id
-      ? db.getSessionArchive(srcSession.parent_session_id)
-      : null;
-
-    const id = crypto.randomUUID();
-    const short = id.slice(0, 6);
-    const baseTitle = body.title || srcSession?.title || `commit ${primarySha.slice(0, 7)}`;
-    const title = `Undo: ${baseTitle}`;
-    const slug = slugify(title);
-    const rawToken = deriveWorkspaceToken(config.sessionSecret, id, 0);
-
-    const revertSession = db.createSession({
-      id,
-      title,
-      slug,
-      kind: 'revert',
-      parentSessionId: srcSession?.id ?? null,
-      revertsSha: primarySha,
-      revertReason: reason,
-      ownerUserId: user.id,
-      repo: config.repo,
-      baseBranch: config.baseBranch,
-      workingBranch: `halley/${slug}-${short}`,
-      volumeName: `halley-ws-${id}`,
-      workspaceTokenHash: hashWorkspaceToken(rawToken),
-    });
-
-    driver.setRawWorkspaceToken?.(id, rawToken);
-
-    type RevertStartResult = {
-      status?: 'clean' | 'conflict' | 'nothing_to_undo';
-      revertCheckpointSha?: string;
-      revertedCommits?: RevertedCommitSummaryDto[];
-      conflictedFiles?: string[];
-      changedFilesCount?: number;
-      [key: string]: unknown;
-    };
-    let revertResult: RevertStartResult | null = null;
-    try {
-      const ep = await driver.ensureRunning(revertSession);
-      const res = await fetch(`${ep.runnerUrl}/internal/git/revert-start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ shas: targetShas }),
-        signal: AbortSignal.timeout(55_000),
-      });
-      revertResult = (await res.json().catch(() => null)) as RevertStartResult | null;
-      const revUpdates: Record<string, unknown> = {};
-      if (revertResult?.revertCheckpointSha) {
-        revUpdates.initial_revert_sha = revertResult.revertCheckpointSha;
-      }
-      if (typeof revertResult?.changedFilesCount === 'number') {
-        revUpdates.changed_files_count = revertResult.changedFilesCount;
-      }
-      if (Object.keys(revUpdates).length > 0) {
-        db.updateSession(revertSession.id, revUpdates);
-      }
-
-      const undoSummary = buildUndoHandoffSummary({
-        baseBranch: config.baseBranch,
-        targetTitle: baseTitle,
-        targetShas,
-        revertReason: reason,
-        revertStatus: revertResult?.status ?? null,
-        revertCheckpointSha: revertResult?.revertCheckpointSha ?? null,
-        revertedCommits: Array.isArray(revertResult?.revertedCommits)
-          ? revertResult.revertedCommits
-          : [],
-        conflictedFiles: Array.isArray(revertResult?.conflictedFiles)
-          ? revertResult.conflictedFiles
-          : [],
-        srcSession,
-        srcArchive,
-        priorHandoff: parentArchive?.handoffSummary ?? null,
-      });
-
-      await fetch(`${ep.runnerUrl}/internal/context-note`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ note: undoSummary, persist: true }),
-        signal: AbortSignal.timeout(15_000),
-      }).catch(() => {});
-    } catch {
-      // Workspace may still be booting; UI can retry
-    }
-
-    return c.json(
-      {
-        session: enrichSessionDto(db.getSession(revertSession.id)!, user),
-        revertResult,
-      },
-      201,
-    );
-  });
-
-  // Published History timeline: Halley publications + direct developer commits + PR reconciliation (Q20, P6)
-  app.get('/api/history', auth.requireAuth, async (c) => {
-    const allSessions = db.listSessions();
-
-    // Best-effort reconciliation of open Halley PRs that were merged/closed manually on GitHub (P6)
-    const openPrSessions = allSessions.filter(
-      (s) => s.pr_number && s.status !== 'published' && s.status !== 'merged',
-    );
-    for (const s of openPrSessions.slice(0, 5)) {
-      try {
-        const prState = await github.getPrState(s.pr_number!);
-        if (prState.merged && prState.mergeCommitSha) {
-          db.updateSession(s.id, {
-            status: 'published',
-            publish_state: 'published',
-            merged_sha: prState.mergeCommitSha,
-            merged_at: s.merged_at ?? new Date().toISOString(),
-            archived_at: s.archived_at ?? new Date().toISOString(),
-          });
-        }
-      } catch {
-        // GitHub unavailable in dev/offline mode
-      }
-    }
-
-    const refreshed = db.listSessions();
-    const publishedSessions = refreshed.filter(
-      (s) => s.status === 'published' || s.status === 'merged',
-    );
-    const revertedBySha = new Map<
-      string,
-      { sessionId: string; authorName: string; timestamp: string; reason: string | null }
-    >();
-
-    for (const s of publishedSessions) {
-      if (s.kind === 'revert' && s.reverts_sha) {
-        revertedBySha.set(s.reverts_sha, {
-          sessionId: s.id,
-          authorName: s.owner_name ?? 'Editor',
-          timestamp: s.merged_at ?? s.archived_at ?? s.last_active_at,
-          reason: s.revert_reason,
-        });
-      }
-    }
-
-    const entries: LiveHistoryEntryDto[] = [];
-    const seenShas = new Set<string>();
-
-    for (const s of publishedSessions) {
-      const sha = s.merged_sha || s.id;
-      if (s.merged_sha) seenShas.add(s.merged_sha);
-      entries.push({
-        id: `session-${s.id}`,
-        source: 'halley',
-        sha,
-        shortSha: sha.slice(0, 7),
-        title: s.title,
-        authorName: s.owner_name ?? 'Editor',
-        timestamp: s.merged_at ?? s.archived_at ?? s.last_active_at,
-        prNumber: s.pr_number,
-        prUrl: s.pr_url,
-        sessionId: s.id,
-        sessionKind: s.kind,
-        parentSessionId: s.parent_session_id,
-        revertsSha: s.reverts_sha,
-        revertReason: s.revert_reason,
-        revertedBy: s.merged_sha ? (revertedBySha.get(s.merged_sha) ?? null) : null,
-        canUndo: Boolean(s.merged_sha),
-        undoDisabledReason: s.merged_sha ? undefined : 'No merged commit SHA recorded',
-        volumeExpired: Boolean(s.volume_expired_at),
-      });
-    }
-
-    const ghCommits = await github.listMainCommits(config.baseBranch, 25);
-    for (const cm of ghCommits) {
-      if (seenShas.has(cm.sha)) continue;
-      const isInfra = /^\s*(?:ci|build|chore|workflow)\b/i.test(cm.subject) && cm.subject.includes('.github');
-      entries.push({
-        id: `commit-${cm.sha}`,
-        source: 'github',
-        sha: cm.sha,
-        shortSha: cm.shortSha,
-        title: cm.subject,
-        authorName: cm.author,
-        timestamp: cm.date,
-        revertedBy: revertedBySha.get(cm.sha) ?? null,
-        canUndo: !isInfra,
-        undoDisabledReason: isInfra ? 'Developer infrastructure update — revert on GitHub' : undefined,
-      });
-    }
-
-    entries.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    return c.json({ entries });
-  });
-
-  app.get('/api/sessions/:id/archive', auth.requireAuth, (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const archive = db.getSessionArchive(s.id);
-    return c.json({ archive });
-  });
-
-  app.post('/api/sessions/:id/retry-deploy', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if (s.owner_user_id !== user.id && !user.isAdmin) {
-      return c.json({ error: 'Forbidden' }, 403);
-    }
-    if (s.status !== 'merged' || !s.merged_sha) {
-      return c.json({ error: 'Session is not awaiting deploy verification' }, 409);
-    }
-    void publishService.retryDeployCheck(s).catch(() => {});
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/sessions/:id/takeover', auth.requireAdmin, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    db.updateSession(s.id, { owner_user_id: user.id });
-    const updated = db.getSession(s.id)!;
-    if (updated.runner_url && updated.status === 'running') {
-      void fetch(`${updated.runner_url}/internal/owner`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          editorName: user.name,
-          editorEmail: user.email,
-          persona: user.persona,
-        }),
-        signal: AbortSignal.timeout(5000),
-      }).catch(() => {});
-    }
-    broadcastToSession(s.id, { type: 'session_meta_updated' });
-    return c.json({ session: enrichSessionDto(updated, user) });
-  });
-
-  app.delete('/api/sessions/:id', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if (s.owner_user_id !== user.id && !user.isAdmin) {
-      return c.json({ error: 'Forbidden' }, 403);
-    }
-    await driver.destroy(s);
-    db.deleteSession(s.id);
-    return c.json({ ok: true });
-  });
-
-  // Workspace git, undo, verify, uploads, publish
   const requireSessionEdit = async (c: import('hono').Context<Env>) => {
     const user = c.get('user');
     const s = db.getSession(c.req.param('id')!);
@@ -983,1180 +211,69 @@ export function createControlPlane(
     return { session: s, user };
   };
 
-  app.get('/api/sessions/:id/routes', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if ((s.status === 'published' || s.status === 'merged') && !s.runner_url) {
-      return c.json({ routes: [] });
-    }
-    const ep = await driver.ensureRunning(s);
-    const res = await fetch(`${ep.runnerUrl}/internal/routes`, {
-      signal: AbortSignal.timeout(15_000),
-    });
-    return c.json(await res.json(), res.status as 200);
-  });
-
-  app.get('/api/sessions/:id/page-options', auth.requireAuth, async (c) => {
-    const user = c.get('user');
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const spend = db.getSpendStatus(user.id);
-    const ep = await driver.ensureRunning(s);
-    const res = await fetch(
-      `${ep.runnerUrl}/internal/page-options?capped=${spend.capped ? 'true' : 'false'}`,
-      { signal: AbortSignal.timeout(15_000) },
-    );
-    return c.json(await res.json(), res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/pages', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const spend = db.getSpendStatus(check.user.id);
-    const ep = await driver.ensureRunning(check.session);
-    const body = (await c.req.json()) as Record<string, unknown>;
-    const res = await fetch(`${ep.runnerUrl}/internal/pages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, capped: spend.capped }),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok && typeof data.changedFilesCount === 'number') {
-      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-    }
-    if (res.ok) {
-      convertAndBroadcastIfRevert(check.session.id);
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/pages/:pageRequestId/retry', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const spend = db.getSpendStatus(check.user.id);
-    const ep = await driver.ensureRunning(check.session);
-    const pageRequestId = c.req.param('pageRequestId')!;
-    const reqBody = (await c.req.json().catch(() => ({}))) as { viewport?: string };
-    const res = await fetch(
-      `${ep.runnerUrl}/internal/pages/${encodeURIComponent(pageRequestId)}/retry`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ capped: spend.capped, viewport: reqBody.viewport }),
-        signal: AbortSignal.timeout(25_000),
-      },
-    );
-    return c.json(await res.json(), res.status as 200);
-  });
-
-  app.delete('/api/sessions/:id/pages', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const ep = await driver.ensureRunning(check.session);
-    const route = c.req.query('route') || '';
-    const res = await fetch(
-      `${ep.runnerUrl}/internal/pages?route=${encodeURIComponent(route)}`,
-      { method: 'DELETE', signal: AbortSignal.timeout(25_000) },
-    );
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok && typeof data.changedFilesCount === 'number') {
-      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-    }
-    if (res.ok) {
-      convertAndBroadcastIfRevert(check.session.id);
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/pages/visibility', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const spend = db.getSpendStatus(check.user.id);
-    const ep = await driver.ensureRunning(check.session);
-    const body = (await c.req.json()) as Record<string, unknown>;
-    const res = await fetch(`${ep.runnerUrl}/internal/pages/visibility`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, capped: spend.capped }),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok && typeof data.changedFilesCount === 'number') {
-      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-    }
-    if (res.ok) {
-      convertAndBroadcastIfRevert(check.session.id);
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/pages/rename', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const ep = await driver.ensureRunning(check.session);
-    const body = await c.req.json();
-    const res = await fetch(`${ep.runnerUrl}/internal/pages/rename`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok && typeof data.changedFilesCount === 'number') {
-      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-    }
-    if (res.ok) {
-      convertAndBroadcastIfRevert(check.session.id);
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.get('/api/sessions/:id/changes', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    if ((s.status === 'published' || s.status === 'merged') && !s.runner_url) {
-      return c.json({ changes: [], checkpoints: [] });
-    }
-    const ep = await driver.ensureRunning(s);
-    const res = await fetch(
-      `${ep.runnerUrl}/internal/git/changes?baseRef=${encodeURIComponent(`origin/${s.base_branch}`)}`,
-      { signal: AbortSignal.timeout(15_000) },
-    );
-    const data = (await res.json()) as { changes?: unknown[]; checkpoints?: unknown[] };
-    if (res.ok && Array.isArray(data.changes)) {
-      db.updateSession(s.id, { changed_files_count: data.changes.length });
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/revert-file', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const ep = await driver.ensureRunning(check.session);
-    const body = await c.req.json();
-    const res = await fetch(`${ep.runnerUrl}/internal/git/revert-file`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...body, baseRef: `origin/${check.session.base_branch}` }),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok) {
-      if (typeof data.changedFilesCount === 'number') {
-        db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-      }
-      convertAndBroadcastIfRevert(check.session.id);
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/undo', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const ep = await driver.ensureRunning(check.session);
-    const body = await c.req.json();
-    const res = await fetch(`${ep.runnerUrl}/internal/git/undo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json()) as { changedFilesCount?: number };
-    if (res.ok && typeof data.changedFilesCount === 'number') {
-      db.updateSession(check.session.id, { changed_files_count: data.changedFilesCount });
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/verify', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const ep = await driver.ensureRunning(s);
-    const res = await fetch(`${ep.runnerUrl}/internal/verify`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(180_000),
-    });
-    return c.json(await res.json(), res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/uploads', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const ep = await driver.ensureRunning(check.session);
-    const formData = await c.req.formData();
-    const res = await fetch(`${ep.runnerUrl}/internal/uploads`, {
-      method: 'POST',
-      body: formData,
-      signal: AbortSignal.timeout(30_000),
-    });
-    return c.json(await res.json(), res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = SyncStartRequestSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid sync request' }, 400);
-    }
-    const body = parsed.data;
-    const ep = await driver.ensureRunning(check.session);
-    const ghToken = await github.getAccessToken().catch(() => '');
-    let fetchedByDriver = false;
-    if (ghToken || config.devLocalRepo) {
-      fetchedByDriver = await driver
-        .fetchIntoSession(check.session, ghToken)
-        .then(() => true)
-        .catch(() => false);
-    }
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        baseBranch: check.session.base_branch,
-        kind: body.kind ?? 'sync',
-        autoSyncOnly: body.autoSyncOnly,
-        autoApplyCleanOnly: body.autoApplyCleanOnly,
-        skipFetch: fetchedByDriver,
-      }),
-      signal: AbortSignal.timeout(55_000),
-    });
-    const data = (await res.json().catch(() => ({ error: 'Sync failed' }))) as {
-      review?: {
-        newBaseSha?: string;
-        prevBaseSha?: string;
-        status?: string;
-        alreadyUpToDate?: boolean;
-      };
-      error?: string;
-    };
-    if (
-      data.review?.newBaseSha &&
-      data.review.status !== 'needs_choices' &&
-      !data.review.alreadyUpToDate
-    ) {
-      db.updateSession(check.session.id, {
-        prev_base_sha: data.review.prevBaseSha ?? (check.session.base_sha || null),
-        base_sha: data.review.newBaseSha,
-        last_active_at: new Date().toISOString(),
-      });
-    }
-    if (
-      res.ok &&
-      body.kind === 'publish' &&
-      !(data as { heldForUser?: boolean }).heldForUser &&
-      data.review?.status !== 'needs_choices'
-    ) {
-      void fetch(`${ep.runnerUrl}/internal/verify/speculative`, { method: 'POST' }).catch(() => {});
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync/choose', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = await c.req.json();
-    const ep = await driver.ensureRunning(check.session);
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/choose`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(55_000),
-    });
-    const data = (await res.json().catch(() => ({ error: 'Choice failed' }))) as {
-      review?: { newBaseSha?: string; prevBaseSha?: string; status?: string };
-    };
-    if (data.review?.newBaseSha && data.review.status === 'ready_for_review') {
-      db.updateSession(check.session.id, {
-        prev_base_sha: data.review.prevBaseSha ?? (check.session.base_sha || null),
-        base_sha: data.review.newBaseSha,
-      });
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync/undo', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = await c.req.json().catch(() => ({}));
-    const ep = await driver.ensureRunning(check.session);
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/undo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = (await res.json().catch(() => ({ ok: res.ok }))) as {
-      ok?: boolean;
-      changedFilesCount?: number;
-    };
-    if (res.ok) {
-      const updates: Record<string, unknown> = {};
-      if (check.session.prev_base_sha) updates.base_sha = check.session.prev_base_sha;
-      if (typeof data.changedFilesCount === 'number') {
-        updates.changed_files_count = data.changedFilesCount;
-      }
-      if (Object.keys(updates).length > 0) {
-        db.updateSession(check.session.id, updates);
-      }
-    }
-    return c.json(data, res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync/estimate-escalation', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = (await c.req.json().catch(() => ({}))) as {
-      recordIds?: string[];
-      userNote?: string;
-    };
-    const spend = db.getSpendStatus(check.user.id);
-    const remainingBudgetUsd = Math.max(
-      0,
-      spend.dailyCapUsd + spend.extraGrantedUsd - spend.spentTodayUsd,
-    );
-    const ep = await driver.ensureRunning(check.session);
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/estimate-escalation`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recordIds: body.recordIds,
-        userNote: body.userNote,
-        remainingBudgetUsd,
-        escalationModelId: config.escalationModelId,
-        hardCeilingUsd: config.escalationMaxUsd,
-      }),
-      signal: AbortSignal.timeout(25_000),
-    });
-    return c.json(await res.json().catch(() => ({ error: 'Estimate failed' })), res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync/escalate', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = (await c.req.json().catch(() => ({}))) as {
-      recordIds?: string[];
-      userNote?: string;
-      ceilingUsd?: number;
-    };
-    const ep = await driver.ensureRunning(check.session);
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/escalate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recordIds: body.recordIds,
-        userNote: body.userNote,
-        escalationModelId: config.escalationModelId,
-        escalationThinking: config.escalationThinkingLevel,
-        ceilingUsd: Math.min(body.ceilingUsd ?? config.escalationMaxUsd, config.escalationMaxUsd),
-      }),
-      signal: AbortSignal.timeout(55_000),
-    });
-    return c.json(await res.json().catch(() => ({ error: 'Escalation failed' })), res.status as 200);
-  });
-
-  app.post('/api/sessions/:id/sync/apply-advanced', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = await c.req.json();
-    const ep = await driver.ensureRunning(check.session);
-    const res = await fetch(`${ep.runnerUrl}/internal/sync/apply-advanced`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25_000),
-    });
-    return c.json(await res.json().catch(() => ({ error: 'Apply failed' })), res.status as 200);
-  });
-
-  app.get('/api/sessions/:id/review', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const ep = await driver.ensureRunning(s);
-    const includeScreenshots = c.req.query('screenshots') === '1';
-    const rawViewport = c.req.query('viewport');
-    const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
-    const activeRoute = c.req.query('activeRoute') || '';
-    const qs = new URLSearchParams({
-      baseRef: `origin/${s.base_branch}`,
-    });
-    if (activeRoute) qs.set('activeRoute', activeRoute);
-
-    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`, {
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (res.ok && !includeScreenshots && s.status === 'running' && s.kind === 'revert') {
-      void fetch(`${ep.runnerUrl}/internal/verify/speculative`, { method: 'POST' }).catch(() => {});
-    }
-    const data = (await res
-      .json()
-      .catch(() => ({ cards: [], pages: [], targetRoutes: [], mergeReview: null }))) as {
-      cards: Array<{ route?: string }>;
-      pages: unknown[];
-      targetRoutes?: string[];
-      draftFiles?: string[];
-      mergedFromLiveFiles?: string[];
-      astroReady?: boolean;
-      previewBase?: string;
-      liveSiteUrl?: string | null;
-      mergeReview: unknown;
-      baseSha?: string;
-      prevBaseSha?: string | null;
-    };
-
-    const resolvedRoutes =
-      Array.isArray(data.targetRoutes) && data.targetRoutes.length > 0
-        ? data.targetRoutes
-        : [
-            ...new Set([
-              ...data.cards.map((card) => card.route || '/'),
-              ...(data.cards.length === 0 ? ['/'] : []),
-            ]),
-          ].slice(0, 4);
-    data.targetRoutes = resolvedRoutes;
-
-    if (includeScreenshots && res.ok && data.astroReady !== false && ep.astroUrl) {
-      driver.deferSpeculativeBuilds?.(15_000);
-      const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
-      const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
-      const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
-      const liveBaseUrl = resolveLiveSiteUrl(config, data.liveSiteUrl);
-      data.pages = await screenshotService
-        .captureLiveVsDraftPages({
-          routes: resolvedRoutes,
-          draftFiles: data.draftFiles ?? [],
-          mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
-          draftBaseUrl,
-          liveBaseUrl,
-          baseSha: data.baseSha ?? s.base_sha,
-          viewport: screenshotViewport,
-          liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
-        })
-        .catch(() => []);
-    }
-
-    return c.json(data, res.ok ? 200 : 502);
-  });
-
-  app.get('/api/sessions/:id/review/screenshot', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const ep = await driver.ensureRunning(s);
-    const rawRoute = (c.req.query('route') || '/').trim();
-    const cleanRoute = rawRoute.startsWith('/') ? rawRoute : `/${rawRoute}`;
-    if (cleanRoute.includes('..')) {
-      return c.json({ error: 'Invalid route' }, 400);
-    }
-    const rawViewport = c.req.query('viewport');
-    const screenshotViewport: ScreenshotViewport = rawViewport === 'mobile' ? 'mobile' : 'desktop';
-
-    const qs = new URLSearchParams({ baseRef: `origin/${s.base_branch}` });
-    const res = await fetch(`${ep.runnerUrl}/internal/review?${qs.toString()}`, {
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!res.ok) {
-      return c.json({ error: 'Failed to load review metadata' }, 502);
-    }
-    const data = (await res.json().catch(() => ({}))) as {
-      draftFiles?: string[];
-      mergedFromLiveFiles?: string[];
-      astroReady?: boolean;
-      previewBase?: string;
-      liveSiteUrl?: string | null;
-      baseSha?: string;
-    };
-    if (data.astroReady === false || !ep.astroUrl) {
-      return c.json({ error: 'Preview server is not ready' }, 503);
-    }
-
-    driver.deferSpeculativeBuilds?.(15_000);
-    const baseSuffix = ep.astroBase === '/' ? '' : ep.astroBase.replace(/\/$/, '');
-    const previewBase = data.previewBase || `/p/${s.id}${baseSuffix}`;
-    const draftBaseUrl = `${ep.astroUrl.replace(/\/$/, '')}${previewBase}`;
-    const liveBaseUrl = resolveLiveSiteUrl(config, data.liveSiteUrl);
-
-    try {
-      const page = await screenshotService.captureRouteReview({
-        route: cleanRoute,
-        draftFiles: data.draftFiles ?? [],
-        mergedFromLiveFiles: data.mergedFromLiveFiles ?? [],
-        draftBaseUrl,
-        liveBaseUrl,
-        baseSha: data.baseSha ?? s.base_sha,
-        viewport: screenshotViewport,
-        liveTimestamp: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
-        signal: c.req.raw.signal,
-      });
-
-      return c.json({ page });
-    } catch (err) {
-      if (c.req.raw.signal?.aborted || (err instanceof Error && /aborted/i.test(err.message))) {
-        return new Response(null, { status: 204 });
-      }
-      throw err;
-    }
-  });
-
-  app.get('/api/sessions/:id/upstream-status', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const ghCommits = await github.listMainCommits(s.base_branch, 10);
-    const latestMainSha = ghCommits[0]?.sha ?? '';
-    const behind = Boolean(latestMainSha && s.base_sha && latestMainSha !== s.base_sha);
-    const newerCommits = behind
-      ? ghCommits.slice(
-          0,
-          Math.max(
-            1,
-            ghCommits.findIndex((cm) => cm.sha === s.base_sha) === -1
-              ? ghCommits.length
-              : ghCommits.findIndex((cm) => cm.sha === s.base_sha),
-          ),
-        )
-      : [];
-
-    // Warn early if teammates have other active drafts with edits
-    const coEditors = db
-      .listSessions()
-      .filter(
-        (other) =>
-          other.id !== s.id &&
-          other.status !== 'published' &&
-          other.status !== 'merged' &&
-          !other.volume_expired_at &&
-          other.changed_files_count > 0,
-      )
-      .map((other) => ({
-        sessionId: other.id,
-        title: other.title,
-        ownerName: other.owner_name ?? 'A teammate',
-        changedFilesCount: other.changed_files_count,
-      }));
-
-    return c.json({
-      behind,
-      latestMainSha,
-      newerCommits,
-      coEditors,
-    });
-  });
-
-  app.post('/api/sessions/:id/publish', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = PublishRequestSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid publish request' }, 400);
-    }
-    const body = parsed.data;
-
-    // Run durable publish pipeline in background so UI can dismiss modal & stream progress over WS
-    void publishService.publish(check.session, check.user, {
-      title: body.title,
-      summary: body.summary,
-      excludePaths: body.excludePaths,
-    });
-    return c.json({ ok: true, started: true });
-  });
-
-  app.post('/api/sessions/:id/prompt', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = await c.req.json();
-    const ep = await driver.ensureRunning(check.session);
-    db.updateSession(check.session.id, { last_active_at: new Date().toISOString() });
-    const res = await fetch(`${ep.runnerUrl}/internal/prompt`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(25_000),
-    });
-    const data = await res.json().catch(() => ({ ok: res.ok }));
-    return c.json(data, res.ok ? 200 : 400);
-  });
-
-  app.get('/api/sessions/:id/transcript', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const parentSession = s.parent_session_id ? db.getSession(s.parent_session_id) : null;
-    const parentArchive = s.parent_session_id ? db.getSessionArchive(s.parent_session_id) : null;
-    const priorThread =
-      parentSession && parentArchive
-        ? {
-            parentSessionId: parentSession.id,
-            parentTitle: parentSession.title,
-            parentStatus: parentSession.status,
-            parentPublishedAt: parentSession.merged_at ?? parentSession.archived_at ?? parentSession.last_active_at,
-            entries: (() => {
-              try {
-                const parsed = JSON.parse(parentArchive.transcriptJson) as { entries?: unknown[] };
-                return parsed.entries ?? [];
-              } catch {
-                return [];
-              }
-            })(),
-          }
-        : null;
-
-    // If volume expired (>420d), serve archived transcript from DB without waking a deleted volume
-    if (s.volume_expired_at) {
-      const ownArchive = db.getSessionArchive(s.id);
-      if (ownArchive) {
-        try {
-          const parsed = JSON.parse(ownArchive.transcriptJson) as Record<string, unknown>;
-          return c.json({ ...parsed, volumeExpired: true, priorThread });
-        } catch {
-          // fall through
-        }
-      }
-      return c.json({
-        entries: [],
-        live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
-        usageUsd: 0,
-        volumeExpired: true,
-        priorThread,
-      });
-    }
-
-    if (!s.runner_url || (s.status !== 'running' && s.status !== 'published' && s.status !== 'merged')) {
-      const ownArchive = db.getSessionArchive(s.id);
-      if (ownArchive) {
-        try {
-          const parsed = JSON.parse(ownArchive.transcriptJson) as Record<string, unknown>;
-          return c.json({ ...parsed, priorThread });
-        } catch {
-          // fall through
-        }
-      }
-      return c.json(
-        {
-          error: 'Workspace is not running',
-          status: s.status,
-          bootProgress: driver.getBootProgress?.(s.id) ?? null,
-          priorThread,
-        },
-        503,
-      );
-    }
-
-    try {
-      const res = await fetch(`${s.runner_url}/internal/transcript`, {
-        signal: AbortSignal.timeout(4000),
-      });
-      const data = (await res
-        .json()
-        .catch(() => ({ entries: [], live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 } }))) as Record<
-        string,
-        unknown
-      >;
-      return c.json({ ...data, priorThread }, res.ok ? 200 : 502);
-    } catch {
-      void driver.reconcileSessions?.().catch(() => {});
-      return c.json(
-        {
-          error: 'Workspace is not reachable',
-          status: s.status,
-          bootProgress: driver.getBootProgress?.(s.id) ?? null,
-          priorThread,
-        },
-        503,
-      );
-    }
-  });
-
-  app.get('/api/sessions/:id/debug-trace', auth.requireAuth, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    const recentLogs = (await driver.getSessionLogs?.(s.id).catch(() => [])) ?? [];
-    try {
-      const ep = await driver.ensureRunning(s);
-      const res = await fetch(`${ep.runnerUrl}/internal/debug/trace`);
-      const data = (await res.json().catch(() => ({ error: 'Invalid debug trace response' }))) as Record<
-        string,
-        unknown
-      >;
-      return c.json({ ...data, recentLogs }, res.ok ? 200 : 502);
-    } catch (err) {
-      return c.json(
-        {
-          error: err instanceof Error ? err.message : 'Workspace is not running',
-          recentLogs,
-        },
-        503,
-      );
-    }
-  });
-
-  app.post('/api/sessions/:id/fix-with-pi', auth.requireAuth, async (c) => {
-    const check = await requireSessionEdit(c);
-    if ('error' in check) return c.json({ error: check.error }, check.status);
-    const body = (await c.req.json()) as { errorSummary: string; logs?: string };
-    const ep = await driver.ensureRunning(check.session);
-    const promptText = [
-      `Publishing failed with the following issue:`,
-      body.errorSummary,
-      body.logs ? `\nLogs:\n\`\`\`\n${body.logs.slice(0, 3500)}\n\`\`\`` : '',
-      `\nPlease inspect the issue, fix it in the codebase, run \`run_checks\` to confirm everything passes, and summarize what you fixed.`,
-    ].join('\n');
-
-    await fetch(`${ep.runnerUrl}/internal/prompt`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'submit_input',
-        requestId: `fix-${Date.now()}`,
-        text: promptText,
-        contextChips: [],
-        attachments: [],
-      }),
-      signal: AbortSignal.timeout(25_000),
-    });
-    db.updateSession(check.session.id, { publish_state: 'idle', publish_error: null });
-    broadcastToSession(check.session.id, { type: 'publish_state', payload: { state: 'idle' } });
-    return c.json({ ok: true });
-  });
-
-  // Admin routes
-  app.get('/api/admin/overview', auth.requireAdmin, (c) => {
-    return c.json({
-      allowlist: db.listAllowlist(),
-      users: db.listUsers(),
-      dailyCapUsd: db.getDailyCapUsd(),
-      todaySpend: db.listTodaySpendByUser(),
-      spendByPurpose: db.listTodaySpendByPurpose(),
-      sessions: db.listSessions().map((s) => db.toSessionDto(s, c.get('user'))),
-    });
-  });
-
-  app.post('/api/admin/allowlist', auth.requireAdmin, async (c) => {
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = AdminAllowlistCreateSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid allowlist entry' }, 400);
-    }
-    const entry = db.addAllowlist(parsed.data.kind, parsed.data.value, c.get('user').email);
-    return c.json({ entry }, 201);
-  });
-
-  app.delete('/api/admin/allowlist/:id', auth.requireAdmin, (c) => {
-    db.removeAllowlist(c.req.param('id')!);
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/admin/cap', auth.requireAdmin, async (c) => {
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = AdminSpendCapSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid daily cap' }, 400);
-    }
-    db.setDailyCapUsd(parsed.data.dailyCapUsd);
-    return c.json({ dailyCapUsd: db.getDailyCapUsd() });
-  });
-
-  app.post('/api/admin/users/:id/grant-extra', auth.requireAdmin, async (c) => {
-    const rawBody = await c.req.json().catch(() => ({}));
-    const parsed = AdminGrantExtraSchema.safeParse(rawBody);
-    if (!parsed.success) {
-      return c.json({ error: parsed.error.issues[0]?.message || 'Invalid extra allowance' }, 400);
-    }
-    db.grantExtraSpend(c.req.param('id')!, parsed.data.extraUsd ?? 10);
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/admin/users/:id/admin', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json()) as { isAdmin: boolean };
-    db.setUserAdmin(c.req.param('id')!, Boolean(body.isAdmin));
-    return c.json({ ok: true });
-  });
-
-  app.post('/api/admin/sessions/:id/sleep', auth.requireAdmin, async (c) => {
-    const s = db.getSession(c.req.param('id')!);
-    if (!s) return c.json({ error: 'Not found' }, 404);
-    await driver.stop(s);
-    return c.json({ ok: true });
-  });
-
-  // Optimize Astro (Admin-only Halley Readiness & Speed Advisor)
-  app.get('/api/admin/optimize/latest', auth.requireAdmin, (c) => {
-    return c.json(optimizeService.getLatestOverview());
-  });
-
-  app.post('/api/admin/optimize/scan', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { force?: boolean };
-    try {
-      const report = await optimizeService.runStaticScan({ force: Boolean(body.force) });
-      return c.json({
-        report,
-        defaultModelId: config.modelId,
-        escalationModelId: config.escalationModelId,
-      });
-    } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to scan repository' },
-        500,
-      );
-    }
-  });
-
-  app.post('/api/admin/optimize/ai-estimate', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { sha?: string };
-    if (!body.sha) return c.json({ error: 'Missing sha' }, 400);
-    try {
-      const estimate = await optimizeService.estimateDeepAiReview(body.sha, c.get('user'));
-      return c.json({ estimate });
-    } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to estimate Deep AI Review' },
-        400,
-      );
-    }
-  });
-
-  app.post('/api/admin/optimize/ai-review', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { sha?: string };
-    if (!body.sha) return c.json({ error: 'Missing sha' }, 400);
-    try {
-      const report = await optimizeService.runDeepAiReview(body.sha, c.get('user'));
-      return c.json({ report });
-    } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Deep AI Review failed' },
-        400,
-      );
-    }
-  });
-
-  app.post('/api/admin/optimize/create-draft', auth.requireAdmin, async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
-      sha?: string;
-      findingIds?: string[];
-      useEscalationModel?: boolean;
-      title?: string;
-    };
-    if (!body.sha || !Array.isArray(body.findingIds)) {
-      return c.json({ error: 'Missing sha or findingIds' }, 400);
-    }
-    try {
-      const session = await optimizeService.createOptimizationDraft(c.get('user'), {
-        sha: body.sha,
-        findingIds: body.findingIds,
-        useEscalationModel: body.useEscalationModel,
-        title: body.title,
-      });
-      return c.json({ session }, 201);
-    } catch (err) {
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to create Optimization Draft' },
-        400,
-      );
-    }
-  });
-
-  // Preview Proxy (/p/:sessionId/* + Service Worker /__halley_p/:sessionId/* + cookie-free Referer fallback)
-  const previewProxy = createPreviewProxy(auth, db, driver, config.publicUrl);
-  app.all('/p/:sessionId/*', previewProxy.handleHttp);
-  app.all('/p/:sessionId', previewProxy.handleHttp);
-  app.all('/__halley_p/:sessionId/*', previewProxy.handleServiceWorkerRewrite);
-  app.all('/__halley_p/:sessionId', previewProxy.handleServiceWorkerRewrite);
-
-  app.all('*', async (c, next) => {
-    const p = c.req.path;
-    if (
-      p.startsWith('/api/') ||
-      p.startsWith('/p/') ||
-      p.startsWith('/__halley_p/') ||
-      p.startsWith('/internal/') ||
-      p === '/halley-preview-sw.js'
-    ) {
-      return next();
-    }
-    const ref = c.req.header('referer') || '';
-    const refMatch = ref.match(/\/(?:p|__halley_p)\/([^/?#]+)/);
-    const targetSessionId = refMatch?.[1] ? decodeURIComponent(refMatch[1]) : '';
-    if (targetSessionId) {
-      return previewProxy.handleHttpForSession(c, targetSessionId);
-    }
-    const isEscapedDevModule =
-      p.startsWith('/@vite/') ||
-      p.startsWith('/@fs/') ||
-      p.startsWith('/@id/') ||
-      p.startsWith('/__astro') ||
-      p.startsWith('/src/') ||
-      p.startsWith('/node_modules/') ||
-      p.startsWith('/_astro/');
-    if (isEscapedDevModule || p.startsWith('/__editor/')) {
-      // Never fall through to SPA index.html (text/html) for Vite/Astro dev module paths
-      return c.notFound();
-    }
-    return next();
-  });
-
-  // Serve built React Web UI in production
-  const webRoot = config.webDistDir;
-  app.use('/*', async (c, next) => {
-    await next();
-    const p = c.req.path;
-    if (p === '/manifest.webmanifest') {
-      c.header('Cache-Control', 'no-cache');
-      c.header('Content-Type', 'application/manifest+json; charset=utf-8');
-    } else if (p.startsWith('/assets/')) {
-      c.header('Cache-Control', 'public, max-age=31536000, immutable');
-    } else if (
-      p.startsWith('/icons/') ||
-      p === '/favicon.ico' ||
-      p === '/favicon.svg' ||
-      p === '/apple-touch-icon.png'
-    ) {
-      c.header('Cache-Control', 'public, max-age=86400');
-    }
-  });
-  app.use('/*', serveStatic({ root: webRoot }));
-  app.get('*', async (c, next) => {
-    if (
-      c.req.path.startsWith('/api/') ||
-      c.req.path.startsWith('/p/') ||
-      c.req.path.startsWith('/__halley_p/') ||
-      c.req.path.startsWith('/internal/')
-    ) {
-      return next();
-    }
-    // Never return index.html with text/html for missing static asset extensions
-    if (/\.(?:js|mjs|ts|css|map|wasm|webp|png|jpg|jpeg|svg|ico|woff2?|webmanifest)$/i.test(c.req.path)) {
-      return c.notFound();
-    }
-    try {
-      const html = await fs.readFile(path.join(webRoot, 'index.html'), 'utf8');
-      return c.html(html);
-    } catch {
-      return c.text('Halley Control Plane running. Start @halley/web dev server or build packages/web.', 200);
-    }
-  });
-
-  const MAX_PENDING_WS_MESSAGES = 50;
-
-  const handleWsUpgrade = (
-    req: import('node:http').IncomingMessage,
-    socket: import('node:stream').Duplex,
-    head: Buffer,
-    wss: WebSocketServer,
-  ) => {
-    const urlPath = (req.url ?? '').split('?')[0] ?? '';
-    const wsProto = req.headers['sec-websocket-protocol'] || '';
-    if (urlPath.startsWith('/p/') || wsProto.includes('vite-hmr')) {
-      void previewProxy.handleUpgrade(req, socket, head);
-      return;
-    }
-
-    if (!isAllowedWsOrigin(req, config.publicUrl)) {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-
-    const chatMatch = urlPath.match(/^\/ws\/sessions\/([^/]+)$/);
-    if (!chatMatch?.[1]) {
-      socket.destroy();
-      return;
-    }
-    const user = auth.getUserFromCookieHeader(req.headers.cookie);
-    if (!user) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-    const sessionId = decodeURIComponent(chatMatch[1]);
-    const session = db.getSession(sessionId);
-    if (!session) {
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket, head, async (browserWs) => {
-      let set = browserWsBySession.get(sessionId);
-      if (!set) {
-        set = new Set();
-        browserWsBySession.set(sessionId, set);
-      }
-      set.add(browserWs);
-
-      // Keep reverse proxies (Synology Nginx, Cloudflare, etc.) from dropping idle WebSockets
-      const pingTimer = setInterval(() => {
-        if (browserWs.readyState === WebSocket.OPEN) {
-          browserWs.ping();
-        }
-      }, 20_000);
-
-      let runnerWs: WebSocket | null = null;
-      let browserClosed = false;
-      const pendingMessages: string[] = [];
-
-      // Register close handler BEFORE awaiting driver.ensureRunning so early disconnects
-      // never leak pingTimer, browserWsBySession entries, or orphan runnerWs sockets.
-      browserWs.on('close', () => {
-        browserClosed = true;
-        clearInterval(pingTimer);
-        set?.delete(browserWs);
-        if (
-          runnerWs &&
-          (runnerWs.readyState === WebSocket.OPEN || runnerWs.readyState === WebSocket.CONNECTING)
-        ) {
-          runnerWs.close();
-        }
-      });
-
-      const buildPublishPayload = (s: import('./db.js').SessionRecord): PublishProgressPayload => ({
-        state: s.publish_state,
-        prNumber: s.pr_number,
-        prUrl: s.pr_url,
-        error: s.publish_error,
-      });
-
-      // Push current spend, publish status, state sync, and boot progress immediately
-      const latestSession = db.getSession(sessionId) ?? session;
-      const spend = db.getSpendStatus(latestSession.owner_user_id);
-      const initialPublishPayload = buildPublishPayload(latestSession);
-      const initialAstroReady = driver.isSessionAstroReady
-        ? driver.isSessionAstroReady(sessionId)
-        : Boolean(latestSession.astro_url && latestSession.status === 'running');
-      browserWs.send(JSON.stringify({ type: 'spend_status', ...spend }));
-      browserWs.send(JSON.stringify({ type: 'publish_state', payload: initialPublishPayload }));
-      browserWs.send(
-        JSON.stringify({
-          type: 'session_state_sync',
-          workspaceLocked: false,
-          previewPaused: false,
-          astroReady: initialAstroReady,
-          publishProgress: initialPublishPayload,
-        } satisfies ChatServerMessage),
-      );
-      const currentBootProgress = driver.getBootProgress?.(sessionId);
-      if (currentBootProgress) {
-        browserWs.send(JSON.stringify({ type: 'boot_progress', progress: currentBootProgress }));
-      }
-
-      browserWs.on('message', (data) => {
-        const curSession = db.getSession(sessionId) ?? latestSession;
-        const canEdit =
-          (curSession.owner_user_id === user.id || user.isAdmin) &&
-          curSession.status !== 'published' &&
-          curSession.status !== 'merged';
-        if (!canEdit) {
-          if (browserWs.readyState === WebSocket.OPEN) {
-            browserWs.send(
-              JSON.stringify({
-                type: 'error',
-                message: 'This session is read-only. You do not have permission to send edits.',
-              }),
-            );
-          }
-          return;
-        }
-        db.updateSession(sessionId, { last_active_at: new Date().toISOString() });
-        driver.touchSession?.(sessionId);
-        const str = data.toString();
-        if (runnerWs && runnerWs.readyState === WebSocket.OPEN) {
-          runnerWs.send(str);
-        } else if (pendingMessages.length < MAX_PENDING_WS_MESSAGES) {
-          pendingMessages.push(str);
-        } else if (browserWs.readyState === WebSocket.OPEN) {
-          browserWs.send(
-            JSON.stringify({
-              type: 'error',
-              message: 'Workspace is still starting — too many queued messages.',
-            }),
-          );
-        }
-      });
-
-      try {
-        const ep = await driver.ensureRunning(latestSession);
-        if (browserClosed || browserWs.readyState !== WebSocket.OPEN) {
-          return;
-        }
-        const wsUrl = ep.runnerUrl.replace(/^http/, 'ws') + '/ws';
-        runnerWs = new WebSocket(wsUrl);
-        runnerWs.on('open', () => {
-          if (browserClosed) {
-            runnerWs?.close();
-            return;
-          }
-          while (pendingMessages.length > 0 && runnerWs?.readyState === WebSocket.OPEN) {
-            runnerWs.send(pendingMessages.shift()!);
-          }
-        });
-        runnerWs.on('error', (err) => {
-          if (browserWs.readyState === WebSocket.OPEN) {
-            browserWs.send(
-              JSON.stringify({
-                type: 'error',
-                message: `Workspace connection error: ${err.message}`,
-              }),
-            );
-          }
-        });
-        runnerWs.on('close', () => {
-          // Close the browser socket with 1012 (Service Restart) so the client reconnects
-          // cleanly instead of black-holing prompts to a dead runner socket.
-          if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
-            browserWs.close(1012, 'Workspace connection closed');
-          }
-        });
-        runnerWs.on('message', (data) => {
-          if (browserWs.readyState !== WebSocket.OPEN) return;
-          const raw = data.toString();
-          try {
-            const parsed = JSON.parse(raw) as { type?: string };
-            if (parsed.type === 'session_state_sync') {
-              const cur = db.getSession(sessionId);
-              const enriched = {
-                ...parsed,
-                ...(cur ? { publishProgress: buildPublishPayload(cur) } : {}),
-              };
-              browserWs.send(JSON.stringify(enriched));
-              return;
-            }
-          } catch {
-            // forward raw frame
-          }
-          browserWs.send(raw);
-        });
-      } catch (err) {
-        if (!browserClosed && browserWs.readyState === WebSocket.OPEN) {
-          if (err instanceof WorkspaceCrashLoopError) {
-            const now = new Date().toISOString();
-            browserWs.send(
-              JSON.stringify({
-                type: 'boot_progress',
-                progress: {
-                  stage: 'error',
-                  message: err.oom
-                    ? 'Workspace ran out of memory'
-                    : 'Workspace paused after repeated crashes',
-                  detail: err.message,
-                  startedAt: now,
-                  updatedAt: now,
-                  crashLoop: true,
-                  oom: err.oom,
-                  retryAfterSec: err.retryAfterSec,
-                },
-              }),
-            );
-          }
-          browserWs.send(
-            JSON.stringify({
-              type: 'error',
-              message: err instanceof Error ? err.message : 'Workspace failed to connect',
-            }),
-          );
-        }
-      }
-    });
+  const ctx: ControlPlaneContext = {
+    config,
+    deps,
+    clock,
+    randomUUID,
+    nowIso,
+    runnerFetch,
+    db,
+    auth,
+    github,
+    hostDriver,
+    driver,
+    browserWsBySession,
+    broadcastToSession,
+    enrichSessionDto,
+    convertAndBroadcastIfRevert,
+    publishService,
+    optimizeService,
+    screenshotService,
+    requireSessionEdit,
   };
 
-  return { app, db, driver, auth, github, publishService, screenshotService, handleWsUpgrade };
+  // Route modules, registered in the original order (Hono matches in registration order)
+  registerHealth(app, ctx);
+  const { llmProxy } = registerInternal(app, ctx);
+  registerAuth(app, ctx);
+  const { resumePendingRevert } = registerSessions(app, ctx);
+  registerWorkspace(app, ctx);
+  registerReview(app, ctx);
+  registerActions(app, ctx);
+  registerAdmin(app, ctx);
+  const { previewProxy } = registerStatic(app, ctx);
+  const { handleWsUpgrade } = registerWs(app, ctx, { previewProxy, resumePendingRevert });
+
+  /** Stops control-plane-owned background timers (the armed-run reconcile loop). Idempotent. */
+  const dispose = () => {
+    disposed = true;
+    clock.clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+    // Publish CI/deploy poll loops stop at their next step; their runs resume after restart
+    publishService.shutdown();
+  };
+
+  /**
+   * Last step before the database closes on shutdown: records spend for LLM streams still in
+   * flight (and aborts their upstream calls) so no usage is lost to a closed SQLite handle.
+   */
+  const drainInFlight = () => {
+    llmProxy.drain();
+  };
+
+  return {
+    app,
+    db,
+    driver,
+    auth,
+    github,
+    publishService,
+    screenshotService,
+    handleWsUpgrade,
+    dispose,
+    drainInFlight,
+  };
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
@@ -2165,14 +282,45 @@ if (isMain) {
   for (const envFile of ['.env.local', '.env', '../../.env.local', '../../.env']) {
     try {
       process.loadEnvFile(envFile);
-    } catch {
-      // ignore missing env file
+    } catch (err) {
+      // A missing env file is normal; anything else (unreadable, malformed) deserves a warning
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        ignore(err, 'loading env file failed', { envFile });
+      }
     }
   }
   Object.assign(process.env, preExistingEnv);
+
+  // Last-resort handlers. A stray rejection is logged and survived; an uncaught exception leaves
+  // the process in an unknown state, so log it, close SQLite cleanly and exit(1) so the container
+  // restart policy brings up a fresh process.
+  let fatalDb: ControlPlaneDb | null = null;
+  process.on('unhandledRejection', (reason) => {
+    logger.error('unhandled promise rejection', { err: reason });
+  });
+  process.on('uncaughtException', (err, origin) => {
+    logger.error('uncaught exception; exiting', { origin, err });
+    try {
+      fatalDb?.close();
+    } catch (closeErr) {
+      logger.error('closing database after uncaught exception failed', { err: closeErr });
+    }
+    process.exit(1);
+  });
+
   const config = loadConfig();
-  const cp = createControlPlane(config);
-  const stopReaper = startSessionReaper(config, cp.db, cp.driver);
+  // The process-level timers below (shutdown grace, startup reconcile retry) share the clock
+  // the control plane runs on.
+  const clock: Clock = realClock;
+  const cp = createControlPlane(config, undefined, undefined, { clock });
+  fatalDb = cp.db;
+  const stopReaper = startSessionReaper(config, cp.db, cp.driver, {
+    clock,
+    extraPasses: [{ name: 'manual-merge reconcile', run: () => cp.publishService.reconcileManualMerges() }],
+  });
+  void fs
+    .mkdir(path.join(config.dataDir, 'backups'), { recursive: true })
+    .catch((err) => ignore(err, 'creating backups directory failed', { dataDir: config.dataDir }));
 
   const server = serve({
     fetch: cp.app.fetch,
@@ -2187,23 +335,54 @@ if (isMain) {
   });
 
   let shuttingDown = false;
-  const shutdown = () => {
+  const SHUTDOWN_GRACE_MS = 10_000;
+  const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    logger.info('shutting down: draining in-flight requests', { signal, graceMs: SHUTDOWN_GRACE_MS });
     stopReaper();
+    cp.dispose();
+    // Stop accepting new connections/upgrades; let in-flight HTTP requests finish within the grace.
+    for (const client of wss.clients) client.close(1012, 'Server restarting');
     wss.close();
-    server.close();
-    void Promise.allSettled([
-      Promise.resolve(cp.driver.stopWarmPool?.()),
-      Promise.resolve(cp.driver.close?.()),
-      cp.screenshotService.close(),
-    ]).finally(() => {
-      cp.db.close();
-      process.exit(0);
-    });
+    const drained = new Promise<void>((resolve) => server.close(() => resolve()));
+    const httpServer = server as unknown as { closeIdleConnections?: () => void; closeAllConnections?: () => void };
+    httpServer.closeIdleConnections?.();
+    const grace = new Promise<'timeout'>((resolve) => clock.setTimeout(() => resolve('timeout'), SHUTDOWN_GRACE_MS));
+    void Promise.race([drained.then(() => 'drained' as const), grace])
+      .then((outcome) => {
+        if (outcome === 'timeout') {
+          logger.warn('shutdown grace elapsed; closing remaining connections');
+          httpServer.closeAllConnections?.();
+        }
+        cp.drainInFlight();
+        return Promise.allSettled([
+          Promise.resolve(cp.driver.stopWarmPool?.()),
+          Promise.resolve(cp.driver.close?.()),
+          cp.screenshotService.close(),
+        ]);
+      })
+      .finally(() => {
+        cp.db.close();
+        process.exit(0);
+      });
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // Opt-in orphan containment for local / test launches (Docker's tini never goes away): if whatever
+  // started us dies, shut down cleanly, which also stops the local supervisor and its sessions.
+  if (process.env.HALLEY_EXIT_WITH_PARENT === '1') {
+    const originalPpid = process.ppid;
+    const checkParent = () => {
+      if (process.ppid !== originalPpid) {
+        logger.warn('control plane: parent process died; shutting down');
+        shutdown('parent-exit');
+        return;
+      }
+      realClock.setTimeout(checkParent, 2_000); // realClock timers are unref'd
+    };
+    realClock.setTimeout(checkParent, 2_000);
+  }
 
   console.log(`[halley-control-plane] listening on http://0.0.0.0:${config.port} (repo=${config.repo})`);
   if (cp.driver.runDoctorChecks) {
@@ -2215,17 +394,17 @@ if (isMain) {
         if (!report.ok && cp.driver.reconcileSessions) {
           // Workspaces container may still be finishing entrypoint/startup; retry reconciliation briefly
           for (let attempt = 0; attempt < 15 && !shuttingDown; attempt++) {
-            await new Promise((r) => setTimeout(r, 2_000));
+            await clock.sleep(2_000);
             try {
               await cp.driver.reconcileSessions();
               break;
-            } catch {
-              // still starting
+            } catch (err) {
+              ignore(err, 'startup reconcile: workspaces still starting', { attempt }, 'debug');
             }
           }
         }
-      } catch {
-        // ignore startup check error
+      } catch (err) {
+        ignore(err, 'startup doctor checks failed');
       }
     })();
   }

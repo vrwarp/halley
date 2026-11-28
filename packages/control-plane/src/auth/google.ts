@@ -2,8 +2,10 @@ import crypto from 'node:crypto';
 import type { UserDto } from '@halley/shared';
 import type { Context, Next } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+import { realClock, type Clock, type FetchFn } from '../clock.js';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb } from '../db.js';
+import { ignore } from '../log.js';
 
 const COOKIE_NAME = 'halley_session';
 const OAUTH_STATE_COOKIE = 'halley_oauth_state';
@@ -19,7 +21,7 @@ function signToken(payload: object, secret: string): string {
   return `${data}.${sig}`;
 }
 
-function verifyToken<T>(token: string, secret: string): T | null {
+function verifyToken<T>(token: string, secret: string, nowMs: number): T | null {
   const parts = token.split('.');
   if (parts.length !== 2) return null;
   const [data, sig] = parts as [string, string];
@@ -27,24 +29,36 @@ function verifyToken<T>(token: string, secret: string): T | null {
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let parsed: (T & { exp?: number }) | null;
   try {
-    const parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8')) as T & { exp?: number };
-    if (parsed.exp && Date.now() > parsed.exp) return null;
-    return parsed;
-  } catch {
+    parsed = JSON.parse(Buffer.from(data, 'base64url').toString('utf8')) as (T & { exp?: number }) | null;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    // The HMAC matched, so this was signed with our secret yet is not JSON: a real fault, not a bad cookie.
+    ignore(err, 'auth: signed token payload is not valid JSON', { length: data.length });
     return null;
   }
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.exp && nowMs > parsed.exp) return null;
+  return parsed;
 }
 
 export class AuthService {
+  private readonly clock: Clock;
+  private readonly fetchImpl: FetchFn;
+
   constructor(
     private config: HalleyConfig,
     private db: ControlPlaneDb,
-  ) {}
+    deps: { clock?: Clock; fetch?: FetchFn } = {},
+  ) {
+    this.clock = deps.clock ?? realClock;
+    this.fetchImpl = deps.fetch ?? ((input, init) => fetch(input, init));
+  }
 
   private resolveUserFromRawToken(raw: string | undefined): UserDto | null {
     if (!raw) return null;
-    const payload = verifyToken<SessionPayload>(raw, this.config.sessionSecret);
+    const payload = verifyToken<SessionPayload>(raw, this.config.sessionSecret, this.clock.now());
     if (!payload) return null;
     const user = this.db.getUserById(payload.userId);
     if (!user) return null;
@@ -64,11 +78,15 @@ export class AuthService {
       const name = part.slice(0, idx).trim();
       if (name === COOKIE_NAME) {
         const raw = part.slice(idx + 1).trim();
+        let token = raw;
         try {
-          return this.resolveUserFromRawToken(decodeURIComponent(raw));
-        } catch {
-          return this.resolveUserFromRawToken(raw);
+          token = decodeURIComponent(raw);
+        } catch (err) {
+          if (!(err instanceof URIError)) throw err;
+          // Malformed percent-encoding: our cookie is base64url (never needs decoding), so use it as-is.
+          ignore(err, 'auth: session cookie has malformed percent-encoding; using raw value', {}, 'debug');
         }
+        return this.resolveUserFromRawToken(token);
       }
     }
     return null;
@@ -76,7 +94,7 @@ export class AuthService {
 
   issueSessionCookie(c: Context, userId: string): void {
     const token = signToken(
-      { userId, exp: Date.now() + 14 * 24 * 60 * 60 * 1000 } satisfies SessionPayload,
+      { userId, exp: this.clock.now() + 14 * 24 * 60 * 60 * 1000 } satisfies SessionPayload,
       this.config.sessionSecret,
     );
     setCookie(c, COOKIE_NAME, token, {
@@ -98,7 +116,7 @@ export class AuthService {
     const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
 
     const cookieVal = signToken(
-      { state, codeVerifier, exp: Date.now() + 10 * 60_000 },
+      { state, codeVerifier, exp: this.clock.now() + 10 * 60_000 },
       this.config.sessionSecret,
     );
     setCookie(c, OAUTH_STATE_COOKIE, cookieVal, {
@@ -133,12 +151,13 @@ export class AuthService {
     const saved = verifyToken<{ state: string; codeVerifier: string; exp: number }>(
       rawCookie,
       this.config.sessionSecret,
+      this.clock.now(),
     );
     if (!saved || saved.state !== state) {
       return { ok: false, reason: 'Invalid OAuth state' };
     }
 
-    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    const tokenRes = await this.fetchImpl('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
@@ -149,7 +168,7 @@ export class AuthService {
         grant_type: 'authorization_code',
         code_verifier: saved.codeVerifier,
       }),
-      signal: AbortSignal.timeout(15_000),
+      signal: this.clock.timeoutSignal(15_000),
     });
     if (!tokenRes.ok) {
       return { ok: false, reason: 'Failed to exchange Google authorization code' };
@@ -159,9 +178,9 @@ export class AuthService {
       return { ok: false, reason: 'No access token from Google' };
     }
 
-    const userRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+    const userRes = await this.fetchImpl('https://openidconnect.googleapis.com/v1/userinfo', {
       headers: { Authorization: `Bearer ${tokenJson.access_token}` },
-      signal: AbortSignal.timeout(15_000),
+      signal: this.clock.timeoutSignal(15_000),
     });
     if (!userRes.ok) {
       return { ok: false, reason: 'Failed to fetch Google profile' };
