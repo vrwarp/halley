@@ -875,11 +875,30 @@ describe('control-plane auth, allowlist, spend caps & session permissions', () =
         },
       };
 
+      // Hermetic GitHub: the revert route verifies commit files before undoing.
+      const mockGitHub = http.createServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.method === 'GET' && /\/commits\/[0-9a-f]{40}$/.test(req.url ?? '')) {
+          res.end(JSON.stringify({ files: [{ filename: 'src/pages/index.astro' }] }));
+          return;
+        }
+        res.end('[]');
+      });
+      await new Promise<void>((r) => mockGitHub.listen(0, '127.0.0.1', () => r()));
+      const mockGitHubUrl = `http://127.0.0.1:${(mockGitHub.address() as AddressInfo).port}`;
+      mockGitHub.unref(); // never keeps the test process alive
+
       const cfg = {
         ...loadConfig(),
         dataDir: path.join(tmp, 'data'),
         devLoginEnabled: true,
         adminEmails: ['sarah@thecrossing.website'],
+        githubApiBaseUrl: mockGitHubUrl,
+        githubToken: 'test-token',
+        githubAppId: '',
+        githubAppPrivateKey: '',
+        githubAppInstallationId: '',
+        devLocalRepo: '',
       };
       const cp = createControlPlane(cfg, driver as never);
 

@@ -10,6 +10,7 @@ import { ControlPlaneDb } from '../src/db.js';
 import type { WorkspaceDriver } from '../src/drivers/workspace-driver.js';
 import { GitHubService, matchesDeployWorkflow } from '../src/github/client.js';
 import { PublishService } from '../src/routes/publish.js';
+import { FakeClock } from './helpers/fake-clock.js';
 
 interface MockRouteHandler {
   (req: http.IncomingMessage, res: http.ServerResponse, url: URL): void;
@@ -118,7 +119,9 @@ describe('deploy workflow matching & deploy check reliability', () => {
 
     const stopped: string[] = [];
     const broadcasts: PublishProgressPayload[] = [];
-    const github = new GitHubService(cfg);
+    // Virtual time: deploy polling and GitHub retry backoff never wait on the wall clock
+    const clock = new FakeClock({ autoAdvance: true });
+    const github = new GitHubService(cfg, undefined, { clock });
     const publish = new PublishService(
       cfg,
       db,
@@ -134,6 +137,7 @@ describe('deploy workflow matching & deploy check reliability', () => {
         maxConsecutiveErrors: 3,
         ...pollOverrides,
       },
+      { clock },
     );
 
     return { db, github, publish, session: db.getSession(session.id)!, broadcasts, stopped };
@@ -360,7 +364,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
     const second = await setupSession(failingMock.url);
     await second.publish.retryDeployCheck(second.session);
 
-    expect(failCalls).toBe(3);
+    // 3 deploy polls (maxConsecutiveErrors) x 3 attempts each (GitHubService retries idempotent GETs on 5xx)
+    expect(failCalls).toBe(9);
     expect(second.db.getSession(second.session.id)?.status).toBe('merged');
     expect(second.db.getSession(second.session.id)?.publish_state).toBe('failed_deploy');
     expect(second.db.getSession(second.session.id)?.publish_error).toContain('failed repeatedly');
@@ -494,7 +499,8 @@ describe('deploy workflow matching & deploy check reliability', () => {
       }
       if (url.pathname === '/internal/git/changes') {
         res.writeHead(200);
-        res.end(JSON.stringify({ changes: [] }));
+        // checkpoints[0] is the runner HEAD: the commit verify ran on and the PR must point at
+        res.end(JSON.stringify({ changes: [], checkpoints: [{ sha: 'head999' }] }));
         return;
       }
       res.writeHead(404);

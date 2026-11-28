@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 import type { SpendPurpose } from '@halley/shared';
 import type { Context } from 'hono';
+import { realClock, timeoutSignal, type Clock, type FetchFn } from '../clock.js';
 import type { HalleyConfig } from '../config.js';
 import type { ControlPlaneDb } from '../db.js';
+import { ignore, logger } from '../log.js';
 
 // Per-million-token pricing (USD) for Anthropic models, aligned with @earendil-works/pi-ai
 export const MODEL_RATES: Record<
@@ -132,8 +134,8 @@ function addUserReservation(userId: string, amountUsd: number): () => void {
   };
 }
 
-function pruneStaleRuns() {
-  const cutoff = Date.now() - 30 * 60_000;
+function pruneStaleRuns(nowMs: number) {
+  const cutoff = nowMs - 30 * 60_000;
   for (const [k, v] of activeRunSpendUsd.entries()) {
     if (v.updatedAt < cutoff) activeRunSpendUsd.delete(k);
   }
@@ -143,8 +145,13 @@ export function createLlmProxyHandler(
   config: HalleyConfig,
   db: ControlPlaneDb,
   onSpendUpdated?: (userId: string, sessionId: string) => void,
-): (c: Context) => Promise<Response> {
-  return async (c: Context): Promise<Response> => {
+  deps: { clock?: Clock; fetch?: FetchFn } = {},
+): LlmProxyHandler {
+  const clock = deps.clock ?? realClock;
+  const fetchImpl: FetchFn = deps.fetch ?? ((input, init) => fetch(input, init));
+  /** In-flight SSE streams: each entry records the usage seen so far and aborts the upstream. */
+  const inFlightStreams = new Set<() => void>();
+  const handler = async (c: Context): Promise<Response> => {
     const authHeader = c.req.header('authorization') || '';
     const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
     const xApiKey = c.req.header('x-api-key') || '';
@@ -163,15 +170,25 @@ export function createLlmProxyHandler(
       return c.json({ error: { message: 'Server ANTHROPIC_API_KEY is not configured' } }, 500);
     }
 
+    // An agent turn calling the model is session activity even when no browser tab is open:
+    // keep the idle reaper from stopping a workspace mid-turn (throttled in memory, ≤1 write/15s).
+    try {
+      db.touchSessionActivity(session.id);
+    } catch (err) {
+      ignore(err, 'llm-proxy: recording session activity failed', { sessionId: session.id });
+    }
+
     const subPath = c.req.path.replace(/^\/internal\/llm\/anthropic/, '') || '/v1/messages';
     const isCountTokens = subPath.includes('/count_tokens');
 
     const rawPurpose = (c.req.header('x-halley-purpose') || 'chat') as SpendPurpose;
     const purpose: SpendPurpose = VALID_PURPOSES.has(rawPurpose) ? rawPurpose : 'chat';
 
-    const bodyText = await c.req.text();
+    const bodyBytes = new Uint8Array(await c.req.arrayBuffer());
+    const bodyText = bodyBytes.byteLength > 0 ? utf8.decode(bodyBytes) : '';
     let requestedModel = config.modelId;
-    let safeBodyText = bodyText;
+    /** What goes upstream: the original bytes unless the model field had to be rewritten. */
+    let upstreamBody: Uint8Array | string = bodyBytes;
 
     if (bodyText.trim().length > 0) {
       let parsedBody: Record<string, unknown>;
@@ -197,12 +214,21 @@ export function createLlmProxyHandler(
         );
       }
 
-      if (typeof parsedBody.model === 'string' && parsedBody.model.trim().length > 0) {
-        requestedModel = parsedBody.model.trim();
+      const rawModel = parsedBody.model;
+      if (typeof rawModel === 'string' && rawModel.trim().length > 0) {
+        requestedModel = rawModel.trim();
       }
-      parsedBody.model = requestedModel;
-      safeBodyText = JSON.stringify(parsedBody);
+      // Forward the original bytes when the model the allowlist checks is exactly the one upstream
+      // will read: present, already trimmed, and the only `"model"` token in the body (a duplicate
+      // key could otherwise be read differently upstream). Anything else is re-serialized.
+      if (rawModel !== requestedModel || countOccurrences(bodyText, '"model"') !== 1) {
+        parsedBody.model = requestedModel;
+        upstreamBody = JSON.stringify(parsedBody);
+      }
     }
+    const upstreamBodyLength = typeof upstreamBody === 'string' ? upstreamBody.length : upstreamBody.byteLength;
+    const upstreamInit = (): RequestInit['body'] =>
+      upstreamBodyLength > 0 ? (upstreamBody as RequestInit['body']) : undefined;
 
     // F15: Enforce model allowlist (count_tokens is allowed for escalation model estimation)
     const allowCheckPurpose: SpendPurpose = isCountTokens ? 'conflict-escalation' : purpose;
@@ -234,13 +260,11 @@ export function createLlmProxyHandler(
     if (beta) headers['anthropic-beta'] = beta;
 
     if (isCountTokens) {
-      const upstream = await fetch(upstreamUrl, {
+      const upstream = await fetchImpl(upstreamUrl, {
         method: c.req.method,
         headers,
-        body: safeBodyText || undefined,
-        signal: c.req.raw.signal
-          ? AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(20_000)])
-          : AbortSignal.timeout(20_000),
+        body: upstreamInit(),
+        signal: timeoutSignal(clock, 20_000, c.req.raw.signal),
       });
       const txt = await upstream.text();
       return new Response(txt, {
@@ -266,7 +290,7 @@ export function createLlmProxyHandler(
     }
 
     // F16: Per-run hard ceiling check (used by escalation runs, capped at config.escalationMaxUsd)
-    pruneStaleRuns();
+    pruneStaleRuns(clock.now());
     const runId = c.req.header('x-halley-run-id') || '';
     const requestedCeiling = Number(c.req.header('x-halley-run-ceiling-usd') || '0');
     const runCeilingUsd =
@@ -291,7 +315,7 @@ export function createLlmProxyHandler(
       );
     }
 
-    const approxPromptTokens = Math.ceil(safeBodyText.length / 4);
+    const approxPromptTokens = Math.ceil(upstreamBodyLength / 4);
     const reservationUsd = Math.min(
       0.05,
       Math.max(
@@ -307,10 +331,10 @@ export function createLlmProxyHandler(
 
     let upstream: Response;
     try {
-      upstream = await fetch(upstreamUrl, {
+      upstream = await fetchImpl(upstreamUrl, {
         method: c.req.method,
         headers,
-        body: safeBodyText || undefined,
+        body: upstreamInit(),
         signal: abortController.signal,
       });
     } catch (err) {
@@ -323,7 +347,7 @@ export function createLlmProxyHandler(
       if (!effectiveRunKey || cost <= 0) return priorRunSpent;
       const cur = activeRunSpendUsd.get(effectiveRunKey)?.spent ?? 0;
       const next = cur + cost;
-      activeRunSpendUsd.set(effectiveRunKey, { spent: next, updatedAt: Date.now() });
+      activeRunSpendUsd.set(effectiveRunKey, { spent: next, updatedAt: clock.now() });
       return next;
     };
 
@@ -332,7 +356,17 @@ export function createLlmProxyHandler(
       c.req.raw.signal?.removeEventListener('abort', onClientAbort);
       const txt = await upstream.text();
       try {
-        const json = JSON.parse(txt) as {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(txt);
+        } catch (err) {
+          ignore(err, 'llm-proxy: upstream returned non-JSON body; no usage to bill', {
+            sessionId: session.id,
+            status: upstream.status,
+          }, 'debug');
+          parsedJson = null;
+        }
+        const json = (parsedJson ?? {}) as {
           model?: string;
           usage?: {
             input_tokens?: number;
@@ -358,8 +392,9 @@ export function createLlmProxyHandler(
           );
           onSpendUpdated?.(session.owner_user_id, session.id);
         }
-      } catch {
-        // ignore
+      } catch (err) {
+        // Losing a spend record weakens the daily cap: make it loud.
+        logger.error('llm-proxy: failed to record spend', { sessionId: session.id, purpose, err });
       } finally {
         releaseReservation();
       }
@@ -377,12 +412,21 @@ export function createLlmProxyHandler(
     let cacheRead = 0;
     let spendRecorded = false;
     let lineBuf = '';
+    let unparsedEvents = 0;
     const decoder = new TextDecoder();
 
     const flushSpendOnce = () => {
       if (spendRecorded) return;
       spendRecorded = true;
+      inFlightStreams.delete(drainStream);
       c.req.raw.signal?.removeEventListener('abort', onClientAbort);
+      if (unparsedEvents > 0) {
+        // Usage accounting may be incomplete if an event carrying usage was unparseable
+        logger.warn('llm-proxy: some SSE events could not be parsed for usage accounting', {
+          sessionId: session.id,
+          unparsedEvents,
+        });
+      }
       try {
         const cost = computeCostUsd(billedModel, {
           input_tokens: inputTokens,
@@ -402,14 +446,24 @@ export function createLlmProxyHandler(
           );
           onSpendUpdated?.(session.owner_user_id, session.id);
         }
-      } catch {
-        // Ignore if SQLite database was closed during graceful server shutdown
+      } catch (err) {
+        // Typically the SQLite database was closed during graceful shutdown; still worth a trace.
+        logger.error('llm-proxy: failed to record streamed spend', { sessionId: session.id, purpose, err });
       } finally {
         releaseReservation();
       }
     };
 
     const reader = upstream.body.getReader();
+    // Shutdown: bill what was streamed so far (before SQLite closes) and stop the upstream call
+    const drainStream = () => {
+      flushSpendOnce();
+      abortController.abort();
+      reader
+        .cancel()
+        .catch((err) => ignore(err, 'llm-proxy: cancelling upstream on shutdown failed', { sessionId: session.id }, 'debug'));
+    };
+    inFlightStreams.add(drainStream);
     const stream = new ReadableStream({
       async pull(controller) {
         let readResult: Awaited<ReturnType<typeof reader.read>>;
@@ -477,20 +531,26 @@ export function createLlmProxyHandler(
               if (priorRunSpent + currentCost > runCeilingUsd) {
                 flushSpendOnce();
                 abortController.abort();
-                reader.cancel().catch(() => {});
+                reader
+                  .cancel()
+                  .catch((err) => ignore(err, 'llm-proxy: cancelling upstream after ceiling failed', { sessionId: session.id }, 'debug'));
                 controller.close();
                 return;
               }
             }
           } catch {
-            // ignore partial JSON
+            // Lines are split on \n so a payload is complete; an unparseable one is counted and
+            // reported once when the stream ends (per-line logging would flood).
+            unparsedEvents += 1;
           }
         }
       },
       cancel() {
         flushSpendOnce();
         abortController.abort();
-        reader.cancel().catch(() => {});
+        reader
+          .cancel()
+          .catch((err) => ignore(err, 'llm-proxy: cancelling upstream after client abort failed', { sessionId: session.id }, 'debug'));
       },
     });
 
@@ -502,4 +562,26 @@ export function createLlmProxyHandler(
       },
     });
   };
+  return Object.assign(handler, {
+    inFlightStreams: () => inFlightStreams.size,
+    drain: () => {
+      for (const drainOne of [...inFlightStreams]) drainOne();
+    },
+  });
+}
+
+const utf8 = new TextDecoder();
+
+function countOccurrences(haystack: string, needle: string): number {
+  let n = 0;
+  for (let i = haystack.indexOf(needle); i !== -1; i = haystack.indexOf(needle, i + needle.length)) n++;
+  return n;
+}
+
+export interface LlmProxyHandler {
+  (c: Context): Promise<Response>;
+  /** Number of SSE responses still streaming. */
+  inFlightStreams(): number;
+  /** Records spend for every in-flight stream and aborts their upstream calls (graceful shutdown). */
+  drain(): void;
 }

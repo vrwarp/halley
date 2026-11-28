@@ -1,9 +1,11 @@
 import http from 'node:http';
 import { Readable, type Duplex } from 'node:stream';
+import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { Context } from 'hono';
 import type { AuthService } from '../auth/google.js';
 import type { ControlPlaneDb } from '../db.js';
 import { WorkspaceCrashLoopError, type WorkspaceDriver } from '../drivers/workspace-driver.js';
+import { ignore } from '../log.js';
 
 function escapeHtml(str: string): string {
   return str
@@ -91,7 +93,9 @@ function extractSessionFromUrl(rawUrl) {
     const u = new URL(rawUrl);
     const m = u.pathname.match(/^\\/p\\/([^/]+)(?:\\/|$)/);
     return m ? m[1] : null;
-  } catch {
+  } catch (err) {
+    if (!(err instanceof TypeError)) throw err; // only an unparseable URL is expected here
+    console.debug('[halley-sw] ignoring unparseable client URL', rawUrl, err);
     return null;
   }
 }
@@ -192,7 +196,10 @@ export function isAllowedWsOrigin(req: http.IncomingMessage, publicUrl?: string)
       if (pubHost && originHost === pubHost) return true;
     }
     return false;
-  } catch {
+  } catch (err) {
+    // new URL() throws TypeError for a malformed Origin header (or PUBLIC_URL): reject the upgrade.
+    if (!(err instanceof TypeError)) throw err;
+    ignore(err, 'preview ws: rejecting upgrade with unparseable origin', { origin }, 'debug');
     return false;
   }
 }
@@ -265,8 +272,8 @@ export function createPreviewProxy(
       return c.json({ error: 'Preview server is starting', retryable: true }, 503);
     }
 
-    // Only stamp activity once the session is confirmed running
-    db.updateSession(session.id, { last_active_at: new Date().toISOString() });
+    // Only stamp activity once the session is confirmed running (throttled: ≤1 write/15s/session)
+    db.touchSessionActivity(session.id);
     driver.touchSession?.(session.id);
 
     // Route `/__editor/*` directly to single-writer `workspace-runner` (never `astro dev`)
@@ -303,8 +310,11 @@ export function createPreviewProxy(
     // Request uncompressed upstream bytes so Node streams match stripped content-encoding
     headers['accept-encoding'] = 'identity';
 
+    // Stream request bodies (inline-edit patches, form posts) instead of buffering them
     const reqBody =
-      ['GET', 'HEAD'].includes(c.req.method) ? undefined : Buffer.from(await c.req.arrayBuffer());
+      c.req.method === 'GET' || c.req.method === 'HEAD' || !c.req.raw.body
+        ? null
+        : Readable.fromWeb(c.req.raw.body as unknown as NodeReadableStream<Uint8Array>);
 
     try {
       const upstream = await new Promise<http.IncomingMessage>((resolve, reject) => {
@@ -333,10 +343,12 @@ export function createPreviewProxy(
           c.req.raw.signal?.removeEventListener('abort', onAbort);
           reject(err);
         });
-        if (reqBody && reqBody.length > 0) {
-          proxyReq.write(reqBody);
+        if (reqBody) {
+          reqBody.on('error', (err) => proxyReq.destroy(err));
+          reqBody.pipe(proxyReq);
+        } else {
+          proxyReq.end();
         }
-        proxyReq.end();
       });
 
       const resHeaders = new Headers();
@@ -361,7 +373,8 @@ export function createPreviewProxy(
         status: upstream.statusCode ?? 200,
         headers: resHeaders,
       });
-    } catch {
+    } catch (err) {
+      ignore(err, 'preview proxy: upstream request failed', { sessionId, path: upstreamPath }, 'debug');
       const wantsHtml = (c.req.header('accept') || '').includes('text/html');
       if (wantsHtml) {
         return new Response(STARTING_STATUS_HTML, {
@@ -400,6 +413,12 @@ export function createPreviewProxy(
     socket: Duplex,
     head: Buffer,
   ) => {
+    // A client reset (ECONNRESET/EPIPE) on a raw upgrade socket with no 'error' listener is an
+    // uncaught exception that kills the whole control-plane: attach one before any await.
+    socket.on('error', (err) => {
+      ignore(err, 'preview upgrade socket error', { url: req.url }, 'debug');
+      socket.destroy();
+    });
     if (!isAllowedWsOrigin(req, publicUrl)) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       socket.destroy();
@@ -436,10 +455,12 @@ export function createPreviewProxy(
     try {
       const ep = await driver.ensureRunning(session);
       astroUrl = ep.astroUrl;
-    } catch {
+    } catch (err) {
+      ignore(err, 'preview upgrade: workspace not running', { sessionId }, 'debug');
       socket.destroy();
       return;
     }
+    if (socket.destroyed) return;
 
     driver.touchSession?.(sessionId);
 
@@ -469,6 +490,8 @@ export function createPreviewProxy(
       socket.pipe(proxySocket);
       proxySocket.on('error', () => socket.destroy());
       socket.on('error', () => proxySocket.destroy());
+      socket.on('close', () => proxySocket.destroy());
+      proxySocket.on('close', () => socket.destroy());
     });
 
     proxyReq.on('response', (proxyRes) => {

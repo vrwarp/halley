@@ -9,7 +9,10 @@ import type {
 } from '@halley/shared';
 import { slugifyRouteSegment } from '@halley/shared';
 import { deriveWorkspaceToken } from '@halley/shared/auth';
+import { realClock, type Clock, type FetchFn, type IdGenerator } from '../clock.js';
 import type { HalleyConfig } from '../config.js';
+import { createRunnerClient, type RunnerClient } from '../runner-client.js';
+import { ignore, logger, orDefault } from '../log.js';
 import type { ControlPlaneDb, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
 import { computeCostUsd, getModelRate, hashWorkspaceToken } from '../proxy/llm-proxy.js';
@@ -76,7 +79,18 @@ export class OptimizeService {
     private enrichSessionDto: (row: SessionRecord, viewer: UserDto) => EditorSessionDto,
     private onSessionMetaUpdated?: (sessionId: string) => void,
     private onSpendUpdated?: (userId: string) => void,
-  ) {}
+    deps: { fetch?: FetchFn; randomUUID?: IdGenerator; clock?: Clock } = {},
+  ) {
+    this.fetchImpl = deps.fetch ?? ((input, init) => fetch(input, init));
+    this.randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
+    this.clock = deps.clock ?? realClock;
+    this.runner = createRunnerClient(deps.fetch, this.clock);
+  }
+
+  private readonly clock: Clock;
+  private readonly fetchImpl: FetchFn;
+  private readonly randomUUID: IdGenerator;
+  private readonly runner: RunnerClient;
 
   async resolveConcreteAnthropicModel(aliasOrId: string): Promise<string> {
     const cached = this.cachedResolvedModels.get(aliasOrId);
@@ -94,22 +108,22 @@ export class OptimizeService {
 
     const fallback =
       family === 'opus'
-        ? 'claude-opus-4-6'
+        ? 'claude-opus-5-5'
         : family === 'sonnet'
-          ? 'claude-sonnet-4-6'
-          : 'claude-haiku-4-5';
+          ? 'claude-sonnet-5-5'
+          : 'claude-haiku-5-5';
 
     if (!this.config.anthropicApiKey) {
       return fallback;
     }
 
     try {
-      const res = await fetch(`${this.config.anthropicBaseUrl}/v1/models`, {
+      const res = await this.fetchImpl(`${this.config.anthropicBaseUrl}/v1/models`, {
         headers: {
           'x-api-key': this.config.anthropicApiKey,
           'anthropic-version': '2023-06-01',
         },
-        signal: AbortSignal.timeout(4000),
+        signal: this.clock.timeoutSignal(4000),
       });
       if (res.ok) {
         const json = (await res.json()) as { data?: Array<{ id: string }> };
@@ -135,8 +149,9 @@ export class OptimizeService {
           return picked;
         }
       }
-    } catch {
-      // fall back cleanly
+    } catch (err) {
+      // Model list unavailable: fall back to the configured alias/default
+      ignore(err, 'optimize: resolving model alias failed; using fallback', { aliasOrId, fallback }, 'debug');
     }
 
     return fallback;
@@ -188,7 +203,7 @@ export class OptimizeService {
     let inputTokens = Math.ceil((system.length + userPrompt.length) / 3.8);
     if (this.config.anthropicApiKey) {
       try {
-        const ctRes = await fetch(`${this.config.anthropicBaseUrl}/v1/messages/count_tokens`, {
+        const ctRes = await this.fetchImpl(`${this.config.anthropicBaseUrl}/v1/messages/count_tokens`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -200,7 +215,7 @@ export class OptimizeService {
             system,
             messages: [{ role: 'user', content: userPrompt }],
           }),
-          signal: AbortSignal.timeout(8000),
+          signal: this.clock.timeoutSignal(8000),
         });
         if (ctRes.ok) {
           const ctJson = (await ctRes.json()) as { input_tokens?: number };
@@ -208,8 +223,9 @@ export class OptimizeService {
             inputTokens = ctJson.input_tokens;
           }
         }
-      } catch {
+      } catch (err) {
         // use character heuristic fallback
+        ignore(err, 'optimize: token count request failed; estimating from characters', {}, 'debug');
       }
     }
 
@@ -266,7 +282,7 @@ export class OptimizeService {
     const maxOutputByCeiling = Math.floor((remainingCeilingUsd / rate.output) * 1_000_000);
     const maxTokens = Math.max(512, Math.min(3000, maxOutputByCeiling));
 
-    const res = await fetch(`${this.config.anthropicBaseUrl}/v1/messages`, {
+    const res = await this.fetchImpl(`${this.config.anthropicBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -279,11 +295,13 @@ export class OptimizeService {
         system,
         messages: [{ role: 'user', content: userPrompt }],
       }),
-      signal: AbortSignal.timeout(90_000),
+      signal: this.clock.timeoutSignal(90_000),
     });
 
     if (!res.ok) {
-      const errBody = await res.text().catch(() => res.statusText);
+      const errBody = await orDefault(res.text(), res.statusText, 'optimize: reading Anthropic error body failed', {
+        status: res.status,
+      }, 'debug');
       throw new Error(`Anthropic Deep AI Review failed (${res.status}): ${errBody.slice(0, 300)}`);
     }
 
@@ -371,8 +389,9 @@ export class OptimizeService {
             agentInstructions: item.agentInstructions?.trim() || item.description.trim(),
           });
         }
-      } catch {
+      } catch (err) {
         // keep default empty findings if model returned malformed JSON
+        ignore(err, 'optimize: AI review returned malformed findings JSON', { sha });
       }
     }
 
@@ -417,7 +436,7 @@ export class OptimizeService {
     const hasAgentRefactors = selected.some((f) => f.actionKind === 'agent_refactor');
     const useEscalation = Boolean(input.useEscalationModel ?? true) && hasAgentRefactors;
 
-    let sessionId: string = crypto.randomUUID();
+    let sessionId: string = this.randomUUID();
     let volumeName = `halley-ws-${sessionId}`;
     let warmId: string | null = null;
 
@@ -442,34 +461,39 @@ export class OptimizeService {
 
     let session: SessionRecord;
     try {
-      session = this.db.createSession({
-        id: sessionId,
-        title,
-        slug,
-        kind: 'edit',
-        ownerUserId: user.id,
-        repo: this.config.repo,
-        baseBranch: this.config.baseBranch,
-        workingBranch: `halley/${slug}-${short}`,
-        volumeName,
-        workspaceTokenHash: hashWorkspaceToken(rawToken),
+      // One transaction: never leave a half-configured optimize session (e.g. missing escalation flag)
+      session = this.db.transaction(() => {
+        const created = this.db.createSession({
+          id: sessionId,
+          title,
+          slug,
+          kind: 'edit',
+          ownerUserId: user.id,
+          repo: this.config.repo,
+          baseBranch: this.config.baseBranch,
+          workingBranch: `halley/${slug}-${short}`,
+          volumeName,
+          workspaceTokenHash: hashWorkspaceToken(rawToken),
+        });
+        if (useEscalation) {
+          this.db.updateSession(created.id, {
+            optimize_escalation_allowed: 1,
+            active_model_label: this.config.escalationModelId,
+          });
+        } else if (hasAgentRefactors) {
+          this.db.updateSession(created.id, {
+            active_model_label: this.config.modelId,
+          });
+        }
+        return created;
       });
     } catch (err) {
       if (warmId) {
-        await this.driver.releaseWarmWorkspace?.(warmId).catch(() => {});
+        await this.driver
+          .releaseWarmWorkspace?.(warmId)
+          .catch((releaseErr) => ignore(releaseErr, 'optimize: releasing warm workspace failed', { warmId }));
       }
       throw err;
-    }
-
-    if (useEscalation) {
-      this.db.updateSession(session.id, {
-        optimize_escalation_allowed: 1,
-        active_model_label: this.config.escalationModelId,
-      });
-    } else if (hasAgentRefactors) {
-      this.db.updateSession(session.id, {
-        active_model_label: this.config.modelId,
-      });
     }
 
     this.driver.setRawWorkspaceToken?.(session.id, rawToken);
@@ -484,7 +508,7 @@ export class OptimizeService {
     void (async () => {
       try {
         const ep = await this.driver.ensureRunning(freshSession);
-        const res = await fetch(`${ep.runnerUrl}/internal/optimize/start`, {
+        const res = await this.runner.runnerFetch(`${ep.runnerUrl}/internal/optimize/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -502,13 +526,17 @@ export class OptimizeService {
           this.onSessionMetaUpdated?.(session.id);
         }
       } catch (err) {
-        this.db.updateSession(session.id, {
-          status: 'error',
-          publish_error: err instanceof Error ? err.message : 'Failed to start optimization draft',
-          optimize_escalation_allowed: 0,
-          active_model_label: null,
-        });
-        this.onSessionMetaUpdated?.(session.id);
+        logger.warn('optimize: starting optimization draft failed', { sessionId: session.id, err });
+        try {
+          this.db.setSessionStatus(session.id, 'error', {
+            publish_error: err instanceof Error ? err.message : 'Failed to start optimization draft',
+            optimize_escalation_allowed: 0,
+            active_model_label: null,
+          });
+          this.onSessionMetaUpdated?.(session.id);
+        } catch (dbErr) {
+          logger.error('optimize: recording start failure failed', { sessionId: session.id, err: dbErr });
+        }
       }
     })();
 

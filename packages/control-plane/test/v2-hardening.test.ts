@@ -266,7 +266,7 @@ describe('v2 control-plane hardening invariants', () => {
 
       // Wait until req1 reaches upstream and holds an in-flight spend reservation
       while (!releaseFirstStream) {
-        await new Promise((r) => setTimeout(r, 15));
+        await new Promise((r) => setImmediate(r));
       }
 
       // Concurrent req2 arrives BEFORE req1 finishes streaming -> blocked by TOCTOU spend reservation (429)!
@@ -575,7 +575,7 @@ describe('v2 control-plane hardening invariants', () => {
           if (updated?.status === 'published' && updated.publish_state === 'published') {
             break;
           }
-          await new Promise((r) => setTimeout(r, 50));
+          await new Promise((r) => setImmediate(r));
         }
         const finalSess = cp2.db.getSession(sess.id);
         expect(finalSess?.status).toBe('published');

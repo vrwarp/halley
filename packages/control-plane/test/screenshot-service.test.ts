@@ -1,9 +1,23 @@
 import { EventEmitter } from 'node:events';
 import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
-import { ScreenshotService } from './screenshot-service.js';
+import type { Clock } from '../src/clock.js';
+import { ScreenshotBusyError, ScreenshotService, ScreenshotTimeoutError } from '../src/screenshot-service.js';
+import { FakeClock } from './helpers/fake-clock.js';
 
-function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delta: number) => void }) {
+/** Lets pending promise continuations (and setImmediate-based fake-clock steps) run. */
+const flush = async (rounds = 5) => {
+  for (let i = 0; i < rounds; i++) await new Promise((r) => setImmediate(r));
+};
+
+function createFakeBrowser(opts?: {
+  gotoDelayMs?: number;
+  onActiveChange?: (delta: number) => void;
+  /** goto never settles while the browser stays "connected" (a wedged Chromium). */
+  hangGoto?: () => boolean;
+  /** Clock for gotoDelayMs (default: real timers). */
+  clock?: Clock;
+}) {
   const emitter = new EventEmitter();
   let connected = true;
   let contextsCreated = 0;
@@ -23,8 +37,12 @@ function createFakeBrowser(opts?: { gotoDelayMs?: number; onActiveChange?: (delt
           goto: async (url: string) => {
             opts?.onActiveChange?.(1);
             visitedUrls.push(url);
+            if (opts?.hangGoto?.()) {
+              await new Promise(() => {});
+            }
             if (opts?.gotoDelayMs) {
-              await new Promise((r) => setTimeout(r, opts.gotoDelayMs));
+              if (opts.clock) await opts.clock.sleep(opts.gotoDelayMs);
+              else await new Promise((r) => setTimeout(r, opts.gotoDelayMs));
             }
           },
           waitForTimeout: async () => {},
@@ -123,7 +141,9 @@ describe('ScreenshotService', () => {
     let launchCount = 0;
     const fakes: Array<ReturnType<typeof createFakeBrowser>> = [];
 
+    const clock = new FakeClock();
     const svc = new ScreenshotService({
+      clock,
       idleTimeoutMs: 50,
       settleWaitMs: 0,
       launchBrowser: async () => {
@@ -136,11 +156,13 @@ describe('ScreenshotService', () => {
 
     try {
       svc.prewarm();
-      await new Promise((r) => setTimeout(r, 15));
+      await flush();
       expect(launchCount).toBe(1);
       expect(svc.isBrowserRunning()).toBe(true);
 
-      await new Promise((r) => setTimeout(r, 90));
+      await clock.advance(49);
+      expect(svc.isBrowserRunning()).toBe(true);
+      await clock.advance(1);
       expect(svc.isBrowserRunning()).toBe(false);
       expect(fakes[0]!.stats().closeCalls).toBe(1);
     } finally {
@@ -152,7 +174,9 @@ describe('ScreenshotService', () => {
     let launchCount = 0;
     const fakes: Array<ReturnType<typeof createFakeBrowser>> = [];
 
+    const clock = new FakeClock();
     const svc = new ScreenshotService({
+      clock,
       idleTimeoutMs: 40,
       settleWaitMs: 0,
       launchBrowser: async () => {
@@ -168,7 +192,9 @@ describe('ScreenshotService', () => {
       expect(launchCount).toBe(1);
       expect(svc.isBrowserRunning()).toBe(true);
 
-      await new Promise((r) => setTimeout(r, 90));
+      await clock.advance(39);
+      expect(svc.isBrowserRunning()).toBe(true);
+      await clock.advance(1);
       expect(svc.isBrowserRunning()).toBe(false);
       expect(fakes[0]!.stats().closeCalls).toBe(1);
 
@@ -525,6 +551,117 @@ describe('ScreenshotService', () => {
       expect(events).toContain('complete-async-img-decoded');
       expect(events).toContain('font-loaded');
       expect(events[events.length - 1]).toBe('screenshot');
+    } finally {
+      await svc.close();
+    }
+  });
+
+  it('rejects with ScreenshotBusyError (503) once more than maxQueue captures are waiting', async () => {
+    const clock = new FakeClock({ autoAdvance: true });
+    const svc = new ScreenshotService({
+      clock,
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      maxConcurrency: 1,
+      maxQueue: 2,
+      launchBrowser: async () => createFakeBrowser({ gotoDelayMs: 40, clock }).browser,
+    });
+    try {
+      const ok = [1, 2, 3].map((i) => svc.capture({ url: `http://ws/p/s/${i}`, viewport: 'desktop' }));
+      const rejected = svc.capture({ url: 'http://ws/p/s/4', viewport: 'desktop' });
+      await expect(rejected).rejects.toBeInstanceOf(ScreenshotBusyError);
+      await expect(rejected).rejects.toMatchObject({ status: 503 });
+      const results = await Promise.all(ok);
+      expect(results).toHaveLength(3);
+      expect(svc.stats.rejectedBusy).toBe(1);
+    } finally {
+      await svc.close();
+    }
+  });
+
+  it('enforces a per-capture deadline (queue wait included), closes the context and recycles a hung browser', async () => {
+    let launches = 0;
+    let hang = true;
+    const fakes: Array<ReturnType<typeof createFakeBrowser>> = [];
+    const clock = new FakeClock();
+    const svc = new ScreenshotService({
+      clock,
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      maxConcurrency: 1,
+      captureDeadlineMs: 120,
+      launchBrowser: async () => {
+        launches += 1;
+        const fake = createFakeBrowser({ hangGoto: () => hang });
+        fakes.push(fake);
+        return fake.browser;
+      },
+    });
+    try {
+      const started = clock.now();
+      const hung = svc.capture({ url: 'http://ws/p/s/hung', viewport: 'desktop' });
+      // Queued behind the hung capture: its own deadline covers the time spent waiting
+      const queued = svc.capture({ url: 'http://ws/p/s/queued', viewport: 'desktop' });
+      const hungResult = expect(hung).rejects.toBeInstanceOf(ScreenshotTimeoutError);
+      const queuedResult = expect(queued).rejects.toBeInstanceOf(ScreenshotTimeoutError);
+      await flush();
+      await clock.advance(119);
+      expect(svc.stats.timeouts).toBe(0);
+      await clock.advance(1);
+      await hungResult;
+      await queuedResult;
+      const elapsed = clock.now() - started;
+      expect(elapsed).toBe(120);
+      // The hung capture's context was closed and the (still "connected") browser recycled
+      expect(fakes[0]!.stats().contextsClosed).toBe(fakes[0]!.stats().contextsCreated);
+      expect(fakes[0]!.stats().closeCalls).toBe(1);
+      expect(svc.stats.timeouts).toBe(2);
+
+      // Slots are free again and a fresh browser serves the next capture
+      hang = false;
+      const ok = await svc.capture({ url: 'http://ws/p/s/after', viewport: 'desktop' });
+      expect(ok.data.toString()).toBe('fake-jpeg');
+      // The queued capture may be granted the slot just before its own deadline and get a fresh
+      // (equally wedged) browser, which is recycled too; the last browser is the healthy one.
+      expect(launches).toBeGreaterThanOrEqual(2);
+      for (const fake of fakes.slice(0, -1)) expect(fake.stats().closeCalls).toBe(1);
+      expect(fakes.at(-1)!.stats().connected).toBe(true);
+    } finally {
+      await svc.close();
+    }
+  });
+
+  it('recycles Chromium after recycleAfterCaptures captures without disturbing in-flight work', async () => {
+    let launches = 0;
+    const fakes: Array<ReturnType<typeof createFakeBrowser>> = [];
+    // Manual clock: auto-advance would also fire the 60s idle-close timer between captures.
+    const clock = new FakeClock();
+    const svc = new ScreenshotService({
+      clock,
+      idleTimeoutMs: 60_000,
+      settleWaitMs: 0,
+      maxConcurrency: 2,
+      recycleAfterCaptures: 2,
+      launchBrowser: async () => {
+        launches += 1;
+        const fake = createFakeBrowser({ gotoDelayMs: 5, clock });
+        fakes.push(fake);
+        return fake.browser;
+      },
+    });
+    try {
+      for (let i = 0; i < 5; i++) {
+        const shot = svc.capture({ url: `http://ws/p/s/${i}`, viewport: 'desktop' });
+        await flush();
+        await clock.advance(5); // the fake goto delay
+        await shot;
+      }
+      expect(launches).toBe(3); // 2 + 2 + 1 captures
+      await flush();
+      expect(fakes[0]!.stats().closeCalls).toBe(1);
+      expect(fakes[1]!.stats().closeCalls).toBe(1);
+      expect(fakes[2]!.stats().connected).toBe(true);
+      expect(svc.stats.recycles).toBe(2);
     } finally {
       await svc.close();
     }
