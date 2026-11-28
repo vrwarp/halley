@@ -1016,6 +1016,9 @@ describe('deploy workflow matching & deploy check reliability', () => {
   async function publishWithFakes(opts: {
     publishSkipCi: boolean;
     onMerge: (res: http.ServerResponse, ctx: { checkRunPolls: number; markMerged: () => void }) => void;
+    /** Extra step appended to the fake repo's PR CI workflow. */
+    ciExtraStep?: string;
+    workflowsStatus?: number;
   }) {
     const runnerReplies: Record<string, unknown> = {
       '/internal/git/checkpoint': { ok: true, checkpoint: null },
@@ -1062,6 +1065,35 @@ describe('deploy workflow matching & deploy check reliability', () => {
           state: merged ? 'closed' : 'open',
           head: { sha: 'head999' },
         });
+      }
+      if (url.pathname.endsWith('/actions/workflows')) {
+        return send(opts.workflowsStatus ?? 200, {
+          workflows: [
+            { id: 1, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' },
+            { id: 2, name: 'Deploy to GitHub Pages', path: '.github/workflows/deploy.yml', state: 'active' },
+          ],
+        });
+      }
+      if (url.pathname.endsWith('/contents/.github/workflows/ci.yml')) {
+        expect(url.searchParams.get('ref')).toBe('head999');
+        const yaml = [
+          'on:',
+          '  pull_request:',
+          'jobs:',
+          '  verify:',
+          '    steps:',
+          '      - uses: actions/checkout@v4',
+          '      - run: npm ci',
+          '      - run: npm run check',
+          '      - run: npm run build',
+          '      - run: npm run verify:seo',
+          ...(opts.ciExtraStep ? [`      - run: ${opts.ciExtraStep}`] : []),
+        ].join('\n');
+        return send(200, { encoding: 'base64', content: Buffer.from(yaml).toString('base64') });
+      }
+      if (url.pathname.endsWith('/contents/.github/workflows/deploy.yml')) {
+        const yaml = 'on:\n  push:\njobs:\n  deploy:\n    steps:\n      - run: ./anything.sh\n';
+        return send(200, { encoding: 'base64', content: Buffer.from(yaml).toString('base64') });
       }
       if (url.pathname.endsWith('/check-runs')) {
         seen.checkRunPolls += 1;
@@ -1209,6 +1241,25 @@ describe('deploy workflow matching & deploy check reliability', () => {
     });
     expect(t.seen.mergeCalls).toBe(2); // refused once (no retry), then merged after CI passed
     expect(t.seen.checkRunPolls).toBeGreaterThanOrEqual(1);
+    expect(t.states).toContain('waiting_ci');
+    expect(t.session.publish_state).toBe('published');
+  });
+
+  it.each([
+    ['PR CI has a step Halley does not run locally', { ciExtraStep: 'npx eslint .' }],
+    ['the workflows cannot be read', { workflowsStatus: 403 }],
+  ])('HALLEY_PUBLISH_SKIP_CI still waits for CI when %s', async (_label, extra) => {
+    const t = await publishWithFakes({
+      publishSkipCi: true,
+      ...extra,
+      onMerge: (res, ctx) => {
+        expect(ctx.checkRunPolls).toBeGreaterThanOrEqual(1);
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(t.seen.mergeCalls).toBe(1);
     expect(t.states).toContain('waiting_ci');
     expect(t.session.publish_state).toBe('published');
   });

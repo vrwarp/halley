@@ -753,6 +753,25 @@ export class PublishService {
   }
 
   /**
+   * True when the repo's pull-request CI (as of the verified commit) only repeats checks Halley
+   * already ran locally. Fails closed: a CI-only step, or any error reading GitHub, means wait for CI.
+   */
+  private async ciIsCoveredByLocalChecks(ref: string, ctx: { sessionId: string; runId: string }): Promise<boolean> {
+    try {
+      const coverage = await this.github.getCiCoverage(ref);
+      if (coverage.covered) return true;
+      logger.info('publish: PR CI runs checks Halley does not run locally; waiting for CI', {
+        ...ctx,
+        gaps: coverage.gaps.slice(0, 10).map((g) => `${g.workflow}:${g.line} ${g.step} (${g.detail})`),
+      });
+      return false;
+    } catch (err) {
+      logger.warn('publish: could not inspect PR CI workflows; waiting for CI', { ...ctx, err });
+      return false;
+    }
+  }
+
+  /**
    * Squash-merges a freshly opened PR without waiting for its CI (HALLEY_PUBLISH_SKIP_CI). The
    * merge is pinned to the verified commit. Returns the merge commit, or null when GitHub refuses
    * so the caller can wait for CI instead. GitHub computes mergeability asynchronously after a PR
@@ -1095,9 +1114,10 @@ export class PublishService {
       const commitMsg = `${prBody}\n\nCo-authored-by: ${actor.name} <${actor.email}>`;
 
       // Optional fast path: the exact commit already passed the local checks, so merge it now
-      // instead of waiting for the PR's CI run to repeat them. A refusal (e.g. branch protection
+      // instead of waiting for the PR's CI run to repeat them. Only taken when the repo's PR CI
+      // contains nothing beyond those checks. A refusal (e.g. branch protection
       // requiring status checks) falls through to the normal wait-for-CI path below.
-      if (this.config.publishSkipCi) {
+      if (this.config.publishSkipCi && (await this.ciIsCoveredByLocalChecks(verifiedSha, { sessionId: session.id, runId }))) {
         const mergedSha = await this.tryMergeWithoutCi(pr.number, verifiedSha, prTitle, commitMsg, {
           sessionId: session.id,
           runId,
