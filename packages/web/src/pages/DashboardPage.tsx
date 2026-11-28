@@ -6,18 +6,17 @@ import {
   GitCommitHorizontal,
   History,
   Loader2,
-  LogOut,
   Plus,
   RotateCcw,
   Settings,
   Trash2,
-  Zap,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { AccountMenu } from '../components/AccountMenu.js';
 import { BranchOffModal } from '../components/BranchOffModal.js';
 import { HalleyLogo } from '../components/HalleyLogo.js';
-import { InstallAppButton } from '../components/InstallAppButton.js';
+import { InstallAppBanner } from '../components/InstallAppBanner.js';
 import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
@@ -226,61 +225,51 @@ export function DashboardPage({
   return (
     <div className="min-h-dvh bg-[#FAF9F7] text-[#1C1917]">
       <header
-        className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/90 backdrop-blur"
+        className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/92 backdrop-blur"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-3 sm:px-6 sm:py-3.5">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <HalleyLogo className="h-8 w-8 shrink-0 rounded-lg" />
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-2 sm:px-6 sm:py-2.5">
+          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+            <HalleyLogo className="h-[34px] w-[34px] shrink-0 rounded-[9px]" />
             <div className="min-w-0">
-              <h1 className="text-sm font-semibold tracking-tight text-stone-900">Halley</h1>
-              <p className="truncate text-xs text-stone-500">{repo}</p>
+              <h1 className="text-sm font-semibold leading-tight tracking-tight text-stone-900">
+                Halley
+              </h1>
+              <p className="truncate text-xs leading-snug text-stone-500">{repo}</p>
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-2 sm:gap-3">
-            <span className="hidden text-xs text-stone-500 md:inline">
-              Daily AI budget: ${spend.spentTodayUsd.toFixed(2)} / $
-              {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}
-            </span>
-            <InstallAppButton />
-            {user.isAdmin && (
-              <>
-                {onOpenOptimize && (
+          <div className="flex shrink-0 items-center gap-3">
+            <div className="hidden items-center gap-3 md:flex">
+              <span className="text-xs text-stone-500 tabular-nums">
+                Daily AI budget{' '}
+                <strong className="font-semibold text-stone-700">
+                  ${spend.spentTodayUsd.toFixed(2)} / $
+                  {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(0)}
+                </strong>
+              </span>
+              {user.isAdmin && (
+                <>
+                  <span className="h-4 w-px bg-[#E7E5E4]" aria-hidden="true" />
                   <button
                     type="button"
-                    onClick={onOpenOptimize}
-                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50/70 px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100/70 sm:px-3"
+                    onClick={onOpenAdmin}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] font-medium text-stone-700 transition hover:bg-stone-100/80 hover:text-stone-900"
                   >
-                    <Zap className="h-3.5 w-3.5 text-amber-600" />
-                    <span className="hidden sm:inline">Optimize Astro</span>
-                    <span className="sm:hidden">Optimize</span>
+                    <Settings className="h-3.5 w-3.5 text-stone-500" />
+                    <span>Admin</span>
                   </button>
-                )}
-                <button
-                  type="button"
-                  onClick={onOpenAdmin}
-                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 py-1.5 text-xs font-medium text-stone-700 hover:bg-stone-50 sm:px-3"
-                >
-                  <Settings className="h-3.5 w-3.5" />
-                  <span>Admin</span>
-                </button>
-              </>
-            )}
-            <div className="flex items-center gap-1.5 border-l border-stone-200 pl-2 sm:gap-2 sm:pl-3">
-              <span className="hidden max-w-[120px] truncate text-xs font-medium text-stone-700 sm:inline">
-                {user.name}
-              </span>
-              <button
-                type="button"
-                onClick={onLogout}
-                title="Sign out"
-                aria-label="Sign out"
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
-              >
-                <LogOut className="h-4 w-4" />
-              </button>
+                </>
+              )}
             </div>
+
+            <AccountMenu
+              user={user}
+              spend={spend}
+              onOpenAdmin={onOpenAdmin}
+              onOpenOptimize={onOpenOptimize}
+              onLogout={onLogout}
+            />
           </div>
         </div>
       </header>
@@ -563,6 +552,8 @@ export function DashboardPage({
             )}
           </section>
         )}
+
+        <InstallAppBanner />
       </main>
 
       {/* Undo publication reason modal (Q1, Q5, Q17) */}
