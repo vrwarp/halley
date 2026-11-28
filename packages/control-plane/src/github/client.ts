@@ -33,6 +33,68 @@ export class GitHubApiError extends Error {
   }
 }
 
+export interface GitHubRetryOptions {
+  /** Maximum number of retries after the initial attempt (default: 3 -> 4 total attempts). */
+  maxRetries?: number;
+  /** Base backoff delay in ms before doubling (default: 1000 -> 1s, 2s, 4s). */
+  baseDelayMs?: number;
+  /** Upper bound for any single retry delay in ms (default: 15000). */
+  maxDelayMs?: number;
+  /** Additive random jitter ratio in [0, 1] applied to exponential delays (default: 0.2). */
+  jitterRatio?: number;
+  /** Custom sleep implementation (useful for deterministic unit tests). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const DEFAULT_RETRY_OPTIONS: Required<GitHubRetryOptions> = {
+  maxRetries: 3,
+  baseDelayMs: 1000,
+  maxDelayMs: 15_000,
+  jitterRatio: 0.2,
+  sleep: (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+export function isTransientGitHubStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+export function isTransientGitHubError(err: unknown): boolean {
+  if (err instanceof GitHubApiError) {
+    return isTransientGitHubStatus(err.status);
+  }
+  if (err instanceof Error) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return true;
+    }
+    const pattern =
+      /fetch failed|timeout|timed out|aborted|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|network/i;
+    if (pattern.test(err.message)) {
+      return true;
+    }
+    const cause = (err as { cause?: unknown }).cause;
+    if (cause instanceof Error) {
+      if (pattern.test(cause.message)) return true;
+      const code = (cause as { code?: unknown }).code;
+      if (typeof code === 'string' && pattern.test(code)) return true;
+    }
+  }
+  return false;
+}
+
+export function parseRetryAfterMs(headerValue: string | null, maxDelayMs: number): number | null {
+  if (!headerValue) return null;
+  const trimmed = headerValue.trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) {
+    return Math.min(maxDelayMs, Math.max(0, Number(trimmed) * 1000));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (!Number.isNaN(parsedDate)) {
+    return Math.min(maxDelayMs, Math.max(0, parsedDate - Date.now()));
+  }
+  return null;
+}
+
 const DEFAULT_DEPLOY_WORKFLOW_RE = /(?:^|[\s/_-])(deploy|pages)(?:$|[\s/._-])/i;
 
 export function matchesDeployWorkflow(
@@ -52,12 +114,87 @@ export function matchesDeployWorkflow(
 
 export class GitHubService {
   private cachedInstallToken: { token: string; expiresAt: number } | null = null;
+  private retryOptions: Required<GitHubRetryOptions>;
 
-  constructor(private config: HalleyConfig) {}
+  constructor(
+    private config: HalleyConfig,
+    retryOptions?: GitHubRetryOptions,
+  ) {
+    this.retryOptions = { ...DEFAULT_RETRY_OPTIONS, ...retryOptions };
+  }
 
   get ownerRepo(): { owner: string; repo: string } {
     const [owner = '', repo = ''] = this.config.repo.split('/');
     return { owner, repo };
+  }
+
+  private computeRetryDelayMs(attempt: number, retryAfterHeader: string | null): number {
+    const retryAfter = parseRetryAfterMs(retryAfterHeader, this.retryOptions.maxDelayMs);
+    if (retryAfter !== null) {
+      return retryAfter;
+    }
+    const base = Math.min(
+      this.retryOptions.maxDelayMs,
+      this.retryOptions.baseDelayMs * 2 ** attempt,
+    );
+    const jitter =
+      base > 0 && this.retryOptions.jitterRatio > 0
+        ? Math.round(Math.random() * base * this.retryOptions.jitterRatio)
+        : 0;
+    return base + jitter;
+  }
+
+  private async fetchWithRetry(
+    url: string,
+    pathForError: string,
+    buildInit: () => RequestInit,
+    opts: { allowRetry: boolean; formatError?: (status: number, bodyText: string) => string },
+  ): Promise<Response> {
+    const maxAttempts = opts.allowRetry ? this.retryOptions.maxRetries + 1 : 1;
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const init = buildInit();
+      const callerSignal = init.signal;
+      try {
+        const res = await fetch(url, {
+          ...init,
+          signal: callerSignal ?? AbortSignal.timeout(15_000),
+        });
+        if (res.ok) {
+          return res;
+        }
+        const retryAfter = res.headers.get('retry-after');
+        const bodyText = await res.text().catch(() => '');
+        const message = opts.formatError
+          ? opts.formatError(res.status, bodyText)
+          : `GitHub API ${pathForError} failed (${res.status}): ${bodyText}`;
+        const apiErr = new GitHubApiError(res.status, pathForError, message);
+        if (attempt + 1 < maxAttempts && isTransientGitHubStatus(res.status)) {
+          lastError = apiErr;
+          await this.retryOptions.sleep(this.computeRetryDelayMs(attempt, retryAfter));
+          continue;
+        }
+        throw apiErr;
+      } catch (err) {
+        if (err instanceof GitHubApiError) {
+          throw err;
+        }
+        if (callerSignal?.aborted) {
+          throw err;
+        }
+        if (attempt + 1 < maxAttempts && isTransientGitHubError(err)) {
+          lastError = err;
+          await this.retryOptions.sleep(this.computeRetryDelayMs(attempt, null));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`GitHub API ${pathForError} failed after retries`);
   }
 
   private createAppJwt(): string {
@@ -83,26 +220,23 @@ export class GitHubService {
       if (this.cachedInstallToken && Date.now() < this.cachedInstallToken.expiresAt - 120_000) {
         return this.cachedInstallToken.token;
       }
-      const jwt = this.createAppJwt();
-      const res = await fetch(
-        `${this.config.githubApiBaseUrl}/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
-        {
+      const tokenPath = `/app/installations/${this.config.githubAppInstallationId}/access_tokens`;
+      const res = await this.fetchWithRetry(
+        `${this.config.githubApiBaseUrl}${tokenPath}`,
+        tokenPath,
+        () => ({
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${jwt}`,
+            Authorization: `Bearer ${this.createAppJwt()}`,
             Accept: 'application/vnd.github+json',
             'User-Agent': 'halley-editor',
           },
-          signal: AbortSignal.timeout(15_000),
+        }),
+        {
+          allowRetry: true,
+          formatError: (status, bodyText) => `GitHub App token failed: ${status} ${bodyText}`,
         },
       );
-      if (!res.ok) {
-        throw new GitHubApiError(
-          res.status,
-          `/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
-          `GitHub App token failed: ${res.status} ${await res.text()}`,
-        );
-      }
       const data = (await res.json()) as { token: string; expires_at: string };
       this.cachedInstallToken = {
         token: data.token,
@@ -117,26 +251,29 @@ export class GitHubService {
     throw new Error('No GitHub App or GITHUB_TOKEN configured');
   }
 
-  private async api<T>(path: string, init?: RequestInit): Promise<T> {
+  private async api<T>(
+    path: string,
+    init?: RequestInit,
+    opts?: { retry?: boolean },
+  ): Promise<T> {
     const token = await this.getAccessToken();
-    const res = await fetch(`${this.config.githubApiBaseUrl}${path}`, {
-      ...init,
-      signal: init?.signal ?? AbortSignal.timeout(15_000),
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'User-Agent': 'halley-editor',
-        ...(init?.headers ?? {}),
-      },
-    });
-    if (!res.ok) {
-      throw new GitHubApiError(
-        res.status,
-        path,
-        `GitHub API ${path} failed (${res.status}): ${await res.text()}`,
-      );
-    }
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const allowRetry = opts?.retry ?? method !== 'POST';
+    const res = await this.fetchWithRetry(
+      `${this.config.githubApiBaseUrl}${path}`,
+      path,
+      () => ({
+        ...init,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'halley-editor',
+          ...(init?.headers ?? {}),
+        },
+      }),
+      { allowRetry },
+    );
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   }
@@ -148,51 +285,70 @@ export class GitHubService {
     body: string;
   }): Promise<PrInfo> {
     const { owner, repo } = this.ownerRepo;
-    const existing = await this.api<
-      Array<{ number: number; html_url: string; node_id: string; head: { sha: string } }>
-    >(`/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${input.headBranch}`)}`);
+    const maxAttempts = this.retryOptions.maxRetries + 1;
 
-    if (existing[0]) {
-      const updated = await this.api<{
-        number: number;
-        html_url: string;
-        node_id: string;
-        head: { sha: string };
-      }>(`/repos/${owner}/${repo}/pulls/${existing[0].number}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: input.title, body: input.body }),
-      });
-      return {
-        number: updated.number,
-        url: updated.html_url,
-        nodeId: updated.node_id,
-        headSha: updated.head.sha,
-      };
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const existing = await this.api<
+        Array<{ number: number; html_url: string; node_id: string; head: { sha: string } }>
+      >(`/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${input.headBranch}`)}`);
+
+      if (existing[0]) {
+        const updated = await this.api<{
+          number: number;
+          html_url: string;
+          node_id: string;
+          head: { sha: string };
+        }>(`/repos/${owner}/${repo}/pulls/${existing[0].number}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: input.title, body: input.body }),
+        });
+        return {
+          number: updated.number,
+          url: updated.html_url,
+          nodeId: updated.node_id,
+          headSha: updated.head.sha,
+        };
+      }
+
+      try {
+        const created = await this.api<{
+          number: number;
+          html_url: string;
+          node_id: string;
+          head: { sha: string };
+        }>(
+          `/repos/${owner}/${repo}/pulls`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: input.title,
+              body: input.body,
+              head: input.headBranch,
+              base: input.baseBranch,
+            }),
+          },
+          { retry: false },
+        );
+
+        return {
+          number: created.number,
+          url: created.html_url,
+          nodeId: created.node_id,
+          headSha: created.head.sha,
+        };
+      } catch (err) {
+        if (attempt + 1 < maxAttempts && isTransientGitHubError(err)) {
+          // Re-check for an existing open PR on the next attempt so a partial POST never creates duplicates
+          await this.retryOptions.sleep(this.computeRetryDelayMs(attempt, null));
+          continue;
+        }
+        throw err;
+      }
     }
 
-    const created = await this.api<{
-      number: number;
-      html_url: string;
-      node_id: string;
-      head: { sha: string };
-    }>(`/repos/${owner}/${repo}/pulls`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: input.title,
-        body: input.body,
-        head: input.headBranch,
-        base: input.baseBranch,
-      }),
-    });
-
-    return {
-      number: created.number,
-      url: created.html_url,
-      nodeId: created.node_id,
-      headSha: created.head.sha,
-    };
+    throw new Error('Failed to create or update pull request after retries');
   }
 
   async tryEnableNativeAutoMerge(
