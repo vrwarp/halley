@@ -268,12 +268,25 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
+const MUTATING_EDITOR_ENDPOINTS = new Set([
+  '/__editor/patch',
+  '/__editor/mutate',
+  '/__editor/upload-image',
+  '/__editor/undo',
+  '/__editor/redo',
+]);
+
 function isEditorRunnerEndpoint(pathname: string): string | null {
   for (const suffix of [
     '/__editor/health',
     '/__editor/routes',
+    '/__editor/images',
     '/__editor/inspect',
     '/__editor/patch',
+    '/__editor/mutate',
+    '/__editor/upload-image',
+    '/__editor/undo',
+    '/__editor/redo',
   ]) {
     if (pathname === suffix || pathname.endsWith(suffix)) {
       return suffix;
@@ -337,10 +350,11 @@ export function createPreviewProxy(
 
     const editorAction = isEditorRunnerEndpoint(effectivePathname);
 
-    // Block inline edit patches if viewer is not owner/admin or session is published/merged
+    // Block mutating inline edit endpoints if viewer is not owner/admin or session is published/merged
     if (
       c.req.method === 'POST' &&
-      editorAction === '/__editor/patch' &&
+      editorAction &&
+      MUTATING_EDITOR_ENDPOINTS.has(editorAction) &&
       ((session.owner_user_id !== user.id && !user.isAdmin) ||
         session.status === 'published' ||
         session.status === 'merged')
