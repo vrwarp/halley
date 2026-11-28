@@ -13,13 +13,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: 'pnpm'
@@ -32,6 +32,12 @@ jobs:
 
       - name: Typecheck all packages
         run: pnpm typecheck
+
+      - name: Test repo scripts (silent-catch detector)
+        run: node --test 'scripts/*.test.mjs'
+
+      - name: Check silent catch blocks did not increase
+        run: pnpm check:no-silent-catch
 
       - name: Run unit & integration tests
         run: pnpm test
@@ -49,13 +55,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: 'pnpm'
@@ -64,10 +70,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build halley-control-plane image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/control-plane.Dockerfile
@@ -77,7 +83,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=halley-control-plane
 
       - name: Build halley-workspace image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/workspace.Dockerfile
@@ -91,3 +97,99 @@ jobs:
 
       - name: Run 2-container Docker smoke test
         run: pnpm test:docker-smoke
+
+  # Release: only runs for pushes to main, and only after verify + docker-smoke succeeded for
+  # this exact SHA (replaces the former independent dockerhub-push.yml, which raced CI).
+  docker-push:
+    name: Push to Docker Hub (${{ matrix.image.name }}, sha tag)
+    needs: [verify, docker-smoke]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: dockerhub-push-${{ matrix.image.name }}
+      cancel-in-progress: false
+    strategy:
+      # Either both images get their sha tag or the run fails (and `latest` is not moved).
+      fail-fast: true
+      matrix:
+        image:
+          - name: halley-control-plane
+            dockerfile: docker/control-plane.Dockerfile
+          - name: halley-workspace
+            dockerfile: docker/workspace.Dockerfile
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image.name }}
+          # Only the immutable sha tag here; `latest` is moved for both images together below.
+          tags: |
+            type=sha,prefix=
+
+      - name: Build and push image to Docker Hub
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+  docker-promote-latest:
+    name: Move Docker Hub `latest` to this SHA (both images)
+    needs: [docker-push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: dockerhub-promote-latest
+      cancel-in-progress: false
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Retag sha -> latest (no rebuild)
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          # metadata-action `type=sha,prefix=` emits the 7-char short SHA.
+          short_sha="${GITHUB_SHA::7}"
+          # Never move `latest` backwards: an older run that finishes after a newer one must not promote.
+          head_sha="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          if [ "${head_sha}" != "${GITHUB_SHA}" ]; then
+            echo "main has moved on to ${head_sha}; leaving latest for the newer run to promote."
+            exit 0
+          fi
+          for image in halley-control-plane halley-workspace; do
+            docker buildx imagetools inspect "${DOCKERHUB_USERNAME}/${image}:${short_sha}" >/dev/null
+          done
+          for image in halley-control-plane halley-workspace; do
+            docker buildx imagetools create \
+              --tag "${DOCKERHUB_USERNAME}/${image}:latest" \
+              "${DOCKERHUB_USERNAME}/${image}:${short_sha}"
+          done
