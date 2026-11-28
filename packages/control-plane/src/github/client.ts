@@ -1,3 +1,4 @@
+import { analyzeCiCoverage, parseHalleyCheckCommands, type CiCoverageReport } from '@halley/shared';
 import crypto from 'node:crypto';
 import { realClock, type Clock, type FetchFn } from '../clock.js';
 import type { HalleyConfig } from '../config.js';
@@ -752,6 +753,45 @@ export class GitHubService {
     }
 
     return false;
+  }
+
+  /** Text of a repository file at `ref`, or null when it does not exist there. */
+  private async readRepoFile(filePath: string, ref: string): Promise<string | null> {
+    const { owner, repo } = this.ownerRepo;
+    const cleanPath = filePath.replace(/^\/+/, '');
+    try {
+      const res = await this.api<{ content?: string; encoding?: string }>(
+        `/repos/${owner}/${repo}/contents/${cleanPath.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`,
+      );
+      if (typeof res.content !== 'string') return null;
+      return res.encoding === 'base64'
+        ? Buffer.from(res.content.replace(/\s+/g, ''), 'base64').toString('utf8')
+        : res.content;
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * Checks, at commit `ref`, whether the repo's pull-request CI only repeats checks Halley runs
+   * locally before publishing. Throws when GitHub cannot be read: callers must treat that as
+   * "not covered".
+   */
+  async getCiCoverage(ref: string): Promise<CiCoverageReport> {
+    const { owner, repo } = this.ownerRepo;
+    const data = await this.api<{ workflows: Array<{ path: string; state: string }> }>(
+      `/repos/${owner}/${repo}/actions/workflows?per_page=100`,
+    );
+    const paths = (data.workflows ?? [])
+      .filter((w) => w.state === 'active' && /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(w.path ?? ''))
+      .map((w) => w.path);
+    const [halleyJson, ...texts] = await Promise.all([
+      this.readRepoFile('.halley.json', ref),
+      ...paths.map((p) => this.readRepoFile(p, ref)),
+    ]);
+    const workflows = paths.flatMap((p, i) => (texts[i] != null ? [{ path: p, text: texts[i]! }] : []));
+    return analyzeCiCoverage(workflows, { halleyCheckCommands: parseHalleyCheckCommands(halleyJson ?? null) });
   }
 
   async hasActiveDeployWorkflow(): Promise<boolean> {

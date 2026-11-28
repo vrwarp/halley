@@ -161,7 +161,7 @@ import HeroBanner from '../components/HeroBanner.astro';
       'public/og-image.png': bigPng,
       'public/images/cards/featured.png': bigPng,
       '.github/workflows/deploy.yml': `name: Deploy\non:\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: withastro/action@v3\n  deploy:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/deploy-pages@v4\n`,
-      '.github/workflows/ci.yml': `name: CI\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n`,
+      '.github/workflows/ci.yml': `name: CI\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm ci\n      - run: npm run build\n      - name: Link hygiene\n        run: |\n          node -e 'process.exit(0)'\n`,
     });
 
     try {
@@ -205,6 +205,13 @@ import HeroBanner from '../components/HeroBanner.astro';
         'https://github.com/vrwarp/unoptimized-site/edit/main/.github/workflows/deploy.yml',
       );
       expect(deployWf?.workflowSuggestion?.yamlContent).toContain('sleep 3');
+
+      // Pillar 5: CI-only step that Halley's pre-publish checks do not run
+      const ciOnly = report.findings.find((f) => f.title.includes('CI-only check'));
+      expect(ciOnly?.actionKind).toBe('agent_refactor');
+      expect(ciOnly?.files).toEqual([
+        expect.objectContaining({ path: '.github/workflows/ci.yml', line: 14, detail: expect.stringContaining('Link hygiene') }),
+      ]);
     } finally {
       await cleanup();
     }

@@ -1011,4 +1011,270 @@ describe('deploy workflow matching & deploy check reliability', () => {
     expect(finalBroadcast?.retryable).toBe(true);
     expect(finalBroadcast?.error).toContain('GitHub had a temporary hiccup');
   });
+
+  /** Minimal end-to-end publish against fake runner + GitHub; `onMerge` answers PUT /pulls/99/merge. */
+  async function publishWithFakes(opts: {
+    publishSkipCi: boolean;
+    onMerge: (res: http.ServerResponse, ctx: { checkRunPolls: number; markMerged: () => void }) => void;
+    /** Extra step appended to the fake repo's PR CI workflow. */
+    ciExtraStep?: string;
+    workflowsStatus?: number;
+  }) {
+    const runnerReplies: Record<string, unknown> = {
+      '/internal/git/checkpoint': { ok: true, checkpoint: null },
+      '/internal/sync/start': {
+        review: { status: 'applied', prevBaseSha: 'base000', newBaseSha: 'base111', touchedUserFiles: [] },
+      },
+      '/internal/verify': { allPassed: true, results: [] },
+      '/internal/git/protected-diff': { clean: true, protectedFiles: [] },
+      '/internal/read-only': { ok: true },
+      '/internal/transcript': { entries: [], usageUsd: 0 },
+      '/internal/git/changes': { changes: [], checkpoints: [{ sha: 'head999' }] },
+    };
+    const runner = await startMockGitHub((_req, res, url) => {
+      const reply = runnerReplies[url.pathname];
+      res.writeHead(reply ? 200 : 404);
+      res.end(JSON.stringify(reply ?? { error: 'Not found' }));
+    });
+    cleanups.push(() => runner.close());
+
+    const seen = { checkRunPolls: 0, mergeCalls: 0, graphqlCalls: 0 };
+    let merged = false;
+    const ghMock = await startMockGitHub((req, res, url) => {
+      const send = (status: number, payload: unknown) => {
+        res.writeHead(status);
+        res.end(JSON.stringify(payload));
+      };
+      if (req.method === 'POST' && url.pathname === '/graphql') {
+        seen.graphqlCalls += 1;
+        return send(200, { errors: [{ message: 'auto-merge disabled' }] });
+      }
+      if (req.method === 'GET' && url.pathname.endsWith('/pulls')) return send(200, []);
+      if (req.method === 'POST' && url.pathname.endsWith('/pulls')) {
+        return send(201, {
+          number: 99,
+          html_url: 'https://github.com/vrwarp/thecrossing.website/pull/99',
+          node_id: 'PR_99',
+          head: { sha: 'head999' },
+        });
+      }
+      if (req.method === 'GET' && url.pathname.endsWith('/pulls/99')) {
+        return send(200, {
+          merged,
+          merge_commit_sha: merged ? 'merge999' : null,
+          state: merged ? 'closed' : 'open',
+          head: { sha: 'head999' },
+        });
+      }
+      if (url.pathname.endsWith('/actions/workflows')) {
+        return send(opts.workflowsStatus ?? 200, {
+          workflows: [
+            { id: 1, name: 'CI', path: '.github/workflows/ci.yml', state: 'active' },
+            { id: 2, name: 'Deploy to GitHub Pages', path: '.github/workflows/deploy.yml', state: 'active' },
+          ],
+        });
+      }
+      if (url.pathname.endsWith('/contents/.github/workflows/ci.yml')) {
+        expect(url.searchParams.get('ref')).toBe('head999');
+        const yaml = [
+          'on:',
+          '  pull_request:',
+          'jobs:',
+          '  verify:',
+          '    steps:',
+          '      - uses: actions/checkout@v4',
+          '      - run: npm ci',
+          '      - run: npm run check',
+          '      - run: npm run build',
+          '      - run: npm run verify:seo',
+          ...(opts.ciExtraStep ? [`      - run: ${opts.ciExtraStep}`] : []),
+        ].join('\n');
+        return send(200, { encoding: 'base64', content: Buffer.from(yaml).toString('base64') });
+      }
+      if (url.pathname.endsWith('/contents/.github/workflows/deploy.yml')) {
+        const yaml = 'on:\n  push:\njobs:\n  deploy:\n    steps:\n      - run: ./anything.sh\n';
+        return send(200, { encoding: 'base64', content: Buffer.from(yaml).toString('base64') });
+      }
+      if (url.pathname.endsWith('/check-runs')) {
+        seen.checkRunPolls += 1;
+        return send(200, {
+          total_count: 1,
+          check_runs: [{ id: 1, name: 'verify', status: 'completed', conclusion: 'success' }],
+        });
+      }
+      if (url.pathname.endsWith('/status')) return send(200, { state: 'success', statuses: [] });
+      if (req.method === 'PUT' && url.pathname.endsWith('/pulls/99/merge')) {
+        seen.mergeCalls += 1;
+        return opts.onMerge(res, { checkRunPolls: seen.checkRunPolls, markMerged: () => (merged = true) });
+      }
+      if (url.pathname.endsWith('/actions/runs')) {
+        return send(200, {
+          workflow_runs: [
+            {
+              id: 500,
+              name: 'Deploy to GitHub Pages',
+              path: '.github/workflows/deploy.yml',
+              event: 'push',
+              status: 'completed',
+              conclusion: 'success',
+            },
+          ],
+        });
+      }
+      send(404, { message: 'Not found' });
+    });
+    cleanups.push(() => ghMock.close());
+
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'halley-pub-skipci-'));
+    const cfg = {
+      ...loadConfig(),
+      dataDir: tmp,
+      repo: 'vrwarp/thecrossing.website',
+      deployWorkflow: '',
+      publishSkipCi: opts.publishSkipCi,
+      githubApiBaseUrl: ghMock.url,
+      githubToken: 'test-token',
+      githubAppId: '',
+      githubAppPrivateKey: '',
+      githubAppInstallationId: '',
+    };
+    const db = new ControlPlaneDb(path.join(tmp, 'halley.db'), cfg);
+    cleanups.push(async () => {
+      db.db.close();
+      await fs.rm(tmp, { recursive: true, force: true });
+    });
+    const user = db.upsertUser({ email: 'editor@thecrossing.website', name: 'Editor', picture: null });
+    const session = db.createSession({
+      id: 'sess-skipci-1',
+      title: 'Skip CI test',
+      slug: 'skip-ci-test',
+      ownerUserId: user.id,
+      repo: cfg.repo,
+      baseBranch: 'main',
+      workingBranch: 'halley/skipci-1',
+      volumeName: 'vol-skipci-1',
+      workspaceTokenHash: 'hash-skipci-1',
+    });
+    const pushed: Array<string | undefined> = [];
+    const driver: WorkspaceDriver = {
+      ...createStubDriver(),
+      ensureRunning: async () => ({ runnerUrl: runner.url, astroUrl: '', astroBase: '', baseSha: 'base000' }),
+      pushSessionBranch: async (_s, _t, o) => {
+        pushed.push(o?.sha);
+      },
+    };
+    const states: string[] = [];
+    const clock = new FakeClock({ autoAdvance: true });
+    const publish = new PublishService(
+      cfg,
+      db,
+      driver,
+      new GitHubService(cfg, { maxAttempts: 1 }, { clock }),
+      (_id, payload) => states.push(payload.state),
+      undefined,
+      { initialDelayMs: 0, pollIntervalMs: 10, ciPollIntervalMs: 10, runRegistrationGraceMs: 1000, timeoutMs: 5000 },
+      { clock },
+    );
+    await publish.publish(
+      session,
+      { id: user.id, email: user.email, name: user.name, picture: null, isAdmin: true, persona: 'non-technical' },
+      { title: 'Skip CI test', summary: 'Updated 1 file.' },
+    );
+    return { seen, states, pushed, session: db.getSession(session.id)! };
+  }
+
+  it('HALLEY_PUBLISH_SKIP_CI merges the verified commit right after opening the PR, without polling CI', async () => {
+    const mergeBodies: string[] = [];
+    const t = await publishWithFakes({
+      publishSkipCi: true,
+      onMerge: (res, ctx) => {
+        mergeBodies.push(String(ctx.checkRunPolls));
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(t.pushed).toEqual(['head999']);
+    expect(t.seen.mergeCalls).toBe(1);
+    expect(mergeBodies).toEqual(['0']); // merged before any CI poll
+    expect(t.seen.checkRunPolls).toBe(0);
+    expect(t.seen.graphqlCalls).toBe(0); // native auto-merge never armed
+    expect(t.states).toContain('deploying_pages');
+    expect(t.session.publish_state).toBe('published');
+    expect(t.session.merged_sha).toBe('merge999');
+  });
+
+  it('HALLEY_PUBLISH_SKIP_CI retries a not-yet-mergeable PR briefly', async () => {
+    let attempts = 0;
+    const t = await publishWithFakes({
+      publishSkipCi: true,
+      onMerge: (res, ctx) => {
+        attempts += 1;
+        if (attempts < 3) {
+          res.writeHead(405);
+          res.end(JSON.stringify({ message: 'Pull Request is not mergeable' }));
+          return;
+        }
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(attempts).toBe(3);
+    expect(t.seen.checkRunPolls).toBe(0);
+    expect(t.session.publish_state).toBe('published');
+  });
+
+  it('HALLEY_PUBLISH_SKIP_CI falls back to waiting for CI when branch protection refuses the merge', async () => {
+    const t = await publishWithFakes({
+      publishSkipCi: true,
+      onMerge: (res, ctx) => {
+        if (ctx.checkRunPolls === 0) {
+          res.writeHead(405);
+          res.end(JSON.stringify({ message: 'Required status check "verify" is expected.' }));
+          return;
+        }
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(t.seen.mergeCalls).toBe(2); // refused once (no retry), then merged after CI passed
+    expect(t.seen.checkRunPolls).toBeGreaterThanOrEqual(1);
+    expect(t.states).toContain('waiting_ci');
+    expect(t.session.publish_state).toBe('published');
+  });
+
+  it.each([
+    ['PR CI has a step Halley does not run locally', { ciExtraStep: 'npx eslint .' }],
+    ['the workflows cannot be read', { workflowsStatus: 403 }],
+  ])('HALLEY_PUBLISH_SKIP_CI still waits for CI when %s', async (_label, extra) => {
+    const t = await publishWithFakes({
+      publishSkipCi: true,
+      ...extra,
+      onMerge: (res, ctx) => {
+        expect(ctx.checkRunPolls).toBeGreaterThanOrEqual(1);
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(t.seen.mergeCalls).toBe(1);
+    expect(t.states).toContain('waiting_ci');
+    expect(t.session.publish_state).toBe('published');
+  });
+
+  it('without HALLEY_PUBLISH_SKIP_CI the PR is only merged after CI has been polled', async () => {
+    const t = await publishWithFakes({
+      publishSkipCi: false,
+      onMerge: (res, ctx) => {
+        expect(ctx.checkRunPolls).toBeGreaterThanOrEqual(1);
+        ctx.markMerged();
+        res.writeHead(200);
+        res.end(JSON.stringify({ sha: 'merge999', merged: true }));
+      },
+    });
+    expect(t.seen.mergeCalls).toBe(1);
+    expect(t.session.publish_state).toBe('published');
+  });
 });

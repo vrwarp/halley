@@ -497,6 +497,9 @@ describe('control-plane reliability regressions', () => {
     const inFirstWindow = after.filter((at) => at <= t0 + 6200).length;
     // ticks at ~0, 1.5, 3.75, 7.1s → at most 3 ticks (3 calls each) in the window; was 5 ticks
     expect(inFirstWindow).toBeLessThanOrEqual(9);
+    // ...but the interval is held at <=3s for the first minute, so a ~20s CI run is noticed promptly
+    const ticksMidWindow = after.filter((at) => at > t0 + 20_000 && at <= t0 + 50_000).length / 3;
+    expect(ticksMidWindow).toBeGreaterThanOrEqual(9);
     console.log(
       `[R4] ${inFirstWindow} GitHub calls in the first 6.2s; ${after.length} calls over the whole 15-minute wait (was ~1800); ${wallMs}ms wall clock`,
     );

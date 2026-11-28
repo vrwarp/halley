@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { parseAstroSource } from '@halley/astro-dev-edit';
+import { analyzeCiCoverage, parseHalleyCheckCommands } from '@halley/shared';
 import type {
   AstroAuditMetricsDto,
   AstroAuditReportDto,
@@ -1020,6 +1021,36 @@ export async function scanBareGitRepo(
         },
       });
     }
+  }
+
+  // PR CI steps that Halley's own pre-publish checks do not run
+  const ciCoverage = analyzeCiCoverage(
+    [...texts.entries()]
+      .filter(([p]) => p.startsWith('.github/workflows/') && /\.ya?ml$/i.test(p))
+      .map(([p, text]) => ({ path: p, text })),
+    { halleyCheckCommands: parseHalleyCheckCommands(texts.get('.halley.json')) },
+  );
+  for (const wfPath of new Set(ciCoverage.gaps.map((g) => g.workflow))) {
+    const gaps = ciCoverage.gaps.filter((g) => g.workflow === wfPath);
+    const runner = hasPnpmLock ? 'pnpm' : 'npm';
+    findings.push({
+      id: findingId('ci-only-checks', wfPath),
+      pillar: 'speed_and_ci',
+      severity: 'medium',
+      actionKind: 'agent_refactor',
+      source: 'static',
+      title: `Move ${gaps.length} CI-only check${gaps.length === 1 ? '' : 's'} in \`${path.basename(wfPath)}\` into \`verify:*\` scripts`,
+      description:
+        'These pull-request CI steps are not part of Halley\'s pre-publish checks, so editors only learn about a failure after the PR is opened, and Halley has to wait for CI on every publish (`HALLEY_PUBLISH_SKIP_CI` stays inactive). Halley runs every `verify:*` script in `package.json` before publishing. After the scripts exist, replace each step in the workflow with the matching `' +
+        runner +
+        ' run verify:<name>` call on GitHub (Halley cannot edit `.github/`).',
+      impactLabel: 'Catches failures before the PR · lets publishes skip the ~25–35s CI wait',
+      files: gaps.map((g) => ({ path: wfPath, line: g.line, detail: `${g.step}: ${g.detail}` })),
+      scorePenalty: 4,
+      agentInstructions: `The pull-request workflow \`${wfPath}\` has steps that Halley's pre-publish checks do not run: ${gaps
+        .map((g) => `"${g.step}" (line ${g.line})`)
+        .join(', ')}. Read the workflow, then reproduce each step's logic as a zero-dependency Node script under \`scripts/\` exposed as a \`verify:<name>\` script in \`package.json\` (it runs after \`build\`, from the repo root, and must exit non-zero on failure). Do not edit anything under \`.github/\`. Confirm \`run_checks\` passes, then tell the user exactly which workflow steps to replace with \`${runner} run verify:<name>\` on GitHub.`,
+    });
   }
 
   const inlineEditablePct =
