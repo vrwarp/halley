@@ -60,6 +60,8 @@ export function buildClientBridgeScript(previewBase: string): string {
   let activeMeta = null;
   let originalHtml = '';
   let expectedHash = '';
+  let expectedFileHash = ''; // sha256 of the file at inspect time (lets the server relocate safely)
+  let expectedContentHash = '';
   let cachedRoutes = null;
   let savedRange = null;
 
@@ -415,7 +417,9 @@ export function buildClientBridgeScript(previewBase: string): string {
       });
       const data = await res.json();
       if (data && data.editability) return data;
-    } catch {}
+    } catch (err) {
+      console.warn('[halley-dev-edit] inspect request failed', err);
+    }
     return { editability: 'dynamic', reason: 'Could not inspect element' };
   }
 
@@ -439,11 +443,13 @@ export function buildClientBridgeScript(previewBase: string): string {
     sel.addRange(range);
   }
 
-  function beginEditing(el, meta, hash, point) {
+  function beginEditing(el, meta, info, point) {
     activeEl = el;
     activeMeta = meta;
     originalHtml = el.innerHTML;
-    expectedHash = hash;
+    expectedHash = info.snapshotHash || '';
+    expectedFileHash = info.fileHash || '';
+    expectedContentHash = info.contentHash || '';
     el.contentEditable = 'true';
     el.focus();
     placeCaret(el, point);
@@ -463,7 +469,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     selInfo = info;
     if (opts.allowEdit && info.editability === 'editable-static') {
       if (workspaceLocked) showToast('Halley is updating files — you can still ask about this');
-      else beginEditing(el, meta, info.snapshotHash, opts.point);
+      else beginEditing(el, meta, info, opts.point);
     }
     renderToolbar();
   }
@@ -528,7 +534,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     else if (which === 'parent') void selectParent();
     else if (which === 'edit') {
       if (selEl && selMeta && selInfo && selInfo.editability === 'editable-static' && !workspaceLocked) {
-        beginEditing(selEl, selMeta, selInfo.snapshotHash, null);
+        beginEditing(selEl, selMeta, selInfo, null);
         renderToolbar();
       }
     } else if (which === 'done') void clearSelection(true);
@@ -543,7 +549,8 @@ export function buildClientBridgeScript(previewBase: string): string {
       const res = await fetch(BASE + '/__editor/routes');
       const data = await res.json();
       cachedRoutes = Array.isArray(data.routes) ? data.routes : [];
-    } catch {
+    } catch (err) {
+      console.warn('[halley-dev-edit] loading routes for the link picker failed', err);
       cachedRoutes = [];
     }
     return cachedRoutes;
@@ -723,9 +730,35 @@ export function buildClientBridgeScript(previewBase: string): string {
       const res = await fetch(BASE + '/__editor/patch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file: meta.file, loc: meta.loc, expectedHash, newHtml }),
+        body: JSON.stringify({
+          file: meta.file,
+          loc: meta.loc,
+          expectedHash,
+          fileHash: expectedFileHash || undefined,
+          contentHash: expectedContentHash || undefined,
+          newHtml,
+        }),
       });
       const data = await res.json();
+      if (res.status === 409) {
+        // Stale snapshot: the file (or the element's position) changed since inspect, so this
+        // element's source loc may now point elsewhere. Never retry with the old loc — reload to
+        // get fresh locs; the next click re-inspects.
+        el.innerHTML = originalHtml;
+        if (selEl === el) selInfo = null;
+        showToast('This text changed on disk — refreshing…');
+        window.parent.postMessage({ type: 'halley:edit-error', message: data.error || 'Edit conflict' }, window.location.origin);
+        setTimeout(() => {
+          if (activeEl) return; // user started another edit; the next save will 409 again if stale
+          try {
+            sessionStorage.setItem('__halley_scroll_y', String(window.scrollY));
+          } catch (storageErr) {
+            if (!(storageErr instanceof DOMException)) console.warn('[halley-dev-edit] saving scroll position failed', storageErr);
+          }
+          window.location.reload();
+        }, 1200);
+        return;
+      }
       if (!res.ok) {
         el.innerHTML = originalHtml;
         showToast(data.error || 'Could not save edit');
@@ -734,18 +767,35 @@ export function buildClientBridgeScript(previewBase: string): string {
       }
       if (data.newHash) {
         expectedHash = data.newHash;
+        expectedFileHash = data.newFileHash || '';
+        expectedContentHash = data.newContentHash || '';
         if (selEl === el && selInfo) {
-          selInfo = Object.assign({}, selInfo, { snapshotHash: data.newHash });
+          selInfo = Object.assign({}, selInfo, {
+            snapshotHash: data.newHash,
+            fileHash: data.newFileHash,
+            contentHash: data.newContentHash,
+          });
         }
       }
-      shiftSourceMapLines(
-        meta.file,
-        Number(data.topLineDelta || 0),
-        Number(data.afterLine || 0),
-        Number(data.afterLineDelta || 0),
-        Number(data.sameLineEndCol || 0),
-        Number(data.sameLineByteDelta || 0),
-      );
+      if (data.relocated && data.newLoc) {
+        // The file changed under us and the server found this element elsewhere: the page's
+        // other locs are stale relative to disk anyway (HMR refreshes them), so only re-point
+        // this element instead of shifting everything by deltas computed on the new file.
+        const updated = { file: meta.file, loc: data.newLoc };
+        sourceMap.set(el, updated);
+        if (el.hasAttribute && el.hasAttribute('data-astro-source-loc')) el.setAttribute('data-astro-source-loc', data.newLoc);
+        knownEls.set(keyOf(updated), el);
+        if (selEl === el) selMeta = updated;
+      } else {
+        shiftSourceMapLines(
+          meta.file,
+          Number(data.topLineDelta || 0),
+          Number(data.afterLine || 0),
+          Number(data.afterLineDelta || 0),
+          Number(data.sameLineEndCol || 0),
+          Number(data.sameLineByteDelta || 0),
+        );
+      }
       showToast('Saved');
       window.parent.postMessage({
         type: 'halley:patch-saved',
@@ -753,7 +803,8 @@ export function buildClientBridgeScript(previewBase: string): string {
         loc: data.newLoc || meta.loc,
         summary: 'Edited ' + meta.file,
       }, window.location.origin);
-    } catch {
+    } catch (err) {
+      console.warn('[halley-dev-edit] saving inline edit failed', err);
       el.innerHTML = originalHtml;
       showToast('Network error while saving');
     }
@@ -776,7 +827,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     if (activeEl && activeEl.contains(e.target)) return; // caret moves natively
     // Desktop: re-clicking an already-selected editable element whose caret blurred re-enters editing.
     if (!touchLayout && selEl && selEl === e.target && selInfo && selInfo.editability === 'editable-static' && !activeEl && !workspaceLocked) {
-      beginEditing(selEl, selMeta, selInfo.snapshotHash, { x: e.clientX, y: e.clientY });
+      beginEditing(selEl, selMeta, selInfo, { x: e.clientX, y: e.clientY });
       renderToolbar();
       return;
     }
@@ -874,7 +925,10 @@ export function buildClientBridgeScript(previewBase: string): string {
       if (activeEl && !msg.force) return;
       try {
         sessionStorage.setItem('__halley_scroll_y', String(window.scrollY));
-      } catch {}
+      } catch (err) {
+        // Expected when storage is blocked (sandbox / privacy mode / quota): scroll is not restored.
+        if (!(err instanceof DOMException)) console.warn('[halley-dev-edit] saving scroll position failed', err);
+      }
       window.location.reload();
     }
   });
@@ -891,7 +945,10 @@ export function buildClientBridgeScript(previewBase: string): string {
         requestAnimationFrame(() => window.scrollTo(0, y));
       }
     }
-  } catch {}
+  } catch (err) {
+    // Expected when storage is blocked (sandbox / privacy mode): nothing to restore.
+    if (!(err instanceof DOMException)) console.warn('[halley-dev-edit] restoring scroll position failed', err);
+  }
   window.parent.postMessage({ type: 'halley:ready', route: currentRoute() }, '*');
 })();
 `;

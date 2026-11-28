@@ -1,5 +1,25 @@
 export { parse as parseAstroSource } from '@astrojs/compiler';
-export { inspectAstroElement, parseLoc, sha256, type EditabilityKind, type InspectResult } from './ast-classifier.js';
+export {
+  computeContentHash,
+  computeSnapshotHash,
+  countAstroParseErrors,
+  findElementsByContentHash,
+  inspectAstroElement,
+  parseLoc,
+  sha256,
+  type EditabilityKind,
+  type InspectOptions,
+  type InspectResult,
+  type SourceElement,
+} from './ast-classifier.js';
+export {
+  detectAstroVersions,
+  formatAstroVersions,
+  getAstroCompat,
+  inlineEditingDisabledReason,
+  SUPPORTED_ASTRO_MAJORS,
+  type AstroVersionInfo,
+} from './compat.js';
 export { PerFileMutex, type AsyncFileLock } from './file-lock.js';
 export {
   halleyDevEdit,
@@ -26,6 +46,7 @@ export {
 export {
   patchStaticSpan,
   serializeHtmlToAstro,
+  verifyPatchedSource,
   type PatchStaticSpanInput,
   type PatchStaticSpanResult,
   type SerializeOptions,

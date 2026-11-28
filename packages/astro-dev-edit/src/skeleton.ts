@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { parse } from '@astrojs/compiler';
+import { ignoreMissingPath, warnUnexpected } from './diagnostics.js';
 import { HALLEY_PLACEHOLDER_ATTR } from '@halley/shared';
 import * as parse5 from 'parse5';
 import { discoverSiteRoutes } from './routes.js';
@@ -160,8 +161,9 @@ async function pickReferenceAstroFile(
       try {
         const source = await fs.readFile(abs, 'utf8');
         return { fileAbs: abs, fileRel: match.file, source };
-      } catch {
+      } catch (err) {
         // fall through to most common layout
+        ignoreMissingPath(`reading style-like page ${abs}`, err);
       }
     }
   }
@@ -187,8 +189,9 @@ async function pickReferenceAstroFile(
       } else {
         layoutCounts.set(key, { count: 1, sample: { fileAbs: abs, fileRel: r.file, source } });
       }
-    } catch {
-      // ignore unparseable pages
+    } catch (err) {
+      // skip pages that vanished or cannot be parsed
+      ignoreMissingPath(`scanning layout usage in ${abs}`, err);
     }
   }
 
@@ -295,8 +298,9 @@ export async function generatePageSkeleton(
           layoutName,
         };
       }
-    } catch {
+    } catch (err) {
       // fall back to minimal HTML skeleton
+      ignoreMissingPath('building skeleton from reference layout', err);
     }
   }
 
@@ -545,8 +549,9 @@ export async function togglePageUnlistedInSource(
         }
       }
     }
-  } catch {
+  } catch (err) {
     // fall through to <head> injection
+    warnUnexpected('inspecting layout for noindex insertion; using <head> injection', err);
   }
 
   if (/<\/head>/i.test(source)) {

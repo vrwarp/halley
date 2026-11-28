@@ -196,6 +196,11 @@ describe('client-bridge script', () => {
 
     // Esc saves edits rather than discarding
     expect(bridge).not.toContain('clearSelection(false)');
+
+    // Patches carry the inspect-time file hash + content identity so the server can relocate safely
+    expect(bridge).toContain('fileHash: expectedFileHash || undefined');
+    expect(bridge).toContain('contentHash: expectedContentHash || undefined');
+    expect(bridge).toContain('expectedFileHash = data.newFileHash');
   });
 });
 

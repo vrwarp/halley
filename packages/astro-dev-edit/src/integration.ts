@@ -7,6 +7,8 @@ import { buildClientBridgeScript, EARLY_OBSERVER_SCRIPT } from './client-bridge.
 import { PerFileMutex, type AsyncFileLock } from './file-lock.js';
 import { discoverSiteRoutes } from './routes.js';
 import { patchStaticSpan } from './serializer.js';
+import { formatAstroVersions, getAstroCompat } from './compat.js';
+import { warnUnexpected } from './diagnostics.js';
 
 export interface HalleyDevEditOptions {
   repoRoot: string;
@@ -116,8 +118,15 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
   return {
     name: '@halley/astro-dev-edit',
     hooks: {
-      'astro:config:setup': ({ command, injectScript, updateConfig }) => {
+      'astro:config:setup': async ({ command, injectScript, updateConfig }) => {
         if (command !== 'dev') return;
+
+        // The site's Astro (which emits data-astro-source-loc) and the compiler bundled here
+        // (which the classifier parses with) may differ: log both, and disable inline editing
+        // when the combination is unsupported rather than risk writing to the wrong span.
+        const compat = await getAstroCompat(options.repoRoot);
+        console.info(`[halley-dev-edit] ${formatAstroVersions(compat)}`);
+        if (compat.disabledReason) console.warn(`[halley-dev-edit] ${compat.disabledReason}`);
 
         updateConfig({
           vite: {
@@ -176,7 +185,10 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
               }
               const abs = path.resolve(options.repoRoot, relFile);
               const source = await fs.readFile(abs, 'utf8');
-              const inspected = await inspectAstroElement(source, body.loc);
+              const inspected = await inspectAstroElement(source, body.loc, {
+                file: relFile,
+                disabledReason: (await getAstroCompat(options.repoRoot)).disabledReason,
+              });
               if (!inspected) {
                 sendJson(res, 200, { editability: 'dynamic', reason: 'Unmapped AST node' });
                 return;
@@ -185,6 +197,8 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 editability: inspected.editability,
                 reason: inspected.reason,
                 snapshotHash: inspected.snapshotHash,
+                fileHash: inspected.fileHash,
+                contentHash: inspected.contentHash,
                 tagName: inspected.tagName,
               });
             } catch (err) {
@@ -206,6 +220,8 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 file: string;
                 loc: string;
                 expectedHash: string;
+                fileHash?: string;
+                contentHash?: string;
                 newHtml: string;
               }>(req);
               const relFile = resolveEditorRelFile(options.repoRoot, body.file);
@@ -214,6 +230,8 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 relFile,
                 loc: body.loc,
                 expectedHash: body.expectedHash,
+                expectedFileHash: typeof body.fileHash === 'string' ? body.fileHash : undefined,
+                expectedContentHash: typeof body.contentHash === 'string' ? body.contentHash : undefined,
                 newHtml: body.newHtml,
                 previewBase: options.previewBase,
                 originalBase: options.originalBase,
@@ -229,13 +247,16 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ file: relFile, loc: result.newLoc }),
-                }).catch(() => {});
+                }).catch((err) => warnUnexpected('onPatched webhook delivery failed', err));
               }
               sendJson(res, 200, {
                 ok: true,
                 updatedSource: result.updatedSource,
                 newHash: result.newHash,
                 newLoc: result.newLoc,
+                newFileHash: result.newFileHash,
+                newContentHash: result.newContentHash,
+                relocated: result.relocated,
                 topLineDelta: result.topLineDelta,
                 afterLine: result.afterLine,
                 afterLineDelta: result.afterLineDelta,

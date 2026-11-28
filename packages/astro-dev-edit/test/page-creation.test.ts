@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,7 +22,11 @@ import {
   togglePageUnlistedInSource,
 } from '../src/index.js';
 
-const CROSSING_ROOT = '/home/antigravity/vrwarp/thecrossing.website';
+// Real-site fixtures live outside the repo; override with HALLEY_CROSSING_ROOT. When absent these
+// tests are reported as skipped (not silently passed).
+const CROSSING_ROOT =
+  process.env.HALLEY_CROSSING_ROOT || '/home/antigravity/vrwarp/thecrossing.website';
+const CROSSING_EXISTS = existsSync(CROSSING_ROOT);
 
 describe('slugify & route validation', () => {
   it('slugifies accents, punctuation, and nested segments', () => {
@@ -116,10 +121,7 @@ describe('AST unlisted detection, skeleton generation & helpers', () => {
     ).toBe(false);
   });
 
-  it('derives valid skeletons from real thecrossing.website pages with rewritten import paths', async () => {
-    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
-    if (!exists) return;
-
+  it.skipIf(!CROSSING_EXISTS)('derives valid skeletons from real thecrossing.website pages with rewritten import paths', async () => {
     const structure = await discoverSiteStructure(CROSSING_ROOT);
     expect(structure.sections.some((s) => s.section === '/events')).toBe(true);
     expect(structure.dynamicPatterns).toContain('/sermons/[slug]');

@@ -10,8 +10,85 @@ export interface InspectResult {
   innerStartOffset: number;
   innerEndOffset: number;
   innerSource: string;
+  /**
+   * Staleness token for the patch endpoint. Covers the file path (when given), the tag, the full
+   * opening-tag source, the element's absolute offset, the source line(s) from the start of the
+   * element's line through its opening tag, and the inner source — so a stale loc that lands on a
+   * different element with identical inner text (after lines shifted) no longer matches.
+   */
   snapshotHash: string;
+  /**
+   * sha256 of the whole file at inspect time (editable elements only). The patch endpoint
+   * patches at the loc only while the file is byte-identical; otherwise it relocates by
+   * `contentHash`.
+   */
+  fileHash?: string;
+  /**
+   * Position-independent identity of the element (tag, opening-tag source, inner source and
+   * element byte length; editable elements only). Used to relocate a patch after the file changed.
+   */
+  contentHash?: string;
   usesUrlHelper: boolean;
+  /** Char offset of the element's `<` in the source (additive; -1 when not applicable). */
+  elementStartOffset?: number;
+  /** Source of the element's opening tag, `<tag ...>` (additive). */
+  openingTagSource?: string;
+  /**
+   * Inline element children of the edited element, with char offsets relative to `innerSource`
+   * (additive; used by the serializer to keep unchanged source verbatim).
+   */
+  innerTree?: SourceElement[];
+}
+
+/** An inline element inside an editable span; offsets are chars relative to the span's inner source. */
+export interface SourceElement {
+  tag: string;
+  /** `<` of the opening tag. */
+  start: number;
+  /** End of the element (after `</tag>`, or after the opening tag for void/self-closing). */
+  end: number;
+  /** Just after the opening tag's `>`. */
+  openEnd: number;
+  /** Start of `</tag>`; null for void/self-closing elements or when the closing tag is not found. */
+  closeStart: number | null;
+  attrs: Array<{ name: string; kind: string; value: string }>;
+  children: SourceElement[];
+}
+
+export interface InspectOptions {
+  /** Repo-relative file path; bound into `snapshotHash` so a hash cannot be replayed on another file. */
+  file?: string;
+  /**
+   * When set, inline editing is disabled (e.g. unsupported Astro version): every element is
+   * classified `dynamic` with this reason so edits go to the agent instead.
+   */
+  disabledReason?: string;
+}
+
+const VOID_TAGS = new Set(['br', 'wbr', 'img', 'hr', 'input', 'meta', 'link', 'source', 'area', 'col', 'embed', 'track']);
+
+/**
+ * Directives that make an element's rendered content differ from its source children
+ * (raw HTML/text injection or raw passthrough). Inline-editing such elements would write
+ * the rendered DOM back over the directive's semantics, so they are never editable.
+ */
+const CONTENT_DIRECTIVES = new Set(['set:html', 'set:text', 'is:raw']);
+
+function contentDirectiveOf(attrs: AstAttribute[] | undefined): string | null {
+  for (const attr of attrs ?? []) {
+    const name = (attr.name ?? '').toLowerCase();
+    if (CONTENT_DIRECTIVES.has(name)) return name;
+  }
+  return null;
+}
+
+/**
+ * Number of error-severity diagnostics @astrojs/compiler reports for `source`.
+ * Throws if the compiler itself fails to parse.
+ */
+export async function countAstroParseErrors(source: string): Promise<number> {
+  const result = await parse(source, { position: true });
+  return (result.diagnostics ?? []).filter((d) => d.severity === 1).length;
 }
 
 const ALLOWED_INLINE_TAGS = new Set([
@@ -92,6 +169,10 @@ function areChildrenStatic(nodes: AstNode[]): { static: boolean; reason: string 
       if (!ALLOWED_INLINE_TAGS.has(tag)) {
         return { static: false, reason: `Contains nested <${child.name}> element` };
       }
+      const nestedDirective = contentDirectiveOf(child.attributes);
+      if (nestedDirective) {
+        return { static: false, reason: `Contains ${nestedDirective} directive on <${tag}>` };
+      }
       for (const attr of child.attributes ?? []) {
         if (attr.kind === 'spread' || attr.kind === 'shorthand') {
           return { static: false, reason: `Contains dynamic attribute on <${tag}>` };
@@ -112,32 +193,45 @@ function areChildrenStatic(nodes: AstNode[]): { static: boolean; reason: string 
   return { static: true, reason: 'Static text and inline formatting' };
 }
 
-function findElementAtLoc(
-  node: AstNode,
-  buf: Buffer,
-  targetByteOffset: number,
-): AstNode | null {
-  for (const child of node.children ?? []) {
-    const found = findElementAtLoc(child, buf, targetByteOffset);
-    if (found) return found;
-  }
-  if ((node.type === 'element' || node.type === 'component') && node.position) {
-    const { offset } = node.position.start;
-    if (Math.abs(offset - targetByteOffset) <= 2) {
-      return node;
+/**
+ * Finds the element a `data-astro-source-loc` points at.
+ *
+ * Convention (Astro 5 / @astrojs/compiler 2.x `annotateSourceFile`): the loc is the line and
+ * 1-based UTF-8 byte column JUST AFTER the opening tag's `>` — i.e. the start of the element's
+ * inner content. For `<p><b>x</b></p>` the `<p>` loc therefore equals the `<b>` start offset,
+ * which is why a nearest-offset/children-first search picked the child. Matching order:
+ *   1. exact: an element whose inner start (opening `>` + 1) equals the target (Astro 5 locs);
+ *   2. exact: an element whose `<` equals the target (start-of-tag locs, used by older tooling
+ *      and tests);
+ *   3. fuzzy (|start - target| <= 2, or target inside the opening tag) — only when exactly one
+ *      element qualifies; an ambiguous fuzzy match returns null (re-inspect / agent edit).
+ */
+function findElementAtLoc(root: AstNode, buf: Buffer, targetByteOffset: number): AstNode | null {
+  const exact: { inner: AstNode | null; start: AstNode | null } = { inner: null, start: null };
+  const fuzzy: AstNode[] = [];
+  const visit = (node: AstNode) => {
+    if ((node.type === 'element' || node.type === 'component') && node.position) {
+      const start = node.position.start.offset;
+      const end = node.position.end?.offset ?? buf.length;
+      // Only elements whose span can contain the target need the opening-tag scan.
+      if (start <= targetByteOffset + 2 && targetByteOffset <= Math.max(end, start + 2)) {
+        const gt = findOpeningTagEndByteOffset(buf, start, end > start ? end : buf.length);
+        if (gt !== null && gt + 1 === targetByteOffset && !exact.inner) exact.inner = node;
+        if (start === targetByteOffset && !exact.start) exact.start = node;
+        if (
+          Math.abs(start - targetByteOffset) <= 2 ||
+          (gt !== null && targetByteOffset >= start && targetByteOffset <= gt + 1)
+        ) {
+          fuzzy.push(node);
+        }
+      }
     }
-    // Astro 5 emits data-astro-source-loc at the closing `>` of the opening tag.
-    // Check if targetByteOffset falls within the opening tag byte span.
-    const gtByteOffset = findOpeningTagEndByteOffset(
-      buf,
-      offset,
-      node.position.end?.offset ?? buf.length,
-    );
-    if (gtByteOffset !== null && targetByteOffset >= offset && targetByteOffset <= gtByteOffset + 1) {
-      return node;
-    }
-  }
-  return null;
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(root);
+  if (exact.inner) return exact.inner;
+  if (exact.start) return exact.start;
+  return fuzzy.length === 1 ? fuzzy[0]! : null;
 }
 
 /**
@@ -204,7 +298,7 @@ function findOpeningTagEndByteOffset(buf: Buffer, startOffset: number, endOffset
 function computeInnerSpan(
   buf: Buffer,
   node: AstNode,
-): { innerStartOffset: number; innerEndOffset: number } | null {
+): { innerStartOffset: number; innerEndOffset: number; innerStartByte: number; innerEndByte: number } | null {
   if (!node.position?.start || !node.position.end || !node.name) return null;
   const startByte = node.position.start.offset;
   const endByte = node.position.end.offset;
@@ -226,12 +320,147 @@ function computeInnerSpan(
   return {
     innerStartOffset: prefixChars,
     innerEndOffset: prefixChars + match.index,
+    innerStartByte,
+    innerEndByte: innerStartByte + Buffer.byteLength(match.input.slice(0, match.index), 'utf8'),
   };
+}
+
+/** Builds the inline element tree of an editable span (char offsets relative to `baseByte`). */
+function buildSourceTree(nodes: AstNode[], buf: Buffer, baseByte: number, limitByte: number): SourceElement[] {
+  const rel = (b: number) => buf.subarray(baseByte, b).toString('utf8').length;
+  const out: SourceElement[] = [];
+  for (const node of nodes) {
+    if (node.type !== 'element' || !node.name || !node.position) continue;
+    const startByte = node.position.start.offset;
+    const gt = findOpeningTagEndByteOffset(buf, startByte, limitByte);
+    if (gt === null) continue;
+    const tag = node.name.toLowerCase();
+    const attrs = (node.attributes ?? []).map((a) => ({ name: a.name, kind: a.kind, value: a.value ?? '' }));
+    const selfClosing = buf[gt - 1] === 0x2f || VOID_TAGS.has(tag);
+    if (selfClosing) {
+      const e = rel(gt + 1);
+      out.push({ tag, start: rel(startByte), end: e, openEnd: e, closeStart: null, attrs, children: [] });
+      continue;
+    }
+    const span = computeInnerSpan(buf, node);
+    const endByte = node.position.end?.offset ?? gt + 1;
+    out.push({
+      tag,
+      start: rel(startByte),
+      end: rel(Math.max(endByte, gt + 1)),
+      openEnd: rel(gt + 1),
+      closeStart: span ? rel(span.innerEndByte) : null,
+      attrs,
+      children: span ? buildSourceTree(node.children ?? [], buf, baseByte, span.innerEndByte) : [],
+    });
+  }
+  return out;
+}
+
+/** Hash version prefix: bump when the hashed fields change so old client hashes simply 409. */
+const SNAPSHOT_HASH_VERSION = 'v2';
+
+export function computeSnapshotHash(parts: {
+  file: string;
+  tagName: string;
+  openingTagSource: string;
+  elementStartOffset: number;
+  lineContext: string;
+  innerSource: string;
+}): string {
+  return sha256(
+    [
+      SNAPSHOT_HASH_VERSION,
+      parts.file,
+      parts.tagName,
+      String(parts.elementStartOffset),
+      parts.openingTagSource,
+      parts.lineContext,
+      parts.innerSource,
+    ].join('\u0000'),
+  );
+}
+
+/** Version prefix of `contentHash` tokens (`c1:<tag>:<elementByteLength>:<sha256>`). */
+const CONTENT_HASH_VERSION = 'c1';
+
+/**
+ * Position-independent element identity token. The tag and the element's byte length are kept
+ * in clear so relocation can skip non-candidates without slicing/hashing them.
+ */
+export function computeContentHash(parts: {
+  file: string;
+  tagName: string;
+  openingTagSource: string;
+  innerSource: string;
+  elementByteLength: number;
+}): string {
+  const digest = sha256(
+    [CONTENT_HASH_VERSION, parts.file, parts.tagName, parts.openingTagSource, parts.innerSource].join('\u0000'),
+  );
+  return `${CONTENT_HASH_VERSION}:${parts.tagName}:${parts.elementByteLength}:${digest}`;
+}
+
+/** 1-based `line:byteCol` of a 0-based UTF-8 byte offset. */
+function byteOffsetToLoc(buf: Buffer, byteOffset: number): string {
+  let line = 1;
+  let lineStart = 0;
+  for (let i = 0; i < byteOffset; i++) {
+    if (buf[i] === 0x0a) {
+      line++;
+      lineStart = i + 1;
+    }
+  }
+  return `${line}:${byteOffset - lineStart + 1}`;
+}
+
+/**
+ * Locs (Astro 5 convention: just after the opening tag's `>`) of every element whose
+ * `contentHash` equals `contentHash`, bound to `file` or unbound (callers that inspected
+ * without a file path). Parses the source once.
+ */
+export async function findElementsByContentHash(
+  source: string,
+  contentHash: string,
+  file = '',
+): Promise<string[]> {
+  const m = /^c1:([^:]+):(\d+):[0-9a-f]{64}$/.exec(contentHash);
+  if (!m) return [];
+  const tagName = m[1]!;
+  const elementByteLength = Number(m[2]);
+  const buf = Buffer.from(source, 'utf8');
+  const result = await parse(source, { position: true });
+  const locs: string[] = [];
+  const visit = (node: AstNode) => {
+    if (
+      node.type === 'element' &&
+      node.name === tagName &&
+      node.position?.end &&
+      node.position.end.offset - node.position.start.offset === elementByteLength
+    ) {
+      const span = computeInnerSpan(buf, node);
+      if (span) {
+        const openingTagSource = buf.subarray(node.position.start.offset, span.innerStartByte).toString('utf8');
+        const innerSource = source.slice(span.innerStartOffset, span.innerEndOffset);
+        const parts = { tagName, openingTagSource, innerSource, elementByteLength };
+        if (
+          computeContentHash({ ...parts, file }) === contentHash ||
+          (file !== '' && computeContentHash({ ...parts, file: '' }) === contentHash)
+        ) {
+          locs.push(byteOffsetToLoc(buf, span.innerStartByte));
+        }
+      }
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(result.ast as unknown as AstNode);
+  return locs;
 }
 
 export async function inspectAstroElement(
   source: string,
   loc: string,
+  options: InspectOptions = {},
 ): Promise<InspectResult | null> {
   const parsedLoc = parseLoc(loc);
   if (!parsedLoc) return null;
@@ -257,6 +486,20 @@ export async function inspectAstroElement(
     };
   }
 
+  const directive = contentDirectiveOf(node.attributes);
+  if (directive) {
+    return {
+      editability: 'dynamic',
+      reason: `Element uses ${directive} directive`,
+      tagName: node.name,
+      innerStartOffset: 0,
+      innerEndOffset: 0,
+      innerSource: '',
+      snapshotHash: '',
+      usesUrlHelper: false,
+    };
+  }
+
   const span = computeInnerSpan(buf, node);
   if (!span) {
     return {
@@ -272,8 +515,16 @@ export async function inspectAstroElement(
   }
 
   const innerSource = source.slice(span.innerStartOffset, span.innerEndOffset);
-  const check = areChildrenStatic(node.children ?? []);
+  const check: { static: boolean; reason: string } = options.disabledReason
+    ? { static: false, reason: options.disabledReason }
+    : areChildrenStatic(node.children ?? []);
   const usesUrlHelper = /\bimport\s+\{[^}]*\burl\b[^}]*\}\s+from\s+['"][^'"]+['"]/.test(source);
+
+  const startByte = node.position!.start.offset;
+  const elementStartOffset = buf.subarray(0, startByte).toString('utf8').length;
+  const openingTagSource = buf.subarray(startByte, span.innerStartByte).toString('utf8');
+  const lineStart = source.lastIndexOf('\n', elementStartOffset - 1) + 1;
+  const lineContext = source.slice(lineStart, span.innerStartOffset);
 
   return {
     editability: check.static ? 'editable-static' : 'dynamic',
@@ -282,7 +533,27 @@ export async function inspectAstroElement(
     innerStartOffset: span.innerStartOffset,
     innerEndOffset: span.innerEndOffset,
     innerSource,
-    snapshotHash: sha256(innerSource),
+    snapshotHash: computeSnapshotHash({
+      file: options.file ?? '',
+      tagName: node.name,
+      openingTagSource,
+      elementStartOffset,
+      lineContext,
+      innerSource,
+    }),
+    fileHash: sha256(source),
+    contentHash: computeContentHash({
+      file: options.file ?? '',
+      tagName: node.name,
+      openingTagSource,
+      innerSource,
+      elementByteLength: (node.position!.end?.offset ?? startByte) - startByte,
+    }),
     usesUrlHelper,
+    elementStartOffset,
+    openingTagSource,
+    innerTree: check.static
+      ? buildSourceTree(node.children ?? [], buf, span.innerStartByte, span.innerEndByte)
+      : undefined,
   };
 }
