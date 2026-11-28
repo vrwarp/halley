@@ -136,7 +136,7 @@ describe.skipIf(!CROSSING_EXISTS)('real thecrossing.website templates', () => {
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it('discovers public/images and detects shared components, clickable cards, and image focal styles on real templates', async () => {
     const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);

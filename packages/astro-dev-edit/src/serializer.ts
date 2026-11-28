@@ -202,8 +202,23 @@ export function serializeHtmlToAstro(
   return { astroSource, needsUrlImport: fresh.needsUrlImport() };
 }
 
-function createFreshSerializer(options: SerializeOptions, encodeText: (text: string) => string) {
+function createFreshSerializer(
+  options: SerializeOptions,
+  encodeText: (text: string) => string,
+  allowedStyleValues?: ReadonlySet<string>,
+) {
   let needsUrlImport = false;
+
+  function passthroughFor(el: Element, baseSkip?: Set<string>, keepAttrs?: ReadonlySet<string>): string[] {
+    const skip = baseSkip ? new Set(baseSkip) : new Set<string>();
+    if (allowedStyleValues && !keepAttrs?.has('style')) {
+      const styleVal = getAttr(el, 'style');
+      if (styleVal !== undefined && !allowedStyleValues.has(styleVal)) {
+        skip.add('style');
+      }
+    }
+    return serializePassthroughAttrs(el, skip, keepAttrs);
+  }
 
   function serializeChildren(nodes: Node[]): string {
     let out = '';
@@ -234,35 +249,35 @@ function createFreshSerializer(options: SerializeOptions, encodeText: (text: str
       }
 
       if (tag === 'strong' || tag === 'b') {
-        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const attrs = passthroughFor(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         out += `<strong${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</strong>`;
         return out;
       }
 
       if (tag === 'em' || tag === 'i') {
-        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const attrs = passthroughFor(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         out += `<em${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</em>`;
         return out;
       }
 
       if (tag === 'u' || tag === 'code' || tag === 'small' || tag === 'sup' || tag === 'sub') {
-        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const attrs = passthroughFor(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         out += `<${tag}${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</${tag}>`;
         return out;
       }
 
       if (tag === 's' || tag === 'del' || tag === 'strike') {
-        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const attrs = passthroughFor(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         out += `<s${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</s>`;
         return out;
       }
 
       if (tag === 'span') {
-        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const attrs = passthroughFor(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         if (attrs.length > 0) {
           out += `<span ${attrs.join(' ')}>${inner}</span>`;
@@ -282,7 +297,7 @@ function createFreshSerializer(options: SerializeOptions, encodeText: (text: str
         }
         const target = getAttr(el, 'target');
         const rel = getAttr(el, 'rel');
-        const extraAttrs = serializePassthroughAttrs(el, new Set(['href', 'target', 'rel']), keepAttrs);
+        const extraAttrs = passthroughFor(el, new Set(['href', 'target', 'rel']), keepAttrs);
         if (target === '_blank') {
           extraAttrs.push('target="_blank"');
           extraAttrs.push(`rel="${escapeAttr(rel || 'noopener noreferrer')}"`);
@@ -562,6 +577,22 @@ function freshRun(domRun: Node[], sourceRun: string | null, encode: (t: string) 
   return keep(src.slice(0, pre)) + encode(middleDom) + middleComments + keep(src.slice(src.length - suf));
 }
 
+function collectOriginalStyleValues(elements: SourceElement[]): Set<string> {
+  const styles = new Set<string>();
+  const walk = (list: SourceElement[]) => {
+    for (const el of list) {
+      for (const a of el.attrs) {
+        if (a.name.toLowerCase() === 'style' && (a.kind === 'quoted' || a.kind === 'empty')) {
+          styles.add(a.kind === 'empty' ? '' : decodeEntities(a.value));
+        }
+      }
+      walk(el.children);
+    }
+  };
+  walk(elements);
+  return styles;
+}
+
 function reconcileWithSource(
   domNodes: Node[],
   innerSource: string,
@@ -569,7 +600,7 @@ function reconcileWithSource(
   options: SerializeOptions,
 ): SerializeResult {
   const encode = buildEntityEncoder(innerSource);
-  const fresh = createFreshSerializer(options, encode);
+  const fresh = createFreshSerializer(options, encode, collectOriginalStyleValues(tree));
   const keepSlice = (from: number, to: number) => innerSource.slice(from, to);
 
   function reconcileChildren(nodes: Node[], children: SourceElement[], from: number, to: number): string {
@@ -756,6 +787,8 @@ export type PatchStaticSpanResult =
       newContentHash: string;
       /** True when the file had changed since inspect and the element was found by content. */
       relocated: boolean;
+      /** Preorder locs of the edited element and its surviving descendant elements. */
+      subtreeLocs?: string[];
     }
   | { ok: false; code: 400 | 404 | 409 | 422; error: string };
 
@@ -935,6 +968,7 @@ export async function patchStaticSpan(
         newFileHash: currentFileHash,
         newContentHash: inspected.contentHash ?? '',
         relocated,
+        subtreeLocs: inspected.subtreeLocs,
         topLineDelta: 0,
         afterLine: countNewlines(source.slice(0, inspected.innerEndOffset)) + 1,
         afterLineDelta: 0,
@@ -1001,6 +1035,7 @@ export async function patchStaticSpan(
       newFileHash: sha256(patched),
       newContentHash: reInspected.contentHash ?? '',
       relocated,
+      subtreeLocs: reInspected.subtreeLocs,
       topLineDelta,
       afterLine,
       afterLineDelta,

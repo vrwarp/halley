@@ -115,7 +115,7 @@ const items = await getCollection('announcements');
   <head><meta charset="utf-8" /><title>Home | Fixture</title></head>
   <body>
     <main>
-      <h1>Welcome to our community</h1>
+      <h1>Welcome to <span class="serif-accent">our community</span></h1>
       <p>Join us every Sunday morning at 10am.</p>
       <section data-collection="announcements">
         {items.map((item) => <small>{item.data.title}</small>)}
@@ -980,13 +980,21 @@ describe.concurrent('Halley E2E (with fake Anthropic SSE + fake GitHub + real As
       const frameLocator = page.frameLocator('iframe');
       await frameLocator.locator('h1:has-text("Welcome to our community")').waitFor({ timeout: 60_000 });
 
-      // 3. Switch to Edit mode (Browse is default) and apply inline fine-tuning edit
+      // 3. Switch to Edit mode (Browse is default) and verify clicking a nested <span> inside <h1> promotes cleanly to the whole <h1>
       await page.click('button:has-text("Edit")');
       await waitForPreviewEditMode(page);
+      const h1El = frameLocator.locator('h1').first();
+      const h1Span = frameLocator.locator('h1 span.serif-accent');
+      await h1Span.click();
+      await expect.poll(() => h1El.getAttribute('contenteditable'), { timeout: 10_000 }).toBe('true');
+      expect(await h1Span.getAttribute('contenteditable')).toBeNull();
+
       const pEl = frameLocator.locator('p').first();
       await pEl.click();
       // Desktop click begins editing once the bridge's inspect round-trip returns
       await expect.poll(() => pEl.getAttribute('contenteditable'), { timeout: 10_000 }).toBe('true');
+      // Exiting <h1> must remove contenteditable completely (never leaving contenteditable="false")
+      expect(await h1El.getAttribute('contenteditable')).toBeNull();
       const patchSaved = await armPatchSaved(page);
       await pEl.evaluate((el) => {
         el.textContent = 'Join us every Sunday morning at 10am — coffee at 9:30am!';

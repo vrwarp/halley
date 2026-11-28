@@ -110,7 +110,7 @@ export function buildClientBridgeScript(previewBase: string): string {
   (document.head || document.documentElement).appendChild(cursorStyle);
   function syncCursorStyle() {
     if (mode === 'edit' && !readOnly) {
-      cursorStyle.textContent = 'body { cursor: pointer; } [contenteditable="true"], [contenteditable="true"] * { cursor: text !important; }';
+      cursorStyle.textContent = 'body { cursor: pointer; } [contenteditable="true"] { outline: none !important; } [contenteditable="true"], [contenteditable="true"] * { cursor: text !important; }';
     } else {
       cursorStyle.textContent = '';
     }
@@ -543,8 +543,63 @@ export function buildClientBridgeScript(previewBase: string): string {
     }
   }
 
+  const INLINE_PHRASING_SET = new Set([
+    'span', 'strong', 'b', 'em', 'i', 'u', 's', 'del', 'strike',
+    'code', 'small', 'sup', 'sub', 'mark', 'abbr', 'cite', 'kbd',
+    'q', 'samp', 'time', 'var', 'wbr', 'br',
+  ]);
+  const TEXT_BLOCK_SET = new Set([
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote',
+    'figcaption', 'td', 'th', 'dt', 'dd',
+  ]);
+  const BLOCK_BOUNDARY_SET = new Set([
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'section',
+    'article', 'aside', 'main', 'header', 'footer', 'nav', 'ul',
+    'ol', 'li', 'blockquote', 'figure', 'figcaption', 'table', 'form',
+  ]);
+
+  function stripContentEditableAttrs(rootEl) {
+    if (!rootEl || rootEl.nodeType !== 1) return;
+    if (rootEl.hasAttribute && rootEl.hasAttribute('contenteditable')) {
+      rootEl.removeAttribute('contenteditable');
+    }
+    const desc = rootEl.querySelectorAll ? rootEl.querySelectorAll('[contenteditable]') : [];
+    for (let i = 0; i < desc.length; i++) {
+      desc[i].removeAttribute('contenteditable');
+    }
+  }
+
+  function copyAstroCid(sourceEl, targetEl) {
+    if (!sourceEl || !sourceEl.attributes || !targetEl || !targetEl.setAttribute) return;
+    for (let i = 0; i < sourceEl.attributes.length; i++) {
+      const a = sourceEl.attributes[i];
+      if (a && a.name && a.name.toLowerCase().indexOf('data-astro-cid-') === 0) {
+        targetEl.setAttribute(a.name, a.value);
+      }
+    }
+  }
+
+  function countSubtreeElements(rootEl) {
+    if (!rootEl || rootEl.nodeType !== 1) return 0;
+    const desc = rootEl.querySelectorAll ? rootEl.querySelectorAll('*') : [];
+    return 1 + desc.length;
+  }
+
+  function isInsideSvg(node) {
+    let cur = node && node.nodeType === 1 ? node : (node ? node.parentElement : null);
+    while (cur && cur !== document.documentElement) {
+      if (cur.tagName && cur.tagName.toLowerCase() === 'svg') return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
   function findMappedElement(target) {
     let cur = target;
+    const svgRoot = isInsideSvg(cur);
+    if (svgRoot && svgRoot.parentElement) {
+      cur = svgRoot.parentElement;
+    }
     while (cur && cur !== document.documentElement) {
       if (cur === host) return null;
       const meta = cur.nodeType === 1 ? metaOf(cur) : null;
@@ -981,6 +1036,7 @@ export function buildClientBridgeScript(previewBase: string): string {
   }
 
   function beginEditing(el, meta, info, point, initialHtml) {
+    stripContentEditableAttrs(el);
     activeEl = el;
     activeMeta = meta;
     originalHtml = typeof initialHtml === 'string' ? initialHtml : el.innerHTML;
@@ -998,6 +1054,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     hasHighlightedText = false;
     manualFormatOpen = false;
     suppressAutoFormat = false;
+    stripContentEditableAttrs(el);
     const preInspectHtml = el.innerHTML;
     meta = metaOf(el) || meta;
     selEl = el;
@@ -1007,7 +1064,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     knownEls.set(keyOf(meta), el);
     const token = ++selToken;
     renderToolbar();
-    const info = await inspect(meta);
+    const info = (opts && opts.prefetchedInfo) ? opts.prefetchedInfo : await inspect(meta);
     if (token !== selToken) return;
     selInfo = info;
     if (opts && opts.allowEdit && info.editability === 'editable-static') {
@@ -1015,6 +1072,63 @@ export function buildClientBridgeScript(previewBase: string): string {
       else beginEditing(el, meta, info, opts.point, preInspectHtml);
     }
     renderToolbar();
+  }
+
+  async function selectFromClick(rawTarget, opts) {
+    const inner = findMappedElement(rawTarget);
+    if (!inner) {
+      await clearSelection(true);
+      return;
+    }
+    const innerTag = inner.el.tagName ? inner.el.tagName.toLowerCase() : '';
+    if (INLINE_PHRASING_SET.has(innerTag)) {
+      // 1. Check for an enclosing mapped <a> or <button> with no intervening block boundary
+      let cur = inner.el.parentElement;
+      let linkPromote = null;
+      let blockPromote = null;
+      while (cur && cur !== document.documentElement && cur !== host) {
+        const t = cur.tagName ? cur.tagName.toLowerCase() : '';
+        const m = metaOf(cur);
+        if (!linkPromote && (t === 'a' || t === 'button') && m) {
+          linkPromote = { el: cur, meta: m };
+          break;
+        }
+        if (TEXT_BLOCK_SET.has(t) && m) {
+          blockPromote = { el: cur, meta: m };
+          break;
+        }
+        if (BLOCK_BOUNDARY_SET.has(t)) {
+          break;
+        }
+        cur = cur.parentElement;
+      }
+
+      if (linkPromote) {
+        // Second click on text inside an already-selected non-editable composite link (e.g. <a><span>Label</span><svg/></a>)
+        // drills into the static <span> so the button text can also be edited directly!
+        const drillIntoSpan = selEl === linkPromote.el && selInfo && selInfo.editability !== 'editable-static';
+        if (!drillIntoSpan) {
+          await selectElement(linkPromote.el, linkPromote.meta, opts);
+          return;
+        }
+      } else if (blockPromote) {
+        // Promote to the enclosing heading/paragraph/list-item WHEN that block is static-editable.
+        // If the parent block has dynamic expressions (e.g. <p>{item.time} — <span>Worship</span></p>),
+        // fall back cleanly to selecting the static <span>!
+        const clickToken = ++selToken;
+        const blockInfo = await inspect(blockPromote.meta);
+        if (clickToken !== selToken) return;
+        if (blockInfo && blockInfo.editability === 'editable-static') {
+          await selectElement(
+            blockPromote.el,
+            blockPromote.meta,
+            Object.assign({}, opts, { prefetchedInfo: blockInfo }),
+          );
+          return;
+        }
+      }
+    }
+    await selectElement(inner.el, inner.meta, opts);
   }
 
   async function clearSelection(save) {
@@ -1140,6 +1254,42 @@ export function buildClientBridgeScript(previewBase: string): string {
     return null;
   }
 
+  function cloneFormatShell(el) {
+    const shell = el.cloneNode(false);
+    if (shell.removeAttribute) {
+      shell.removeAttribute('id');
+      shell.removeAttribute('data-astro-source-file');
+      shell.removeAttribute('data-astro-source-loc');
+      shell.removeAttribute('contenteditable');
+    }
+    return shell;
+  }
+
+  function hasCustomInlineAttrs(el) {
+    if (!el || !el.attributes) return false;
+    for (let i = 0; i < el.attributes.length; i++) {
+      const n = el.attributes[i].name.toLowerCase();
+      if (n.indexOf('data-astro-') === 0 || n === 'contenteditable' || n === 'spellcheck') continue;
+      return true;
+    }
+    return false;
+  }
+
+  function flattenMatchingInlineTags(frag, matchTags) {
+    if (!frag || !frag.querySelectorAll) return;
+    const nested = Array.from(frag.querySelectorAll(matchTags.join(',')));
+    for (let i = 0; i < nested.length; i++) {
+      const node = nested[i];
+      if (hasCustomInlineAttrs(node)) continue;
+      const parent = node.parentNode;
+      if (!parent) continue;
+      while (node.firstChild) {
+        parent.insertBefore(node.firstChild, node);
+      }
+      parent.removeChild(node);
+    }
+  }
+
   function toggleInlineTag(tagName, aliases) {
     if (!activeEl) return;
     activeEl.focus();
@@ -1149,15 +1299,60 @@ export function buildClientBridgeScript(previewBase: string): string {
     const matchTags = [tagName].concat(aliases || []);
     const existing = findEnclosingTag(range.commonAncestorContainer, matchTags, activeEl);
     if (existing) {
-      unwrapNode(existing);
+      if (range.collapsed || range.toString() === existing.textContent) {
+        unwrapNode(existing);
+        syncActiveFormatButtons();
+        return;
+      }
+      // Partial selection inside an existing tag (e.g. "middle" inside <strong>first middle last</strong>):
+      // split existing into [before][unformatted selection][after]!
+      const parent = existing.parentNode;
+      if (!parent) return;
+      const beforeRange = document.createRange();
+      beforeRange.setStart(existing, 0);
+      beforeRange.setEnd(range.startContainer, range.startOffset);
+      const afterRange = document.createRange();
+      afterRange.setStart(range.endContainer, range.endOffset);
+      afterRange.setEnd(existing, existing.childNodes.length);
+
+      const beforeFrag = beforeRange.extractContents();
+      const midFrag = range.extractContents();
+      const afterFrag = afterRange.extractContents();
+      flattenMatchingInlineTags(midFrag, matchTags);
+
+      if (beforeFrag.textContent.length > 0 || (beforeFrag.querySelector && beforeFrag.querySelector('br'))) {
+        const beforeEl = cloneFormatShell(existing);
+        beforeEl.appendChild(beforeFrag);
+        parent.insertBefore(beforeEl, existing);
+      }
+      const firstMid = midFrag.firstChild;
+      const lastMid = midFrag.lastChild;
+      parent.insertBefore(midFrag, existing);
+      if (afterFrag.textContent.length > 0 || (afterFrag.querySelector && afterFrag.querySelector('br'))) {
+        const afterEl = cloneFormatShell(existing);
+        afterEl.appendChild(afterFrag);
+        parent.insertBefore(afterEl, existing);
+      }
+      parent.removeChild(existing);
+      if (firstMid && lastMid) {
+        const nextR = document.createRange();
+        nextR.setStartBefore(firstMid);
+        nextR.setEndAfter(lastMid);
+        const sel = window.getSelection();
+        if (sel) { sel.removeAllRanges(); sel.addRange(nextR); }
+        savedRange = nextR.cloneRange();
+      }
       syncActiveFormatButtons();
       return;
     }
     if (range.collapsed) return;
 
     const wrapper = document.createElement(tagName);
+    copyAstroCid(activeEl, wrapper);
     const frag = range.extractContents();
+    flattenMatchingInlineTags(frag, matchTags);
     wrapper.appendChild(frag);
+    wrapper.normalize();
     range.insertNode(wrapper);
 
     const nextRange = document.createRange();
@@ -1191,6 +1386,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     if (range.collapsed) return;
 
     const a = document.createElement('a');
+    copyAstroCid(activeEl, a);
     a.setAttribute('href', href);
     if (openNewTab) {
       a.setAttribute('target', '_blank');
@@ -1690,6 +1886,7 @@ export function buildClientBridgeScript(previewBase: string): string {
       } else if (mutation.kind === 'duplicate') {
         const parent = el.parentNode;
         const clone = el.cloneNode(true);
+        stripContentEditableAttrs(clone);
         if (clone.removeAttribute) clone.removeAttribute('id');
         const idNodes = clone.querySelectorAll ? clone.querySelectorAll('[id]') : [];
         for (let i = 0; i < idNodes.length; i++) idNodes[i].removeAttribute('id');
@@ -1765,6 +1962,7 @@ export function buildClientBridgeScript(previewBase: string): string {
         tpl.innerHTML = data.insertedHtml || '';
         const inserted = tpl.content.firstElementChild;
         if (parent && inserted) {
+          copyAstroCid(el, inserted);
           parent.insertBefore(inserted, el.nextSibling);
           const skipSet = new Set([inserted]);
           shiftSourceMapLines(file, Number(data.topLineDelta || 0), Number(data.afterLine || 0), Number(data.afterLineDelta || 0), Number(data.sameLineEndCol || 0), Number(data.sameLineByteDelta || 0), skipSet);
@@ -1945,7 +2143,15 @@ export function buildClientBridgeScript(previewBase: string): string {
     moreAddView.classList.toggle('hidden', isLoop || moreSubmode !== 'add');
 
     if (!isLoop && st) {
-      morePop.querySelector('[data-more="add-drill"]').disabled = !st.canAddAfter;
+      const allowedKinds = Array.isArray(st.allowedAddKinds)
+        ? st.allowedAddKinds
+        : ['paragraph', 'heading', 'list-item', 'image'];
+      const addBtns = moreAddView.querySelectorAll('button[data-add]');
+      for (let i = 0; i < addBtns.length; i++) {
+        const k = addBtns[i].getAttribute('data-add');
+        addBtns[i].classList.toggle('hidden', !allowedKinds.includes(k));
+      }
+      morePop.querySelector('[data-more="add-drill"]').disabled = !st.canAddAfter || allowedKinds.length === 0;
       morePop.querySelector('[data-more="duplicate"]').disabled = !st.canDuplicate;
       morePop.querySelector('[data-more="move-up"]').disabled = !st.canMoveUp;
       morePop.querySelector('[data-more="move-down"]').disabled = !st.canMoveDown;
@@ -2146,7 +2352,7 @@ export function buildClientBridgeScript(previewBase: string): string {
     const meta = activeMeta;
     const prevHtml = originalHtml;
     const newHtml = el.innerHTML;
-    el.contentEditable = 'false';
+    el.removeAttribute('contenteditable');
     activeEl = null;
     activeMeta = null;
     savedRange = null;
@@ -2214,16 +2420,21 @@ export function buildClientBridgeScript(previewBase: string): string {
           });
         }
       }
+      const subtreeLocs = Array.isArray(data.subtreeLocs) ? data.subtreeLocs : null;
       if (data.relocated && data.newLoc) {
         // The file changed under us and the server found this element elsewhere: the page's
         // other locs are stale relative to disk anyway (HMR refreshes them), so only re-point
-        // this element instead of shifting everything by deltas computed on the new file.
-        const updated = { file: meta.file, loc: data.newLoc };
-        sourceMap.set(el, updated);
-        if (el.hasAttribute && el.hasAttribute('data-astro-source-loc')) el.setAttribute('data-astro-source-loc', data.newLoc);
-        knownEls.set(keyOf(updated), el);
-        if (selEl === el) selMeta = updated;
+        // this element (and its matching subtree) instead of shifting everything by deltas.
+        if (subtreeLocs && subtreeLocs.length === countSubtreeElements(el)) {
+          applySubtreeLocs(el, meta.file, subtreeLocs);
+        } else {
+          setElMeta(el, meta.file, data.newLoc);
+        }
+        if (selEl === el) selMeta = { file: meta.file, loc: data.newLoc };
       } else {
+        const skipSet = new Set([el]);
+        const elDesc = el.querySelectorAll ? el.querySelectorAll('*') : [];
+        for (let i = 0; i < elDesc.length; i++) skipSet.add(elDesc[i]);
         shiftSourceMapLines(
           meta.file,
           Number(data.topLineDelta || 0),
@@ -2231,7 +2442,14 @@ export function buildClientBridgeScript(previewBase: string): string {
           Number(data.afterLineDelta || 0),
           Number(data.sameLineEndCol || 0),
           Number(data.sameLineByteDelta || 0),
+          skipSet,
         );
+        if (subtreeLocs && subtreeLocs.length === countSubtreeElements(el)) {
+          applySubtreeLocs(el, meta.file, subtreeLocs);
+        } else if (data.newLoc) {
+          setElMeta(el, meta.file, data.newLoc);
+        }
+        if (selEl === el && data.newLoc) selMeta = { file: meta.file, loc: data.newLoc };
       }
       const afterLocs = snapshotFileLocs(meta.file);
       pushClientUndo({
@@ -2281,12 +2499,21 @@ export function buildClientBridgeScript(previewBase: string): string {
       renderToolbar();
       return;
     }
-    const found = findMappedElement(e.target);
-    if (!found) { void clearSelection(true); return; }
-    void selectElement(found.el, found.meta, { allowEdit: !touchLayout, point: { x: e.clientX, y: e.clientY } });
+    void selectFromClick(e.target, { allowEdit: !touchLayout, point: { x: e.clientX, y: e.clientY } });
   }, true);
 
   document.addEventListener('selectionchange', handleSelectionChange);
+
+  document.addEventListener('beforeinput', (e) => {
+    if (!activeEl) return;
+    if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0 && activeEl.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        e.preventDefault();
+        insertLineBreakAtCaret();
+      }
+    }
+  });
 
   document.addEventListener('keydown', (e) => {
     if (mode !== 'edit') return;
