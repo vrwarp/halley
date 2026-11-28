@@ -69,7 +69,7 @@ function escapeText(text: string): string {
     .replace(/\}/g, '&#125;');
 }
 
-function escapeAttr(val: string): string {
+export function escapeAttr(val: string): string {
   return val
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
@@ -81,7 +81,7 @@ function getAttr(el: Element, name: string): string | undefined {
   return el.attrs.find((a) => a.name.toLowerCase() === name.toLowerCase())?.value;
 }
 
-function normalizeHref(rawHref: string, previewBase: string, originalBase: string): {
+export function normalizeHref(rawHref: string, previewBase: string, originalBase: string): {
   kind: 'internal' | 'external' | 'invalid';
   value: string;
 } {
@@ -190,6 +190,20 @@ export function serializeHtmlToAstro(
         continue;
       }
 
+      if (tag === 'u' || tag === 'code' || tag === 'small' || tag === 'sup' || tag === 'sub') {
+        const attrs = serializePassthroughAttrs(el);
+        const inner = serializeChildren(el.childNodes);
+        out += `<${tag}${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</${tag}>`;
+        continue;
+      }
+
+      if (tag === 's' || tag === 'del' || tag === 'strike') {
+        const attrs = serializePassthroughAttrs(el);
+        const inner = serializeChildren(el.childNodes);
+        out += `<s${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</s>`;
+        continue;
+      }
+
       if (tag === 'span') {
         const attrs = serializePassthroughAttrs(el);
         const inner = serializeChildren(el.childNodes);
@@ -265,7 +279,7 @@ const URL_HELPER_CANDIDATES = [
   ['src', 'helpers', 'url.ts'],
 ];
 
-async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
+export async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
   for (const parts of URL_HELPER_CANDIDATES) {
     const candidate = path.join(repoRoot, ...parts);
     try {
@@ -278,7 +292,7 @@ async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
   return null;
 }
 
-async function injectUrlImportIfMissing(
+export async function injectUrlImportIfMissing(
   source: string,
   filePath: string,
   urlHelperAbs: string,
@@ -331,7 +345,10 @@ export type PatchStaticSpanResult =
   | {
       ok: true;
       updatedSource: string;
+      beforeSource: string;
+      afterSource: string;
       newHash: string;
+      newOuterHash: string;
       newLoc: string;
       topLineDelta: number;
       afterLine: number;
@@ -341,7 +358,7 @@ export type PatchStaticSpanResult =
     }
   | { ok: false; code: 400 | 404 | 409 | 422; error: string };
 
-function countNewlines(text: string): number {
+export function countNewlines(text: string): number {
   let n = 0;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) === 10) n++;
@@ -349,7 +366,7 @@ function countNewlines(text: string): number {
   return n;
 }
 
-function byteColumnInLastLine(text: string): number {
+export function byteColumnInLastLine(text: string): number {
   const lastNl = text.lastIndexOf('\n');
   const tail = lastNl === -1 ? text : text.slice(lastNl + 1);
   return Buffer.byteLength(tail, 'utf8') + 1;
@@ -377,7 +394,7 @@ export async function patchStaticSpan(
       return { ok: false, code: 404, error: `File not found: ${input.relFile}` };
     }
 
-    const inspected = await inspectAstroElement(source, input.loc);
+    const inspected = await inspectAstroElement(source, input.loc, input.relFile);
     if (!inspected) {
       return { ok: false, code: 404, error: `Element not found at ${input.loc}` };
     }
@@ -429,8 +446,9 @@ export async function patchStaticSpan(
       ? `${parsedInputLoc.line + topLineDelta}:${parsedInputLoc.column}`
       : input.loc;
 
-    const reInspected = await inspectAstroElement(patched, newLoc).catch(() => null);
+    const reInspected = await inspectAstroElement(patched, newLoc, input.relFile).catch(() => null);
     const newHash = reInspected?.snapshotHash || sha256(astroSource);
+    const newOuterHash = reInspected?.outerSnapshotHash || '';
 
     const tmpPath = `${absPath}.halley-tmp-${process.pid}-${Date.now()}`;
     await fs.writeFile(tmpPath, patched, 'utf8');
@@ -439,7 +457,10 @@ export async function patchStaticSpan(
     return {
       ok: true,
       updatedSource: astroSource,
+      beforeSource: source,
+      afterSource: patched,
       newHash,
+      newOuterHash,
       newLoc,
       topLineDelta,
       afterLine,

@@ -4,10 +4,15 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import {
   discoverSiteRoutes,
+  EditUndoStack,
   inspectAstroElement,
+  listSiteImages,
+  mutateAstroElement,
   patchStaticSpan,
   PerFileMutex,
   resolveEditorRelFile,
+  writeSiteImage,
+  type ElementMutation,
 } from '@halley/astro-dev-edit';
 import {
   ChatClientMessageSchema,
@@ -19,6 +24,7 @@ import {
 } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
+import sharp from 'sharp';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { AstroDevManager, detectAstroSiteUrl } from './astro-manager.js';
 import {
@@ -474,6 +480,7 @@ async function main() {
   // ==========================================================================
   // Single-Writer Inline Editor Endpoints (`/__editor/*` or `/p/:id/.../__editor/*`)
   // ==========================================================================
+  const editUndoStack = new EditUndoStack();
   let routesInflight: Promise<Awaited<ReturnType<typeof discoverSiteRoutes>>> | null = null;
   const loadRoutesDedup = () => {
     if (!routesInflight) {
@@ -493,6 +500,72 @@ async function main() {
       const routes = await loadRoutesDedup();
       return c.json({ routes });
     }
+    if (c.req.method === 'GET' && pathname.endsWith('/__editor/images')) {
+      const images = await listSiteImages(REPO_ROOT);
+      return c.json({ images });
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/upload-image')) {
+      if (readOnly) {
+        return c.json({ error: 'Session is read-only' }, 403);
+      }
+      try {
+        const form = await c.req.formData();
+        const fileEntry = form.get('file');
+        const existingSrcEntry = form.get('existingSrc');
+        if (!fileEntry || typeof fileEntry === 'string') {
+          return c.json({ error: 'Missing image file' }, 400);
+        }
+        const rawBytes = Buffer.from(await fileEntry.arrayBuffer());
+        if (rawBytes.length === 0) {
+          return c.json({ error: 'Empty image file' }, 400);
+        }
+        if (rawBytes.length > 20 * 1024 * 1024) {
+          return c.json({ error: 'Image exceeds 20 MB limit' }, 400);
+        }
+        const astroStatus = astroManager.getStatus();
+        const saved = await writeSiteImage({
+          repoRoot: REPO_ROOT,
+          filename: fileEntry.name || 'image.webp',
+          bytes: rawBytes,
+          existingSrc: typeof existingSrcEntry === 'string' ? existingSrcEntry : undefined,
+          previewBase: astroStatus.previewBase || previewBase,
+          originalBase: astroStatus.originalBase || originalBase,
+          convertImage: async (bytes) => {
+            try {
+              const meta = await sharp(bytes).metadata();
+              if (!meta.format || meta.format === 'svg' || meta.format === 'gif') {
+                return null;
+              }
+              const webpBytes = await sharp(bytes)
+                .rotate()
+                .resize({ width: 2400, withoutEnlargement: true })
+                .webp({ quality: 84 })
+                .toBuffer();
+              return { bytes: webpBytes, ext: '.webp' };
+            } catch {
+              return null;
+            }
+          },
+        });
+        scheduleInlineCheckpoint(`Uploaded image ${saved.publicPath}`);
+        const cleanBase =
+          (astroStatus.previewBase || previewBase) === '/'
+            ? ''
+            : (astroStatus.previewBase || previewBase).replace(/\/$/, '');
+        return c.json({
+          ok: true,
+          publicPath: saved.publicPath,
+          diskRelPath: saved.diskRelPath,
+          previewUrl: `${cleanBase}${saved.publicPath}`,
+          sizeBytes: saved.sizeBytes,
+        });
+      } catch (err) {
+        return c.json(
+          { error: err instanceof Error ? err.message : 'Image upload failed' },
+          500,
+        );
+      }
+    }
     if (c.req.method === 'POST' && pathname.endsWith('/__editor/inspect')) {
       try {
         const body = (await c.req.json()) as { file?: string; loc?: string };
@@ -502,7 +575,7 @@ async function main() {
         }
         const abs = path.resolve(REPO_ROOT, relFile);
         const source = await fs.readFile(abs, 'utf8');
-        const inspected = await inspectAstroElement(source, String(body.loc ?? ''));
+        const inspected = await inspectAstroElement(source, String(body.loc ?? ''), relFile);
         if (!inspected) {
           return c.json({ editability: 'dynamic', reason: 'Unmapped AST node' });
         }
@@ -510,7 +583,10 @@ async function main() {
           editability: inspected.editability,
           reason: inspected.reason,
           snapshotHash: inspected.snapshotHash,
+          outerSnapshotHash: inspected.outerSnapshotHash,
           tagName: inspected.tagName,
+          context: inspected.context,
+          capabilities: inspected.capabilities,
         });
       } catch (err) {
         return c.json(
@@ -548,11 +624,18 @@ async function main() {
         if (!result.ok) {
           return c.json({ error: result.error }, result.code);
         }
+        editUndoStack.push({
+          relFile,
+          summary: `Inline edit in ${relFile}`,
+          beforeSource: result.beforeSource,
+          afterSource: result.afterSource,
+        });
         scheduleInlineCheckpoint(`Inline edit in ${relFile}`);
         return c.json({
           ok: true,
           updatedSource: result.updatedSource,
           newHash: result.newHash,
+          newOuterHash: result.newOuterHash,
           newLoc: result.newLoc,
           topLineDelta: result.topLineDelta,
           afterLine: result.afterLine,
@@ -566,6 +649,93 @@ async function main() {
           500,
         );
       }
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/mutate')) {
+      if (readOnly) {
+        return c.json({ error: 'Session is read-only' }, 403);
+      }
+      try {
+        const body = (await c.req.json()) as {
+          file?: string;
+          loc?: string;
+          expectedOuterHash?: string;
+          mutation?: ElementMutation;
+        };
+        if (!body.mutation || typeof body.mutation !== 'object') {
+          return c.json({ error: 'Missing mutation payload' }, 400);
+        }
+        const relFile = resolveEditorRelFile(REPO_ROOT, String(body.file ?? ''));
+        const astroStatus = astroManager.getStatus();
+        const result = await mutateAstroElement({
+          repoRoot: REPO_ROOT,
+          relFile,
+          loc: String(body.loc ?? ''),
+          expectedOuterHash: String(body.expectedOuterHash ?? ''),
+          mutation: body.mutation,
+          previewBase: astroStatus.previewBase || previewBase,
+          originalBase: astroStatus.originalBase || originalBase,
+          fileLock,
+        });
+        if (!result.ok) {
+          return c.json({ error: result.error }, result.code);
+        }
+        editUndoStack.push({
+          relFile,
+          summary: result.summary,
+          beforeSource: result.beforeSource,
+          afterSource: result.afterSource,
+        });
+        scheduleInlineCheckpoint(result.summary);
+        return c.json({
+          ok: true,
+          kind: result.kind,
+          summary: result.summary,
+          newLoc: result.newLoc,
+          newHash: result.newHash,
+          newOuterHash: result.newOuterHash,
+          topLineDelta: result.topLineDelta,
+          afterLine: result.afterLine,
+          afterLineDelta: result.afterLineDelta,
+          sameLineEndCol: result.sameLineEndCol,
+          sameLineByteDelta: result.sameLineByteDelta,
+          subtreeLocs: result.subtreeLocs,
+          swappedSubtreeLocs: result.swappedSubtreeLocs,
+          appliedClass: result.appliedClass,
+          insertedHtml: result.insertedHtml,
+          resolvedHref: result.resolvedHref,
+          resolvedSrc: result.resolvedSrc,
+          appliedTarget: result.appliedTarget,
+          appliedRel: result.appliedRel,
+          appliedAlt: result.appliedAlt,
+        });
+      } catch (err) {
+        return c.json(
+          { error: err instanceof Error ? err.message : 'Mutation failed' },
+          500,
+        );
+      }
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/undo')) {
+      if (readOnly) {
+        return c.json({ error: 'Session is read-only' }, 403);
+      }
+      const result = await editUndoStack.undo(REPO_ROOT, fileLock);
+      if (!result.ok) {
+        return c.json({ error: result.error, canUndo: result.canUndo, canRedo: result.canRedo }, result.code);
+      }
+      scheduleInlineCheckpoint(`Undid: ${result.summary}`);
+      return c.json(result);
+    }
+    if (c.req.method === 'POST' && pathname.endsWith('/__editor/redo')) {
+      if (readOnly) {
+        return c.json({ error: 'Session is read-only' }, 403);
+      }
+      const result = await editUndoStack.redo(REPO_ROOT, fileLock);
+      if (!result.ok) {
+        return c.json({ error: result.error, canUndo: result.canUndo, canRedo: result.canRedo }, result.code);
+      }
+      scheduleInlineCheckpoint(`Redid: ${result.summary}`);
+      return c.json(result);
     }
     return next();
   });
@@ -984,6 +1154,7 @@ async function main() {
     if (!body.targetSha) return c.json({ error: 'Missing targetSha' }, 400);
     const ok = await resetToRef(REPO_ROOT, body.targetSha);
     if (!ok) return c.json({ error: 'Failed to restore SHA' }, 500);
+    editUndoStack.clear();
     const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
     return c.json({ ok: true, changedFilesCount: changes.length });
   });
@@ -992,6 +1163,7 @@ async function main() {
     if (readOnly) return c.json({ error: 'Read-only' }, 403);
     cancelSpeculativeVerify();
     cancelInlineEditTimer();
+    editUndoStack.clear();
     const body = (await c.req.json()) as { targetSha: string };
     const ckpt = await undoToCheckpoint(REPO_ROOT, body.targetSha, gitIdentity);
     await pageService.syncPageRequestsFromDisk().catch(() => {});
