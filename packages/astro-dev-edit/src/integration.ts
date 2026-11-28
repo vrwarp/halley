@@ -277,6 +277,7 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 newFileHash: result.newFileHash,
                 newContentHash: result.newContentHash,
                 relocated: result.relocated,
+                subtreeLocs: result.subtreeLocs,
                 topLineDelta: result.topLineDelta,
                 afterLine: result.afterLine,
                 afterLineDelta: result.afterLineDelta,

@@ -254,6 +254,7 @@ export function registerEditorRoutes(app: Hono, ctx: RunnerContext): void {
           newFileHash: result.newFileHash,
           newContentHash: result.newContentHash,
           relocated: result.relocated,
+          subtreeLocs: result.subtreeLocs,
           topLineDelta: result.topLineDelta,
           afterLine: result.afterLine,
           afterLineDelta: result.afterLineDelta,

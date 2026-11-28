@@ -1002,11 +1002,17 @@ export async function mutateAstroElement(
     // 7. add-block (insert new static sibling after selected element)
     // ------------------------------------------------------------------
     if (m.kind === 'add-block') {
-      if (!inspected.capabilities.structural.canAddAfter) {
+      const allowedKinds = inspected.capabilities.structural.allowedAddKinds;
+      if (
+        !inspected.capabilities.structural.canAddAfter ||
+        (Array.isArray(allowedKinds) && !allowedKinds.includes(m.blockKind))
+      ) {
         return {
           ok: false,
           code: 422,
-          error: inspected.capabilities.structural.blockReason || 'Cannot insert block here',
+          error:
+            inspected.capabilities.structural.blockReason ||
+            `Cannot insert ${m.blockKind} directly inside <${locatedTarget?.parent?.name || 'this container'}>`,
         };
       }
 

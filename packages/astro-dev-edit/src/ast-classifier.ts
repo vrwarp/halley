@@ -40,12 +40,15 @@ export interface StyleCapability {
   reason?: string;
 }
 
+export type StructuralAddBlockKind = 'paragraph' | 'heading' | 'list-item' | 'image';
+
 export interface StructuralCapability {
   canDuplicate: boolean;
   canDelete: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
   canAddAfter: boolean;
+  allowedAddKinds?: StructuralAddBlockKind[];
   blockReason?: string;
 }
 
@@ -96,6 +99,8 @@ export interface InspectResult {
   outerSnapshotHash: string;
   context: ElementContextInfo;
   capabilities: ElementCapabilities;
+  /** Preorder Astro 5 locs of this element and its descendant HTML elements. */
+  subtreeLocs?: string[];
   /**
    * Set when no direct edit of any kind (text, attributes, structure) is allowed on this element:
    * Astro component, set:html/set:text/is:raw directive, or the compat gate disabled editing.
@@ -178,6 +183,76 @@ export const ALLOWED_INLINE_TAGS = new Set([
   'br',
   'span',
   'a',
+]);
+
+export const INLINE_PHRASING_ONLY_TAGS = new Set([
+  'span',
+  'strong',
+  'b',
+  'em',
+  'i',
+  'u',
+  's',
+  'del',
+  'strike',
+  'code',
+  'small',
+  'sup',
+  'sub',
+  'mark',
+  'abbr',
+  'cite',
+  'kbd',
+  'q',
+  'samp',
+  'time',
+  'var',
+  'wbr',
+  'br',
+]);
+
+const PHRASING_CONTAINER_TAGS = new Set([
+  'p',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'span',
+  'strong',
+  'b',
+  'em',
+  'i',
+  'u',
+  's',
+  'del',
+  'strike',
+  'code',
+  'small',
+  'sup',
+  'sub',
+  'a',
+  'button',
+  'label',
+  'summary',
+  'dt',
+]);
+
+const LIST_CONTAINER_TAGS = new Set(['ul', 'ol', 'menu']);
+
+const NON_BLOCK_ADD_CONTAINERS = new Set([
+  'tr',
+  'thead',
+  'tbody',
+  'tfoot',
+  'table',
+  'dl',
+  'select',
+  'optgroup',
+  'picture',
+  'video',
+  'audio',
 ]);
 
 export const PROTECTED_LANDMARK_TAGS = new Set([
@@ -864,6 +939,20 @@ function analyzeStructuralCapability(
       blockReason: `Protected layout element <${tag}>`,
     };
   }
+  const isSvg =
+    tag === 'svg' ||
+    located.ancestors.some((a) => a.type === 'element' && a.name?.toLowerCase() === 'svg');
+  if (isSvg) {
+    return {
+      canDuplicate: false,
+      canDelete: false,
+      canMoveUp: false,
+      canMoveDown: false,
+      canAddAfter: false,
+      allowedAddKinds: [],
+      blockReason: 'SVG graphic — Ask Halley to change icons',
+    };
+  }
   if (!located.parent || located.parent.type === 'root') {
     return {
       canDuplicate: false,
@@ -871,7 +960,25 @@ function analyzeStructuralCapability(
       canMoveUp: false,
       canMoveDown: false,
       canAddAfter: false,
+      allowedAddKinds: [],
       blockReason: 'Top-level page element',
+    };
+  }
+
+  const parentTag =
+    located.parent.type === 'element' ? (located.parent.name?.toLowerCase() ?? '') : '';
+
+  // Inline phrasing elements (<span>, <strong>, <em>, etc.) and inline <a> links inside text
+  // runs should be edited via text/link controls rather than offering block Duplicate/Add/Delete.
+  if (INLINE_PHRASING_ONLY_TAGS.has(tag) || (tag === 'a' && PHRASING_CONTAINER_TAGS.has(parentTag))) {
+    return {
+      canDuplicate: false,
+      canDelete: false,
+      canMoveUp: false,
+      canMoveDown: false,
+      canAddAfter: false,
+      allowedAddKinds: [],
+      blockReason: 'Inline text element — edit text directly',
     };
   }
 
@@ -882,6 +989,14 @@ function analyzeStructuralCapability(
     blockReason = 'Cannot delete the sole page heading (<h1>)';
   }
 
+  let allowedAddKinds: StructuralAddBlockKind[] = [];
+  if (LIST_CONTAINER_TAGS.has(parentTag)) {
+    allowedAddKinds = ['list-item'];
+  } else if (!PHRASING_CONTAINER_TAGS.has(parentTag) && !NON_BLOCK_ADD_CONTAINERS.has(parentTag)) {
+    allowedAddKinds = ['paragraph', 'heading', 'image'];
+  }
+  const canAddAfter = allowedAddKinds.length > 0;
+
   const canMoveUp = findAdjacentStaticSiblingNode(located, buf, 'up') !== null;
   const canMoveDown = findAdjacentStaticSiblingNode(located, buf, 'down') !== null;
 
@@ -890,7 +1005,8 @@ function analyzeStructuralCapability(
     canDelete,
     canMoveUp,
     canMoveDown,
-    canAddAfter: true,
+    canAddAfter,
+    allowedAddKinds,
     blockReason,
   };
 }
@@ -907,6 +1023,7 @@ function emptyCapabilities(reason?: string): ElementCapabilities {
       canMoveUp: false,
       canMoveDown: false,
       canAddAfter: false,
+      allowedAddKinds: [],
       blockReason: reason,
     },
   };
@@ -1043,6 +1160,14 @@ export async function inspectAstroElement(
   // Component tags (uppercase) are always dynamic/agent-edited
   if (/^[A-Z]/.test(tagName)) return notEditable(`Astro component <${tagName}>`);
 
+  // SVG elements and their vector primitives (<path>, <circle>, etc.) are graphics, not editable HTML text/blocks.
+  if (
+    tagName.toLowerCase() === 'svg' ||
+    ancestors.some((a) => a.type === 'element' && a.name?.toLowerCase() === 'svg')
+  ) {
+    return notEditable('SVG graphic — Ask Halley to change icons');
+  }
+
   // Raw HTML/text injection: neither text, attributes nor structure are edited directly.
   const directive = contentDirectiveOf(node.attributes);
   if (directive) return notEditable(`Element uses ${directive} directive`);
@@ -1129,6 +1254,7 @@ export async function inspectAstroElement(
     innerTree: check.static
       ? buildSourceTree(node.children ?? [], buf, span.innerStartByte, span.innerEndByte)
       : undefined,
+    subtreeLocs: check.static ? collectSubtreeLocsFromNode(buf, node) : undefined,
     ...outer,
     context,
     capabilities: {
@@ -1139,6 +1265,21 @@ export async function inspectAstroElement(
       structural: structuralCap,
     },
   };
+}
+
+function collectSubtreeLocsFromNode(buf: Buffer, rootNode: AstNode): string[] {
+  const locs: string[] = [];
+  const walk = (n: AstNode) => {
+    if (n.type === 'element' && n.position?.start) {
+      const loc = elementLoc(buf, n);
+      if (loc) locs.push(loc);
+    }
+    for (const c of n.children ?? []) {
+      walk(c);
+    }
+  };
+  walk(rootNode);
+  return locs;
 }
 
 /**
@@ -1157,16 +1298,5 @@ export async function collectSubtreeLocs(source: string, rootLoc: string): Promi
   const located = findElementWithContext(root, buf, targetByteOffset);
   if (!located) return [];
 
-  const locs: string[] = [];
-  const walk = (n: AstNode) => {
-    if (n.type === 'element' && n.position?.start) {
-      const loc = elementLoc(buf, n);
-      if (loc) locs.push(loc);
-    }
-    for (const c of n.children ?? []) {
-      walk(c);
-    }
-  };
-  walk(located.node);
-  return locs;
+  return collectSubtreeLocsFromNode(buf, located.node);
 }
