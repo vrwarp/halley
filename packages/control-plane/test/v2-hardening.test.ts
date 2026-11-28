@@ -388,6 +388,10 @@ describe('v2 control-plane hardening invariants', () => {
       const swRes = await cp.app.request('/halley-preview-sw.js');
       expect(swRes.status).toBe(200);
       expect(swRes.headers.get('service-worker-allowed')).toBe('/');
+      // The served SW carries a concrete cache version, never the raw placeholder
+      const swBody = await swRes.text();
+      expect(swBody).not.toContain('__HALLEY_SW_VERSION__');
+      expect(swBody).toMatch(/const SW_VERSION = '[0-9a-f]{12}';/);
 
       // 2. Navigating /p/:sessionId/* sets ZERO halley_preview_session cookies!
       const navA = await cp.app.request(`/p/${sA}/site/`, { headers: { Cookie: cookie } });

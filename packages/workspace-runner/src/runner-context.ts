@@ -1,4 +1,4 @@
-import type { PerFileMutex } from '@halley/astro-dev-edit';
+import type { EditUndoStack, PerFileMutex } from '@halley/astro-dev-edit';
 import type {
   ChatServerMessage,
   GitFileChange,
@@ -43,6 +43,7 @@ export interface RunnerContext {
   readonly resolveHeadSha: () => Promise<string | null>;
   readonly syncPageRequestsLogged: (context: string) => Promise<boolean | undefined>;
   readonly fileLock: PerFileMutex;
+  readonly editUndoStack: EditUndoStack;
   readonly uploadManager: UploadManager;
   latestTranscript: Extract<ChatServerMessage, { type: 'transcript_state' }> | null;
   currentPreviewPaused: boolean;

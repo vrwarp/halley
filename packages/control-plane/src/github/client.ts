@@ -3,31 +3,93 @@ import { realClock, type Clock, type FetchFn } from '../clock.js';
 import type { HalleyConfig } from '../config.js';
 import { ignore, logger } from '../log.js';
 
+/**
+ * Retry policy for every GitHub call (REST, GraphQL, App token minting). One mechanism: bounded
+ * exponential backoff with jitter, Retry-After / x-ratelimit-reset aware, timed on the injected clock.
+ */
 export interface GitHubRetryOptions {
-  /** Total attempts including the first (default 3). */
+  /** Total attempts including the first (default 4). Takes precedence over `maxRetries`. */
   maxAttempts?: number;
-  /** Base delay for exponential backoff (default 400ms). */
+  /** Retries after the first attempt (`maxAttempts - 1`); kept for callers that think in retries. */
+  maxRetries?: number;
+  /** Base delay before doubling: attempt 1 waits ~base, attempt 2 ~2x base, ... (default 1000ms). */
   baseDelayMs?: number;
-  /** Upper bound for any single wait, including Retry-After / rate-limit reset (default 10s). */
+  /** Upper bound for any single wait, including Retry-After / rate-limit reset (default 15s). */
   maxDelayMs?: number;
+  /**
+   * Fraction of each exponential delay that is randomised, in [0, 1] (default 0.5): the wait is
+   * `exp * (1 - ratio) + random * exp * ratio`. 0 gives exact 1s, 2s, 4s... (deterministic tests).
+   */
+  jitterRatio?: number;
+  /** Override the wait (tests); defaults to the injected clock's sleep. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
-const DEFAULT_RETRY: Required<GitHubRetryOptions> = {
-  maxAttempts: 3,
-  baseDelayMs: 400,
-  maxDelayMs: 10_000,
+interface ResolvedRetryOptions {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitterRatio: number;
+}
+
+const DEFAULT_RETRY: ResolvedRetryOptions = {
+  maxAttempts: 4,
+  baseDelayMs: 1000,
+  maxDelayMs: 15_000,
+  jitterRatio: 0.5,
 };
+
+function resolveRetryOptions(opts: GitHubRetryOptions | undefined): ResolvedRetryOptions {
+  const maxAttempts =
+    opts?.maxAttempts ?? (opts?.maxRetries !== undefined ? opts.maxRetries + 1 : DEFAULT_RETRY.maxAttempts);
+  return {
+    maxAttempts: Math.max(1, Math.floor(maxAttempts)),
+    baseDelayMs: Math.max(0, opts?.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs),
+    maxDelayMs: Math.max(0, opts?.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs),
+    jitterRatio: Math.min(1, Math.max(0, opts?.jitterRatio ?? DEFAULT_RETRY.jitterRatio)),
+  };
+}
 
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD']);
 
-function isRetryableStatus(status: number): boolean {
-  return status === 429 || status >= 500;
+export function isTransientGitHubStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
 }
 
-/** Network failures (no GitHubApiError) and 429/5xx are worth another attempt. */
+const TRANSIENT_NETWORK_RE =
+  /fetch failed|timeout|timed out|aborted|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|UND_ERR|socket hang up|network/i;
+
+/** 429/5xx responses and network-level failures (resets, DNS, timeouts) are worth another attempt. */
 export function isTransientGitHubError(err: unknown): boolean {
-  if (err instanceof GitHubApiError) return isRetryableStatus(err.status);
-  return true;
+  if (err instanceof GitHubApiError) return isTransientGitHubStatus(err.status);
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  if (TRANSIENT_NETWORK_RE.test(err.message)) return true;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    if (TRANSIENT_NETWORK_RE.test(cause.message)) return true;
+    const code = (cause as { code?: unknown }).code;
+    if (typeof code === 'string' && TRANSIENT_NETWORK_RE.test(code)) return true;
+  }
+  return false;
+}
+
+/** Retry-After (delta-seconds or HTTP date) in ms, clamped to [0, maxDelayMs]; null when absent/invalid. */
+export function parseRetryAfterMs(
+  headerValue: string | null,
+  maxDelayMs: number,
+  now = realClock.now(),
+): number | null {
+  const trimmed = headerValue?.trim();
+  if (!trimmed) return null;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.min(maxDelayMs, Math.max(0, Number(trimmed) * 1000));
+  }
+  const parsedDate = Date.parse(trimmed);
+  if (!Number.isNaN(parsedDate)) {
+    return Math.min(maxDelayMs, Math.max(0, parsedDate - now));
+  }
+  return null;
 }
 
 export interface GitHubServiceDeps {
@@ -35,29 +97,29 @@ export interface GitHubServiceDeps {
   clock?: Clock;
 }
 
-/** Delay before the next attempt: honour Retry-After / x-ratelimit-reset (capped), else exp backoff + full jitter. */
+/**
+ * Delay before attempt `attempt + 1` (attempt is 1-based): honour Retry-After / x-ratelimit-reset
+ * (capped at maxDelayMs), else exponential backoff with `jitterRatio` of it randomised.
+ */
 export function computeRetryDelayMs(
   attempt: number,
   res: Pick<Response, 'headers' | 'status'> | null,
-  opts: Required<GitHubRetryOptions>,
+  opts: GitHubRetryOptions = {},
   now = realClock.now(),
 ): number {
+  const o = resolveRetryOptions(opts);
   if (res) {
-    const retryAfter = res.headers.get('retry-after');
-    if (retryAfter) {
-      const secs = Number(retryAfter);
-      const ms = Number.isFinite(secs) ? secs * 1000 : new Date(retryAfter).getTime() - now;
-      if (Number.isFinite(ms) && ms >= 0) return Math.min(ms, opts.maxDelayMs);
-    }
+    const retryAfter = parseRetryAfterMs(res.headers.get('retry-after'), o.maxDelayMs, now);
+    if (retryAfter !== null) return retryAfter;
     const remaining = res.headers.get('x-ratelimit-remaining');
     const reset = res.headers.get('x-ratelimit-reset');
     if (remaining === '0' && reset && Number.isFinite(Number(reset))) {
       const ms = Number(reset) * 1000 - now;
-      if (ms >= 0) return Math.min(ms, opts.maxDelayMs);
+      if (ms >= 0) return Math.min(ms, o.maxDelayMs);
     }
   }
-  const exp = Math.min(opts.maxDelayMs, opts.baseDelayMs * 2 ** (attempt - 1));
-  return Math.round(exp / 2 + Math.random() * (exp / 2));
+  const exp = Math.min(o.maxDelayMs, o.baseDelayMs * 2 ** Math.max(0, attempt - 1));
+  return Math.round(exp * (1 - o.jitterRatio) + Math.random() * exp * o.jitterRatio);
 }
 
 export interface PrInfo {
@@ -121,8 +183,9 @@ export function matchesDeployWorkflow(
 
 export class GitHubService {
   private cachedInstallToken: { token: string; expiresAt: number } | null = null;
-
-  private retry: Required<GitHubRetryOptions>;
+  private readonly retry: ResolvedRetryOptions;
+  private readonly retryInput: GitHubRetryOptions;
+  private readonly sleepImpl: (ms: number) => Promise<void>;
   private readonly fetchImpl: FetchFn;
   private readonly clock: Clock;
   /** Short-lived cache for commit lists (history / upstream-status pages hit these on every load). */
@@ -134,18 +197,76 @@ export class GitHubService {
     retry?: GitHubRetryOptions,
     deps: GitHubServiceDeps = {},
   ) {
-    this.retry = { ...DEFAULT_RETRY, ...retry };
+    this.retryInput = { ...retry };
+    this.retry = resolveRetryOptions(retry);
     this.fetchImpl = deps.fetch ?? ((...args) => fetch(...args));
     this.clock = deps.clock ?? realClock;
+    this.sleepImpl = retry?.sleep ?? ((ms) => this.clock.sleep(ms));
   }
 
   private backoff(attempt: number, res: Pick<Response, 'headers' | 'status'> | null): Promise<void> {
-    return this.clock.sleep(computeRetryDelayMs(attempt, res, this.retry, this.clock.now()));
+    return this.sleepImpl(computeRetryDelayMs(attempt, res, this.retryInput, this.clock.now()));
   }
 
   get ownerRepo(): { owner: string; repo: string } {
     const [owner = '', repo = ''] = this.config.repo.split('/');
     return { owner, repo };
+  }
+
+  /**
+   * The single retry loop behind every GitHub call. Each attempt gets a fresh init (and so a fresh
+   * token / JWT) and a 15s deadline on the injected clock unless the caller passed a signal.
+   * Network failures and 429/5xx are retried when `canRetry`; a caller abort never is.
+   */
+  private async request(
+    url: string,
+    pathForError: string,
+    buildInit: () => Promise<RequestInit> | RequestInit,
+    opts: { canRetry: boolean; formatError?: (status: number, bodyText: string) => string },
+  ): Promise<Response> {
+    const maxAttempts = opts.canRetry ? this.retry.maxAttempts : 1;
+    for (let attempt = 1; ; attempt++) {
+      const init = await buildInit();
+      const callerSignal = init.signal;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, { ...init, signal: callerSignal ?? this.clock.timeoutSignal(15_000) });
+      } catch (err) {
+        if (callerSignal?.aborted || attempt >= maxAttempts) throw err;
+        const delay = computeRetryDelayMs(attempt, null, this.retryInput, this.clock.now());
+        logger.warn('github request network error; retrying', {
+          path: pathForError,
+          method: init.method ?? 'GET',
+          attempt,
+          delayMs: delay,
+          err,
+        });
+        await this.sleepImpl(delay);
+        continue;
+      }
+      if (res.ok) return res;
+      const text = await res.text().catch((err) => {
+        ignore(err, 'github: reading error body failed', { path: pathForError, status: res.status }, 'debug');
+        return '';
+      });
+      if (attempt < maxAttempts && isTransientGitHubStatus(res.status)) {
+        const delay = computeRetryDelayMs(attempt, res, this.retryInput, this.clock.now());
+        logger.warn('github request transient error; retrying', {
+          path: pathForError,
+          method: init.method ?? 'GET',
+          status: res.status,
+          attempt,
+          delayMs: delay,
+        });
+        await this.sleepImpl(delay);
+        continue;
+      }
+      throw new GitHubApiError(
+        res.status,
+        pathForError,
+        opts.formatError ? opts.formatError(res.status, text) : `GitHub API ${pathForError} failed (${res.status}): ${text}`,
+      );
+    }
   }
 
   private createAppJwt(): string {
@@ -171,26 +292,24 @@ export class GitHubService {
       if (this.cachedInstallToken && this.clock.now() < this.cachedInstallToken.expiresAt - 120_000) {
         return this.cachedInstallToken.token;
       }
-      const jwt = this.createAppJwt();
-      const res = await this.fetchImpl(
-        `${this.config.githubApiBaseUrl}/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
-        {
+      // Minting an installation token has no side effects beyond a fresh token: safe to retry
+      const tokenPath = `/app/installations/${this.config.githubAppInstallationId}/access_tokens`;
+      const res = await this.request(
+        `${this.config.githubApiBaseUrl}${tokenPath}`,
+        tokenPath,
+        () => ({
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${jwt}`,
+            Authorization: `Bearer ${this.createAppJwt()}`,
             Accept: 'application/vnd.github+json',
             'User-Agent': 'halley-editor',
           },
-          signal: this.clock.timeoutSignal(15_000),
+        }),
+        {
+          canRetry: true,
+          formatError: (status, bodyText) => `GitHub App token failed: ${status} ${bodyText}`,
         },
       );
-      if (!res.ok) {
-        throw new GitHubApiError(
-          res.status,
-          `/app/installations/${this.config.githubAppInstallationId}/access_tokens`,
-          `GitHub App token failed: ${res.status} ${await res.text()}`,
-        );
-      }
       const data = (await res.json()) as { token: string; expires_at: string };
       this.cachedInstallToken = {
         token: data.token,
@@ -206,21 +325,19 @@ export class GitHubService {
   }
 
   /**
-   * REST call with bounded retry (exponential backoff + jitter, Retry-After aware) for network
-   * errors, 429 and 5xx. Only idempotent methods (GET/HEAD) are retried unless `retryable` is set.
+   * REST call through the shared retry loop. Only idempotent methods (GET/HEAD) are retried unless
+   * `retryable` is set; non-idempotent writes get their own lookup-before-retry logic.
    */
   private async api<T>(path: string, init?: RequestInit & { retryable?: boolean }): Promise<T> {
     const method = (init?.method ?? 'GET').toUpperCase();
-    const canRetry = init?.retryable ?? IDEMPOTENT_METHODS.has(method);
-    const maxAttempts = canRetry ? Math.max(1, this.retry.maxAttempts) : 1;
-    const { retryable: _retryable, ...fetchInit } = init ?? {};
-    for (let attempt = 1; ; attempt++) {
-      const token = await this.getAccessToken();
-      let res: Response;
-      try {
-        res = await this.fetchImpl(`${this.config.githubApiBaseUrl}${path}`, {
+    const { retryable, ...fetchInit } = init ?? {};
+    const res = await this.request(
+      `${this.config.githubApiBaseUrl}${path}`,
+      path,
+      async () => {
+        const token = await this.getAccessToken();
+        return {
           ...fetchInit,
-          signal: fetchInit.signal ?? this.clock.timeoutSignal(15_000),
           headers: {
             Authorization: `Bearer ${token}`,
             Accept: 'application/vnd.github+json',
@@ -228,36 +345,12 @@ export class GitHubService {
             'User-Agent': 'halley-editor',
             ...(fetchInit.headers ?? {}),
           },
-        });
-      } catch (err) {
-        if (attempt >= maxAttempts) throw err;
-        const delay = computeRetryDelayMs(attempt, null, this.retry, this.clock.now());
-        logger.warn('github api network error; retrying', { path, method, attempt, delayMs: delay, err });
-        await this.clock.sleep(delay);
-        continue;
-      }
-      if (!res.ok) {
-        const text = await res.text().catch((err) => {
-          ignore(err, 'github api: reading error body failed', { path, status: res.status }, 'debug');
-          return '';
-        });
-        if (attempt < maxAttempts && isRetryableStatus(res.status)) {
-          const delay = computeRetryDelayMs(attempt, res, this.retry, this.clock.now());
-          logger.warn('github api transient error; retrying', {
-            path,
-            method,
-            status: res.status,
-            attempt,
-            delayMs: delay,
-          });
-          await this.clock.sleep(delay);
-          continue;
-        }
-        throw new GitHubApiError(res.status, path, `GitHub API ${path} failed (${res.status}): ${text}`);
-      }
-      if (res.status === 204) return undefined as T;
-      return (await res.json()) as T;
-    }
+        };
+      },
+      { canRetry: retryable ?? IDEMPOTENT_METHODS.has(method) },
+    );
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
   }
 
   /** Open PR whose head is `headBranch` (used to re-adopt a PR created just before a crash). */
@@ -297,21 +390,23 @@ export class GitHubService {
       nodeId: pr.node_id,
       headSha: pr.head.sha,
     });
-    const maxAttempts = Math.max(1, this.retry.maxAttempts);
+    // Only the non-idempotent POST is retried here. The lookup GET and the PATCH already go through
+    // api()'s own retry loop, so their exhausted failures propagate instead of being retried twice.
+    const maxAttempts = this.retry.maxAttempts;
     let lastErr: unknown = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const existing = await this.findOpenPrForBranch(input.headBranch);
+      if (existing) {
+        // PATCH of title/body is idempotent: let api() retry transient failures itself
+        const updated = await this.api<PrResponse>(`/repos/${owner}/${repo}/pulls/${existing.number}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: input.title, body: input.body }),
+          retryable: true,
+        });
+        return toInfo(updated);
+      }
       try {
-        const existing = await this.findOpenPrForBranch(input.headBranch);
-        if (existing) {
-          // PATCH of title/body is idempotent: let api() retry transient failures itself
-          const updated = await this.api<PrResponse>(`/repos/${owner}/${repo}/pulls/${existing.number}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: input.title, body: input.body }),
-            retryable: true,
-          });
-          return toInfo(updated);
-        }
         const created = await this.api<PrResponse>(`/repos/${owner}/${repo}/pulls`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -329,7 +424,7 @@ export class GitHubService {
           err instanceof GitHubApiError && err.status === 422 && /pull request already exists/i.test(err.message);
         if (!alreadyExists && !isTransientGitHubError(err)) throw err;
         if (attempt >= maxAttempts) break;
-        logger.warn('github: create/update PR failed; re-checking for an existing PR before retrying', {
+        logger.warn('github: creating PR failed; re-checking for an existing PR before retrying', {
           headBranch: input.headBranch,
           attempt,
           alreadyExists,
@@ -350,12 +445,12 @@ export class GitHubService {
     query: string,
     variables: Record<string, unknown>,
   ): Promise<{ errors?: Array<{ message?: string; type?: string }> }> {
-    const maxAttempts = Math.max(1, this.retry.maxAttempts);
-    for (let attempt = 1; ; attempt++) {
-      const token = await this.getAccessToken();
-      let res: Response;
-      try {
-        res = await this.fetchImpl(`${this.config.githubApiBaseUrl}/graphql`, {
+    const res = await this.request(
+      `${this.config.githubApiBaseUrl}/graphql`,
+      '/graphql',
+      async () => {
+        const token = await this.getAccessToken();
+        return {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
@@ -363,28 +458,11 @@ export class GitHubService {
             'User-Agent': 'halley-editor',
           },
           body: JSON.stringify({ query, variables }),
-          signal: this.clock.timeoutSignal(15_000),
-        });
-      } catch (err) {
-        if (attempt >= maxAttempts) throw err;
-        logger.warn('github graphql network error; retrying', { attempt, err });
-        await this.backoff(attempt, null);
-        continue;
-      }
-      if (!res.ok) {
-        const text = await res.text().catch((err) => {
-          ignore(err, 'github graphql: reading error body failed', { status: res.status }, 'debug');
-          return '';
-        });
-        if (attempt < maxAttempts && isRetryableStatus(res.status)) {
-          logger.warn('github graphql transient error; retrying', { attempt, status: res.status });
-          await this.backoff(attempt, res);
-          continue;
-        }
-        throw new GitHubApiError(res.status, '/graphql', `GitHub GraphQL failed (${res.status}): ${text}`);
-      }
-      return (await res.json()) as { errors?: Array<{ message?: string; type?: string }> };
-    }
+        };
+      },
+      { canRetry: true, formatError: (status, text) => `GitHub GraphQL failed (${status}): ${text}` },
+    );
+    return (await res.json()) as { errors?: Array<{ message?: string; type?: string }> };
   }
 
   private static graphqlErrorText(errors: Array<{ message?: string }> | undefined): string {

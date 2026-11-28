@@ -1,7 +1,8 @@
 import type { EditorSessionDto, SpendStatusDto } from '@halley/shared';
-import { useEffect, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { api, type AuthMeResponse } from './api.js';
 import { LoadErrorScreen } from './components/ErrorBoundary.js';
+import { PwaUpdateToast } from './components/PwaUpdateToast.js';
 import { backoffDelayMs, errorMessage, reportIgnored } from './lib/retry.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
@@ -137,8 +138,10 @@ export function App() {
       </div>
     ) : null;
 
+  let view: ReactNode;
+
   if (!auth && loadError) {
-    return (
+    view = (
       <LoadErrorScreen
         title="Couldn't load Halley"
         message={loadError.message}
@@ -146,20 +149,14 @@ export function App() {
         onRetry={() => void refresh({ manual: true })}
       />
     );
-  }
-
-  if (!auth) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-[#FAF9F7] text-sm text-stone-500">
+  } else if (!auth) {
+    view = (
+      <div className="flex h-dvh items-center justify-center bg-[#FAF9F7] text-sm text-stone-500">
         Loading Halley…
       </div>
     );
-  }
-
-  if (!auth.authenticated || !auth.user) {
-    return (
-      <>
-      {loadErrorBanner}
+  } else if (!auth.authenticated || !auth.user) {
+    view = (
       <SignInPage
         repo={auth.repo}
         googleEnabled={Boolean(auth.googleEnabled)}
@@ -168,14 +165,9 @@ export function App() {
         deniedEmail={deniedEmail}
         onLoggedIn={() => void refresh()}
       />
-      </>
     );
-  }
-
-  if (showAdmin && auth.user.isAdmin) {
-    return (
-      <>
-      {loadErrorBanner}
+  } else if (showAdmin && auth.user.isAdmin) {
+    view = (
       <AdminPage
         focusOptimize={focusOptimize}
         onBack={() => {
@@ -189,14 +181,9 @@ export function App() {
           openSession(id);
         }}
       />
-      </>
     );
-  }
-
-  if (activeSessionId) {
-    return (
-      <>
-      {loadErrorBanner}
+  } else if (activeSessionId) {
+    view = (
       <EditorPage
         key={activeSessionId}
         sessionId={activeSessionId}
@@ -211,40 +198,44 @@ export function App() {
         }}
         onOpenSession={(id, opts) => openSession(id, opts)}
       />
-      </>
+    );
+  } else {
+    view = (
+      <DashboardPage
+        user={auth.user}
+        repo={auth.repo}
+        sessions={sessions}
+        spend={spend}
+        onOpenSession={(id, opts) => openSession(id, opts)}
+        onOpenAdmin={() => {
+          setFocusOptimize(false);
+          setShowAdmin(true);
+        }}
+        onOpenOptimize={() => {
+          setFocusOptimize(true);
+          setShowAdmin(true);
+        }}
+        onRefresh={refresh}
+        onLogout={async () => {
+          try {
+            await api.logout();
+          } catch (err) {
+            setLoadError({ message: `Sign out failed: ${errorMessage(err)}`, retryInMs: null });
+            return;
+          }
+          setActiveSessionId(null);
+          syncSessionUrl(null);
+          await refresh();
+        }}
+      />
     );
   }
 
   return (
     <>
-    {loadErrorBanner}
-    <DashboardPage
-      user={auth.user}
-      repo={auth.repo}
-      sessions={sessions}
-      spend={spend}
-      onOpenSession={(id, opts) => openSession(id, opts)}
-      onOpenAdmin={() => {
-        setFocusOptimize(false);
-        setShowAdmin(true);
-      }}
-      onOpenOptimize={() => {
-        setFocusOptimize(true);
-        setShowAdmin(true);
-      }}
-      onRefresh={refresh}
-      onLogout={async () => {
-        try {
-          await api.logout();
-        } catch (err) {
-          setLoadError({ message: `Sign out failed: ${errorMessage(err)}`, retryInMs: null });
-          return;
-        }
-        setActiveSessionId(null);
-        syncSessionUrl(null);
-        await refresh();
-      }}
-    />
+      {loadErrorBanner}
+      {view}
+      <PwaUpdateToast />
     </>
   );
 }

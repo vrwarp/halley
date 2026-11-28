@@ -23,6 +23,7 @@ import {
   renderFullDiffClient,
   revokeObjectUrls,
 } from '../lib/perceptual-diff-client.js';
+import { isTransientPublishError, resolvePublishedSiteUrl } from '../lib/publish-helpers.js';
 import { ConflictCards } from './ConflictCards.js';
 import { VisualReview } from './VisualReview.js';
 import { reportIgnored } from '../lib/retry.js';
@@ -409,6 +410,13 @@ export function PublishModal({
   })();
 
   const changes = includedCards;
+  const liveSiteUrl = publishProgress?.liveSiteUrl ?? session.liveSiteUrl ?? null;
+  const changedCardRoutes = changes.map((c) => c.route).filter((r): r is string => Boolean(r));
+  const publishedSiteUrl = resolvePublishedSiteUrl(
+    liveSiteUrl,
+    changedCardRoutes.length > 0 ? changedCardRoutes : targetRoutes,
+  );
+  const isTransientFailure = isTransientPublishError(publishProgress?.retryable, errorMsg);
   const activePagesMap = pagesByViewport[activeViewport];
   const activeLoadingRoutes = loadingRoutesByViewport[activeViewport];
   const activeFullPagesMap = fullPagesByViewport[activeViewport];
@@ -592,9 +600,22 @@ export function PublishModal({
                 </div>
 
                 {isPublished ? (
-                  <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-900">
-                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    <span>Your changes are now live on the website.</span>
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-900">
+                    <div className="flex items-center gap-2">
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                      <span>Your changes are now live on the website.</span>
+                    </div>
+                    {publishedSiteUrl && (
+                      <a
+                        href={publishedSiteUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex shrink-0 items-center gap-1 font-semibold text-emerald-800 underline decoration-emerald-400 underline-offset-2 hover:text-emerald-950"
+                      >
+                        Visit website
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                    )}
                   </div>
                 ) : (
                   <p className="text-[11px] leading-relaxed text-stone-500">
@@ -665,8 +686,17 @@ export function PublishModal({
               <div className="flex items-start gap-2.5 text-sm text-amber-950">
                 <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-amber-700" />
                 <div>
-                  <p className="font-semibold">Couldn&apos;t publish just yet</p>
-                  <p className="mt-1 text-xs text-amber-900">{errorMsg}</p>
+                  <p className="font-semibold">
+                    {isTransientFailure
+                      ? 'GitHub had a temporary hiccup'
+                      : "Couldn't publish just yet"}
+                  </p>
+                  <p className="mt-1 text-xs text-amber-900">
+                    {errorMsg ||
+                      (isTransientFailure
+                        ? 'Your edits are safe — please try publishing again in a moment.'
+                        : 'Something went wrong while publishing your changes.')}
+                  </p>
                 </div>
               </div>
 
@@ -685,23 +715,67 @@ export function PublishModal({
                 </div>
               )}
 
-              <button
-                type="button"
-                onClick={async () => {
-                  const logs =
-                    publishProgress?.ciLogs ||
-                    checks
-                      .filter((c) => !c.passed)
-                      .map((c) => `${c.name}:\n${c.output}`)
-                      .join('\n\n');
-                  await onAskHalleyToFix(errorMsg || 'Publish checks failed', logs);
-                  onClose();
-                }}
-                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800"
-              >
-                <Sparkles className="h-3.5 w-3.5" />
-                Ask Halley to fix
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {isTransientFailure ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={isInFlight || changes.length === 0 || hasPendingChoices}
+                      onClick={() => void handlePublish()}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800 disabled:opacity-40"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${isInFlight ? 'animate-spin' : ''}`} />
+                      Try publishing again
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const logs =
+                          publishProgress?.ciLogs ||
+                          checks
+                            .filter((c) => !c.passed)
+                            .map((c) => `${c.name}:\n${c.output}`)
+                            .join('\n\n');
+                        await onAskHalleyToFix(errorMsg || 'Publish checks failed', logs);
+                        onClose();
+                      }}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3.5 py-2 text-xs font-semibold text-amber-950 hover:bg-amber-100/60"
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      Ask Halley to fix
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const logs =
+                          publishProgress?.ciLogs ||
+                          checks
+                            .filter((c) => !c.passed)
+                            .map((c) => `${c.name}:\n${c.output}`)
+                            .join('\n\n');
+                        await onAskHalleyToFix(errorMsg || 'Publish checks failed', logs);
+                        onClose();
+                      }}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-xs font-semibold text-white hover:bg-stone-800"
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      Ask Halley to fix
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isInFlight || changes.length === 0 || hasPendingChoices}
+                      onClick={() => void handlePublish()}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-amber-300 bg-white px-3.5 py-2 text-xs font-semibold text-amber-950 hover:bg-amber-100/60 disabled:opacity-40"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${isInFlight ? 'animate-spin' : ''}`} />
+                      Try publishing again
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           )}
 

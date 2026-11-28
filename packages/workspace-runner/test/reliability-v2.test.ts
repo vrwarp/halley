@@ -577,6 +577,63 @@ describe('createRunner (dependency-injected runner)', () => {
     }
   });
 
+  it('/__editor/mutate duplicates an element under the outer hash, then /__editor/undo and /__editor/redo replay it', async () => {
+    const { runner, url, repo } = await makeRunner();
+    const rel = 'src/pages/blocks.astro';
+    const abs = path.join(repo, rel);
+    const original = ['<main>', '  <p>Alpha text</p>', '  <p>Beta text</p>', '</main>', ''].join('\n');
+    const post = async (route: string, body: unknown) => {
+      const res = await fetch(`${url}${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+    };
+    try {
+      await fs.writeFile(abs, original);
+      const inspected = await post('/__editor/inspect', { file: rel, loc: '2:3' });
+      expect(typeof inspected.json.outerSnapshotHash, JSON.stringify(inspected.json)).toBe('string');
+      const outer = inspected.json.outerSnapshotHash as string;
+
+      // explicit validation: unknown kinds and missing hashes are 400s with no write
+      expect((await post('/__editor/mutate', { file: rel, loc: '2:3', expectedOuterHash: outer, mutation: { kind: 'explode' } })).status).toBe(400);
+      expect((await post('/__editor/mutate', { file: rel, loc: '2:3', mutation: { kind: 'duplicate' } })).status).toBe(400);
+      // a stale outer hash is a 409 with no write
+      const stale = await post('/__editor/mutate', { file: rel, loc: '2:3', expectedOuterHash: 'stale', mutation: { kind: 'duplicate' } });
+      expect(stale.status).toBe(409);
+      expect(await fs.readFile(abs, 'utf8')).toBe(original);
+
+      const dup = await post('/__editor/mutate', { file: rel, loc: '2:3', expectedOuterHash: outer, mutation: { kind: 'duplicate' } });
+      expect(dup.status, JSON.stringify(dup.json)).toBe(200);
+      expect(dup.json.kind).toBe('duplicate');
+      const duplicated = await fs.readFile(abs, 'utf8');
+      expect(duplicated.match(/Alpha text/g)).toHaveLength(2);
+
+      const undo = await post('/__editor/undo', {});
+      expect(undo.status, JSON.stringify(undo.json)).toBe(200);
+      expect(undo.json).toMatchObject({ ok: true, relFile: rel, canUndo: false, canRedo: true });
+      expect(await fs.readFile(abs, 'utf8')).toBe(original);
+
+      const redo = await post('/__editor/redo', {});
+      expect(redo.status, JSON.stringify(redo.json)).toBe(200);
+      expect(await fs.readFile(abs, 'utf8')).toBe(duplicated);
+
+      // an out-of-band edit invalidates the recorded history: undo refuses rather than clobbering it
+      await fs.writeFile(abs, `${duplicated}<!-- agent edit -->\n`);
+      const refused = await post('/__editor/undo', {});
+      expect(refused.status).toBe(409);
+      expect(await fs.readFile(abs, 'utf8')).toContain('agent edit');
+
+      // a tree reset clears the history
+      const head = (await (await fetch(`${url}/internal/git/changes`)).json()) as { headSha: string };
+      expect((await post('/internal/git/restore-sha', { targetSha: head.headSha })).status).toBe(200);
+      expect((await post('/__editor/undo', {})).status).toBe(404);
+    } finally {
+      await runner.shutdown();
+    }
+  });
+
   it('reports headSha from /internal/git/changes and /internal/verify; correlation ids reach every log line', async () => {
     const { runner, url, repo } = await makeRunner();
     const lines: string[] = [];

@@ -9,7 +9,7 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { WebSocket, WebSocketServer } from 'ws';
 import { AuthService } from './auth/google.js';
-import { loadConfig, type HalleyConfig } from './config.js';
+import { loadConfig, resolveLiveSiteUrl, type HalleyConfig } from './config.js';
 import { realClock, type Clock, type ControlPlaneDeps } from './clock.js';
 import { ControlPlaneDb } from './db.js';
 import { type WorkspaceDriver } from './drivers/workspace-driver.js';
@@ -73,6 +73,7 @@ export function createControlPlane(
 
   const enrichSessionDto = (s: import('./db.js').SessionRecord, user: UserDto) => ({
     ...db.toSessionDto(s, user),
+    liveSiteUrl: resolveLiveSiteUrl(config),
     astroReady: driver.isSessionAstroReady
       ? driver.isSessionAstroReady(s.id)
       : Boolean(s.astro_url && s.status === 'running'),

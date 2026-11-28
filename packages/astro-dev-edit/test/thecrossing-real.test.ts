@@ -137,4 +137,27 @@ describe.skipIf(!CROSSING_EXISTS)('real thecrossing.website templates', () => {
       await fs.rm(tmp, { recursive: true, force: true });
     }
   });
+
+  it('discovers public/images and detects shared components, clickable cards, and image focal styles on real templates', async () => {
+    const exists = await fs.access(CROSSING_ROOT).then(() => true).catch(() => false);
+    if (!exists) return;
+
+    const { listSiteImages } = await import('../src/index.js');
+    const images = await listSiteImages(CROSSING_ROOT);
+    expect(images.length).toBeGreaterThan(10);
+    expect(images.some((i) => i.path.startsWith('/images/') && i.path.endsWith('.webp'))).toBe(true);
+
+    // Header.astro should report isSharedFile = true
+    const headerPath = path.join(CROSSING_ROOT, 'src/components/Header.astro');
+    const headerSrc = await fs.readFile(headerPath, 'utf8');
+    const headerLines = headerSrc.split('\n');
+    const headerLineIdx = headerLines.findIndex((l) => l.includes('<a ') && l.includes('href={url('));
+    if (headerLineIdx >= 0) {
+      const col = Buffer.byteLength(headerLines[headerLineIdx]!.slice(0, headerLines[headerLineIdx]!.indexOf('<a ')), 'utf8') + 1;
+      const aInfo = await inspectAstroElement(headerSrc, `${headerLineIdx + 1}:${col}`, 'src/components/Header.astro');
+      expect(aInfo?.context.isSharedFile).toBe(true);
+      expect(aInfo?.capabilities.link?.canEdit).toBe(true);
+      expect(aInfo?.capabilities.link?.isUrlHelper).toBe(true);
+    }
+  });
 });

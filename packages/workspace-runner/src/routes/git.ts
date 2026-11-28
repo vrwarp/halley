@@ -117,6 +117,7 @@ export function registerGitRoutes(app: Hono, ctx: RunnerContext): void {
     cancelInlineEditTimer(); // its pending edit is auto-saved by resetToRef before the reset
     const ok = await resetToRef(REPO_ROOT, body.targetSha, gitIdentity);
     if (!ok) return c.json({ error: 'Failed to restore SHA' }, 500);
+    ctx.editUndoStack.clear();
     const changes = await changesOrEmpty();
     return c.json({ ok: true, changedFilesCount: changes.length });
   });
@@ -125,6 +126,7 @@ export function registerGitRoutes(app: Hono, ctx: RunnerContext): void {
     if (ctx.readOnly) return c.json({ error: 'Read-only' }, 403);
     cancelSpeculativeVerify();
     cancelInlineEditTimer();
+    ctx.editUndoStack.clear();
     const body = (await c.req.json()) as { targetSha: string };
     const ckpt = await undoToCheckpoint(REPO_ROOT, body.targetSha, gitIdentity);
     await syncPageRequestsLogged('after git operation');

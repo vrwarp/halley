@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { discoverSiteRoutes, PerFileMutex } from '@halley/astro-dev-edit';
+import { discoverSiteRoutes, EditUndoStack, PerFileMutex } from '@halley/astro-dev-edit';
 import { type ChatServerMessage, type MergeReviewStateDto } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
@@ -342,6 +342,8 @@ export async function createRunner(config: RunnerConfig, deps: RunnerDeps = {}):
 
   // Single OS-process PerFileMutex shared across inline `/__editor/patch`, Pi `edit`/`write`/`bash`, and `PageCreationService`
   const fileLock = new PerFileMutex();
+  // Inline editor undo/redo history (/__editor/{patch,mutate,undo,redo}); cleared by tree resets
+  const editUndoStack = new EditUndoStack();
   const uploadManager = new UploadManager(path.join(STATE_DIR, 'uploads'));
 
   // ---------------------------------------------------------------------------------------------
@@ -1029,6 +1031,7 @@ export async function createRunner(config: RunnerConfig, deps: RunnerDeps = {}):
     resolveHeadSha,
     syncPageRequestsLogged,
     fileLock,
+    editUndoStack,
     uploadManager,
     get latestTranscript() {
       return latestTranscript;

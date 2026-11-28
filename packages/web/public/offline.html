@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#FAF9F7" />
+    <title>Offline — Halley</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: max(1.5rem, env(safe-area-inset-top)) 1.5rem max(1.5rem, env(safe-area-inset-bottom));
+        background: #faf9f7;
+        color: #1c1917;
+        font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .card {
+        width: 100%;
+        max-width: 26rem;
+        border: 1px solid #e7e5e4;
+        border-radius: 1rem;
+        background: #ffffff;
+        padding: 2rem;
+        text-align: center;
+        box-shadow: 0 1px 2px rgba(28, 25, 23, 0.05);
+      }
+      .mark {
+        width: 3rem;
+        height: 3rem;
+        margin: 0 auto 1.25rem;
+        border-radius: 0.75rem;
+        display: block;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.25rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      p {
+        margin: 0.625rem 0 1.5rem;
+        font-size: 0.875rem;
+        line-height: 1.55;
+        color: #57534e;
+      }
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 0.75rem;
+        background: #1c1917;
+        color: #faf9f7;
+        font: inherit;
+        font-size: 0.875rem;
+        font-weight: 600;
+        padding: 0.6875rem 1.25rem;
+        cursor: pointer;
+        transition: background-color 150ms ease;
+      }
+      button:hover {
+        background: #292524;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <img class="mark" src="/favicon.svg" alt="Halley" width="48" height="48" />
+      <h1>You&rsquo;re offline</h1>
+      <p>
+        Halley needs an internet connection to talk to your live preview and save edits. Reconnect and try again.
+      </p>
+      <button type="button" onclick="window.location.reload()">Try again</button>
+    </main>
+  </body>
+</html>

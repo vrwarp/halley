@@ -94,7 +94,7 @@ function escapeText(text: string): string {
     .replace(/\}/g, '&#125;');
 }
 
-function escapeAttr(val: string): string {
+export function escapeAttr(val: string): string {
   return val
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
@@ -106,7 +106,7 @@ function getAttr(el: Element, name: string): string | undefined {
   return el.attrs.find((a) => a.name.toLowerCase() === name.toLowerCase())?.value;
 }
 
-function normalizeHref(rawHref: string, previewBase: string, originalBase: string): {
+export function normalizeHref(rawHref: string, previewBase: string, originalBase: string): {
   kind: 'internal' | 'external' | 'invalid';
   value: string;
 } {
@@ -244,6 +244,20 @@ function createFreshSerializer(options: SerializeOptions, encodeText: (text: str
         const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
         const inner = serializeChildren(el.childNodes);
         out += `<em${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</em>`;
+        return out;
+      }
+
+      if (tag === 'u' || tag === 'code' || tag === 'small' || tag === 'sup' || tag === 'sub') {
+        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const inner = serializeChildren(el.childNodes);
+        out += `<${tag}${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</${tag}>`;
+        return out;
+      }
+
+      if (tag === 's' || tag === 'del' || tag === 'strike') {
+        const attrs = serializePassthroughAttrs(el, undefined, keepAttrs);
+        const inner = serializeChildren(el.childNodes);
+        out += `<s${attrs.length ? ' ' + attrs.join(' ') : ''}>${inner}</s>`;
         return out;
       }
 
@@ -650,7 +664,7 @@ const URL_HELPER_CANDIDATES = [
   ['src', 'helpers', 'url.ts'],
 ];
 
-async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
+export async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
   for (const parts of URL_HELPER_CANDIDATES) {
     const candidate = path.join(repoRoot, ...parts);
     try {
@@ -664,7 +678,7 @@ async function resolveUrlHelperAbs(repoRoot: string): Promise<string | null> {
   return null;
 }
 
-async function injectUrlImportIfMissing(
+export async function injectUrlImportIfMissing(
   source: string,
   filePath: string,
   urlHelperAbs: string,
@@ -726,7 +740,10 @@ export type PatchStaticSpanResult =
   | {
       ok: true;
       updatedSource: string;
+      beforeSource: string;
+      afterSource: string;
       newHash: string;
+      newOuterHash: string;
       newLoc: string;
       topLineDelta: number;
       afterLine: number;
@@ -742,7 +759,7 @@ export type PatchStaticSpanResult =
     }
   | { ok: false; code: 400 | 404 | 409 | 422; error: string };
 
-function countNewlines(text: string): number {
+export function countNewlines(text: string): number {
   let n = 0;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) === 10) n++;
@@ -750,7 +767,7 @@ function countNewlines(text: string): number {
   return n;
 }
 
-function byteColumnInLastLine(text: string): number {
+export function byteColumnInLastLine(text: string): number {
   const lastNl = text.lastIndexOf('\n');
   const tail = lastNl === -1 ? text : text.slice(lastNl + 1);
   return Buffer.byteLength(tail, 'utf8') + 1;
@@ -801,12 +818,12 @@ export async function verifyPatchedSource(input: {
 }
 
 /** write temp → fsync → rename; the temp file is removed if any step fails. */
-async function writeFileAtomic(absPath: string, contents: string): Promise<void> {
+export async function writeFileAtomic(absPath: string, contents: string | Uint8Array): Promise<void> {
   const tmpPath = `${absPath}.halley-tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   let handle: fs.FileHandle | null = null;
   try {
     handle = await fs.open(tmpPath, 'wx');
-    await handle.writeFile(contents, 'utf8');
+    await (typeof contents === 'string' ? handle.writeFile(contents, 'utf8') : handle.writeFile(contents));
     await handle.sync();
     await handle.close();
     handle = null;
@@ -910,7 +927,10 @@ export async function patchStaticSpan(
       return {
         ok: true,
         updatedSource: astroSource,
+        beforeSource: source,
+        afterSource: source,
         newHash: inspected.snapshotHash,
+        newOuterHash: inspected.outerSnapshotHash,
         newLoc: loc,
         newFileHash: currentFileHash,
         newContentHash: inspected.contentHash ?? '',
@@ -966,13 +986,17 @@ export async function patchStaticSpan(
     }
     const reInspected = verified.inspected;
     const newHash = reInspected.snapshotHash;
+    const newOuterHash = reInspected.outerSnapshotHash;
 
     await writeFileAtomic(absPath, patched);
 
     return {
       ok: true,
       updatedSource: astroSource,
+      beforeSource: source,
+      afterSource: patched,
       newHash,
+      newOuterHash,
       newLoc,
       newFileHash: sha256(patched),
       newContentHash: reInspected.contentHash ?? '',

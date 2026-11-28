@@ -5,10 +5,13 @@ import type { AstroIntegration } from 'astro';
 import { inspectAstroElement } from './ast-classifier.js';
 import { buildClientBridgeScript, EARLY_OBSERVER_SCRIPT } from './client-bridge.js';
 import { PerFileMutex, type AsyncFileLock } from './file-lock.js';
+import { listSiteImages } from './images.js';
+import { mutateAstroElement, type ElementMutation } from './mutations.js';
 import { discoverSiteRoutes } from './routes.js';
 import { patchStaticSpan } from './serializer.js';
 import { formatAstroVersions, getAstroCompat } from './compat.js';
 import { warnUnexpected } from './diagnostics.js';
+import { EditUndoStack } from './undo-stack.js';
 
 export interface HalleyDevEditOptions {
   repoRoot: string;
@@ -111,6 +114,7 @@ export function invalidateCssModulesForFile(
 
 export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
   const fileLock = options.fileLock ?? new PerFileMutex();
+  const undoStack = new EditUndoStack();
   const enableLocalEndpoints = options.enableLocalEndpoints ?? true;
   const normalizedPreviewBase =
     options.previewBase === '/' ? '' : options.previewBase.replace(/\/$/, '');
@@ -175,6 +179,12 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
             return;
           }
 
+          if (req.method === 'GET' && stripped === '/__editor/images') {
+            const images = await listSiteImages(options.repoRoot);
+            sendJson(res, 200, { images });
+            return;
+          }
+
           if (req.method === 'POST' && stripped === '/__editor/inspect') {
             try {
               const body = await readJsonBody<{ file: string; loc: string }>(req);
@@ -199,7 +209,10 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 snapshotHash: inspected.snapshotHash,
                 fileHash: inspected.fileHash,
                 contentHash: inspected.contentHash,
+                outerSnapshotHash: inspected.outerSnapshotHash,
                 tagName: inspected.tagName,
+                context: inspected.context,
+                capabilities: inspected.capabilities,
               });
             } catch (err) {
               sendJson(res, 400, {
@@ -241,6 +254,12 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 sendJson(res, result.code, { error: result.error });
                 return;
               }
+              if (result.beforeSource !== result.afterSource) undoStack.push({
+                relFile,
+                summary: `Inline edit in ${relFile}`,
+                beforeSource: result.beforeSource,
+                afterSource: result.afterSource,
+              });
               options.onPatched?.({ file: relFile, loc: result.newLoc });
               if (options.onPatchedWebhookUrl) {
                 void fetch(options.onPatchedWebhookUrl, {
@@ -253,6 +272,7 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 ok: true,
                 updatedSource: result.updatedSource,
                 newHash: result.newHash,
+                newOuterHash: result.newOuterHash,
                 newLoc: result.newLoc,
                 newFileHash: result.newFileHash,
                 newContentHash: result.newContentHash,
@@ -268,6 +288,102 @@ export function halleyDevEdit(options: HalleyDevEditOptions): AstroIntegration {
                 error: err instanceof Error ? err.message : 'Patch failed',
               });
             }
+            return;
+          }
+
+          if (req.method === 'POST' && stripped === '/__editor/mutate') {
+            if (options.isReadOnly?.()) {
+              sendJson(res, 403, { error: 'Session is read-only' });
+              return;
+            }
+            try {
+              const body = await readJsonBody<{
+                file: string;
+                loc: string;
+                expectedOuterHash: string;
+                fileHash?: string;
+                mutation: ElementMutation;
+              }>(req);
+              const relFile = resolveEditorRelFile(options.repoRoot, body.file);
+              const result = await mutateAstroElement({
+                repoRoot: options.repoRoot,
+                relFile,
+                loc: body.loc,
+                expectedOuterHash: body.expectedOuterHash,
+                expectedFileHash: typeof body.fileHash === 'string' ? body.fileHash : undefined,
+                mutation: body.mutation,
+                previewBase: options.previewBase,
+                originalBase: options.originalBase,
+                fileLock,
+              });
+              if (!result.ok) {
+                sendJson(res, result.code, { error: result.error });
+                return;
+              }
+              undoStack.push({
+                relFile,
+                summary: result.summary,
+                beforeSource: result.beforeSource,
+                afterSource: result.afterSource,
+              });
+              options.onPatched?.({ file: relFile, loc: result.newLoc });
+              sendJson(res, 200, {
+                ok: true,
+                kind: result.kind,
+                summary: result.summary,
+                newLoc: result.newLoc,
+                newHash: result.newHash,
+                newOuterHash: result.newOuterHash,
+                newFileHash: result.newFileHash,
+                relocated: result.relocated,
+                topLineDelta: result.topLineDelta,
+                afterLine: result.afterLine,
+                afterLineDelta: result.afterLineDelta,
+                sameLineEndCol: result.sameLineEndCol,
+                sameLineByteDelta: result.sameLineByteDelta,
+                subtreeLocs: result.subtreeLocs,
+                swappedSubtreeLocs: result.swappedSubtreeLocs,
+                appliedClass: result.appliedClass,
+                insertedHtml: result.insertedHtml,
+                resolvedHref: result.resolvedHref,
+                resolvedSrc: result.resolvedSrc,
+                appliedTarget: result.appliedTarget,
+                appliedRel: result.appliedRel,
+                appliedAlt: result.appliedAlt,
+              });
+            } catch (err) {
+              sendJson(res, 500, {
+                error: err instanceof Error ? err.message : 'Mutation failed',
+              });
+            }
+            return;
+          }
+
+          if (req.method === 'POST' && stripped === '/__editor/undo') {
+            if (options.isReadOnly?.()) {
+              sendJson(res, 403, { error: 'Session is read-only' });
+              return;
+            }
+            const result = await undoStack.undo(options.repoRoot, fileLock);
+            if (!result.ok) {
+              sendJson(res, result.code, { error: result.error, canUndo: result.canUndo, canRedo: result.canRedo });
+              return;
+            }
+            sendJson(res, 200, result);
+            return;
+          }
+
+          if (req.method === 'POST' && stripped === '/__editor/redo') {
+            if (options.isReadOnly?.()) {
+              sendJson(res, 403, { error: 'Session is read-only' });
+              return;
+            }
+            const result = await undoStack.redo(options.repoRoot, fileLock);
+            if (!result.ok) {
+              sendJson(res, result.code, { error: result.error, canUndo: result.canUndo, canRedo: result.canRedo });
+              return;
+            }
+            sendJson(res, 200, result);
             return;
           }
 

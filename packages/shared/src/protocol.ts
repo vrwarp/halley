@@ -174,6 +174,8 @@ export const PublishProgressPayloadSchema = z.object({
   prNumber: z.number().nullable().optional(),
   prUrl: z.string().nullable().optional(),
   deployUrl: z.string().nullable().optional(),
+  liveSiteUrl: z.string().nullable().optional(),
+  retryable: z.boolean().optional(),
   error: z.string().nullable().optional(),
   checks: z.array(VerificationCheckResultSchema).optional(),
   conflictedFiles: z.array(z.string()).optional(),
@@ -385,6 +387,7 @@ export interface EditorSessionDto {
   publishError: string | null;
   prNumber: number | null;
   prUrl: string | null;
+  liveSiteUrl?: string | null;
   mergedSha: string | null;
   mergedAt: string | null;
   archivedAt: string | null;

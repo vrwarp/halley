@@ -2,10 +2,10 @@ import crypto from 'node:crypto';
 import type { PublishProgressPayload, PublishState, UserDto } from '@halley/shared';
 import { realClock, type Clock, type FetchFn, type IdGenerator } from '../clock.js';
 import { mapWithConcurrency } from '../concurrency.js';
-import type { HalleyConfig } from '../config.js';
+import { resolveLiveSiteUrl, type HalleyConfig } from '../config.js';
 import type { ControlPlaneDb, PublishRunRecord, SessionRecord } from '../db.js';
 import type { WorkspaceDriver } from '../drivers/workspace-driver.js';
-import { GitHubApiError, type GitHubService } from '../github/client.js';
+import { GitHubApiError, isTransientGitHubError, type GitHubService } from '../github/client.js';
 import { ignore, logger } from '../log.js';
 import { runWithContext } from '../request-context.js';
 import {
@@ -21,6 +21,9 @@ import {
   createRunnerClient,
   type RunnerClient,
 } from '../runner-client.js';
+
+const TRANSIENT_GITHUB_ERROR_MESSAGE =
+  'GitHub had a temporary hiccup while publishing your changes. Your edits are safe — please try publishing again in a moment.';
 
 export interface DeployPollOptions {
   initialDelayMs?: number;
@@ -68,6 +71,8 @@ type CiWaitResult =
       error: string;
       ciLogs?: string;
       prNodeId: string | null;
+      /** A transient GitHub failure: the user can simply publish again. */
+      retryable?: boolean;
     };
 
 interface PrRunContext {
@@ -546,11 +551,17 @@ export class PublishService {
         actor.id,
       );
     } catch (err) {
+      const transient = isTransientGitHubError(err);
       await this.handleCiFailure(session.id, prCtx, {
         kind: 'failed',
         reason: 'error',
-        error: err instanceof Error ? err.message : 'Failed resuming CI check after restart',
+        error: transient
+          ? TRANSIENT_GITHUB_ERROR_MESSAGE
+          : err instanceof Error
+            ? err.message
+            : 'Failed resuming CI check after restart',
         prNodeId: null,
+        ...(transient ? { retryable: true } : {}),
       });
     } finally {
       this.activePublishes.delete(session.id);
@@ -628,6 +639,7 @@ export class PublishService {
         prUrl: pr.prUrl,
         error: `${failure.error}${note}`,
         ...(failure.ciLogs ? { ciLogs: failure.ciLogs } : {}),
+        ...(failure.retryable ? { retryable: true } : {}),
       });
     } catch (err) {
       logger.error('publish: recording CI failure failed', { sessionId, runId: pr.runId, err });
@@ -1081,11 +1093,13 @@ export class PublishService {
         const rawMsg = err instanceof Error ? err.message : 'Publish failed unexpectedly';
         if (prCtx) {
           // A PR exists (maybe with auto-merge armed): track it rather than forgetting it.
+          const transientGitHub = !(err instanceof RunnerError) && isTransientGitHubError(err);
           await this.handleCiFailure(sessionInput.id, prCtx, {
             kind: 'failed',
             reason: 'error',
-            error: rawMsg,
+            error: transientGitHub ? TRANSIENT_GITHUB_ERROR_MESSAGE : rawMsg,
             prNodeId: prCtx.prNodeId,
+            ...(transientGitHub ? { retryable: true } : {}),
           });
           return;
         }
@@ -1093,17 +1107,25 @@ export class PublishService {
         await this.rollbackExcludedPathsIfNeeded(runnerUrl, preExcludeSha, { sessionId: sessionInput.id, runId });
         this.db.deletePublishRun(sessionInput.id);
         const crashInfo = this.driver.getCrashInfo?.(sessionInput.id);
+        const isTransientGitHubApi = err instanceof GitHubApiError && isTransientGitHubError(err);
         const isRunnerDisconnect =
-          (err instanceof RunnerError && (err.kind === 'network' || err.kind === 'timeout')) ||
-          /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg);
+          !isTransientGitHubApi &&
+          ((err instanceof RunnerError && (err.kind === 'network' || err.kind === 'timeout')) ||
+            /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(rawMsg));
+        // Any other network-level failure outside the runner client came from GitHub
+        const isTransientGitHub =
+          isTransientGitHubApi || (!isRunnerDisconnect && !(err instanceof RunnerError) && isTransientGitHubError(err));
         const friendlyError =
           crashInfo?.oom
             ? 'The workspace ran out of memory while running publish checks. Restart the workspace and try publishing again.'
-            : isRunnerDisconnect
-              ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
-              : rawMsg;
+            : isTransientGitHub
+              ? TRANSIENT_GITHUB_ERROR_MESSAGE
+              : isRunnerDisconnect
+                ? 'Lost connection to the workspace while running publish checks (it may have restarted or run out of memory). Please try again.'
+                : rawMsg;
         this.setState(sessionInput.id, 'failed_checks', {
           error: friendlyError,
+          ...(isTransientGitHub || isRunnerDisconnect ? { retryable: true } : {}),
         });
       } catch (handlerErr) {
         // e.g. the DB was closed during shutdown: never let publish() reject (callers void it)
@@ -1232,7 +1254,8 @@ export class PublishService {
       reason: Extract<CiWaitResult, { kind: 'failed' }>['reason'],
       error: string,
       ciLogs?: string,
-    ): CiWaitResult => ({ kind: 'failed', reason, error, ciLogs, prNodeId });
+      retryable?: boolean,
+    ): CiWaitResult => ({ kind: 'failed', reason, error, ciLogs, prNodeId, ...(retryable ? { retryable } : {}) });
 
     while (this.clock.now() < deadline) {
       if (this.stopping.signal.aborted) return { kind: 'stopped' };
@@ -1297,6 +1320,10 @@ export class PublishService {
         consecutiveErrors += 1;
         logger.warn('publish: transient error while waiting for CI', { ...ctx, consecutiveErrors, err });
         if (consecutiveErrors >= this.deployPollOptions.maxConsecutiveErrors) {
+          if (isTransientGitHubError(err)) {
+            // GitHub outage / rate limiting outlasted the poll tolerance: nothing is wrong with the edit
+            return fail('error', TRANSIENT_GITHUB_ERROR_MESSAGE, undefined, true);
+          }
           return fail(
             'error',
             `Checking GitHub CI failed repeatedly (${err instanceof Error ? err.message : String(err)}).`,
@@ -1341,10 +1368,12 @@ export class PublishService {
         .stop(updated)
         .catch((err) => ignore(err, 'publish: stopping published workspace failed', { sessionId }));
     }
+    const liveSiteUrl = resolveLiveSiteUrl(this.config);
     this.setState(sessionId, 'published', {
       prNumber,
       prUrl,
       ...(deployUrl ? { deployUrl } : {}),
+      ...(liveSiteUrl ? { liveSiteUrl } : {}),
     });
     this.onSessionMetaUpdated?.(sessionId);
   }
