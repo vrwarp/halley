@@ -7,16 +7,17 @@ export interface PwaUpdateState {
 }
 
 /**
- * Registers /sw.js in production builds and surfaces a non-disruptive update
- * state whenever a new Service Worker is installed and waiting to activate.
+ * Registers the unified root-scoped Service Worker (`/halley-preview-sw.js`)
+ * which provides both preview-tab isolation and PWA app-shell caching/offline fallback.
+ * Surfaces a non-disruptive update toast whenever a newer deployment is waiting.
  */
 export function usePwaUpdate(): PwaUpdateState {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const waitingWorkerRef = useRef<ServiceWorker | null>(null);
+  const userRequestedReloadRef = useRef(false);
   const reloadingRef = useRef(false);
 
   useEffect(() => {
-    if (!import.meta.env.PROD) return;
     if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
 
     let cancelled = false;
@@ -29,7 +30,9 @@ export function usePwaUpdate(): PwaUpdateState {
     };
 
     const onControllerChange = () => {
-      if (reloadingRef.current) return;
+      // Only reload when the user explicitly clicked "Reload" in the update toast.
+      // Never reload on first-install clients.claim().
+      if (!userRequestedReloadRef.current || reloadingRef.current) return;
       reloadingRef.current = true;
       window.location.reload();
     };
@@ -38,7 +41,7 @@ export function usePwaUpdate(): PwaUpdateState {
 
     const register = async () => {
       try {
-        const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+        const reg = await navigator.serviceWorker.register('/halley-preview-sw.js', { scope: '/' });
         if (cancelled) return;
         registrationRef = reg;
 
@@ -56,7 +59,7 @@ export function usePwaUpdate(): PwaUpdateState {
           });
         });
       } catch {
-        // SW registration failure should never break the editor
+        // Non-HTTPS LAN environments fall back cleanly to Referer-scoped routing
       }
     };
 
@@ -78,6 +81,7 @@ export function usePwaUpdate(): PwaUpdateState {
   }, []);
 
   const applyUpdate = useCallback(() => {
+    userRequestedReloadRef.current = true;
     const waiting = waitingWorkerRef.current;
     if (waiting) {
       waiting.postMessage({ type: 'SKIP_WAITING' });

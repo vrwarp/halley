@@ -6,8 +6,9 @@ import { describe, expect, it } from 'vitest';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webDir = path.resolve(__dirname, '../..');
 const publicDir = path.join(webDir, 'public');
+const previewProxyPath = path.resolve(webDir, '../control-plane/src/proxy/preview-proxy.ts');
 
-describe('PWA manifest, icons, and service worker', () => {
+describe('PWA manifest, icons, and unified service worker', () => {
   it('ships a valid web app manifest with all referenced icons present on disk', () => {
     const raw = fs.readFileSync(path.join(publicDir, 'manifest.webmanifest'), 'utf8');
     const manifest = JSON.parse(raw) as {
@@ -43,7 +44,7 @@ describe('PWA manifest, icons, and service worker', () => {
   });
 
   it('ships favicons, apple-touch-icon, offline fallback, and links them from index.html', () => {
-    for (const rel of ['favicon.ico', 'favicon.svg', 'apple-touch-icon.png', 'offline.html', 'sw.js']) {
+    for (const rel of ['favicon.ico', 'favicon.svg', 'apple-touch-icon.png', 'offline.html']) {
       const p = path.join(publicDir, rel);
       expect(fs.existsSync(p), `Missing public/${rel}`).toBe(true);
       expect(fs.statSync(p).size).toBeGreaterThan(100);
@@ -58,12 +59,13 @@ describe('PWA manifest, icons, and service worker', () => {
     expect(html).toContain('<meta name="apple-mobile-web-app-capable" content="yes" />');
   });
 
-  it('configures sw.js to bypass dynamic, preview, auth, and websocket routes', () => {
-    const sw = fs.readFileSync(path.join(publicDir, 'sw.js'), 'utf8');
+  it('unifies preview isolation and PWA offline/update behavior in HALLEY_PREVIEW_SW_JS', () => {
+    const swSource = fs.readFileSync(previewProxyPath, 'utf8');
     for (const prefix of ['/api/', '/p/', '/__halley_p/', '/ws/', '/internal/', '/__editor/']) {
-      expect(sw).toContain(`'${prefix}'`);
+      expect(swSource).toContain(`'${prefix}'`);
     }
-    expect(sw).toContain('SKIP_WAITING');
-    expect(sw).toContain('/offline.html');
+    expect(swSource).toContain('SKIP_WAITING');
+    expect(swSource).toContain('/offline.html');
+    expect(swSource).toContain('__HALLEY_SW_VERSION__');
   });
 });
