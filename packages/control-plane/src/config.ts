@@ -8,6 +8,11 @@ export interface HalleyConfig {
   baseBranch: string;
   /** Optional GitHub Actions workflow filename or name used to confirm live site deployment. */
   deployWorkflow: string;
+  /**
+   * Merge the publish PR as soon as it is opened instead of waiting for its CI run. The commit has
+   * already passed Halley's local checks; if GitHub refuses the merge, Halley waits for CI as usual.
+   */
+  publishSkipCi: boolean;
   /** Optional override for live site URL used in Live vs Draft screenshots (defaults to https://<owner>.github.io/<repo> from HALLEY_REPO; "none" disables). */
   liveSiteUrl: string;
   githubAppId: string;
@@ -155,6 +160,7 @@ export function loadConfig(): HalleyConfig {
     repo: process.env.HALLEY_REPO || 'vrwarp/thecrossing.website',
     baseBranch: process.env.HALLEY_BASE_BRANCH || 'main',
     deployWorkflow: (process.env.HALLEY_DEPLOY_WORKFLOW || '').trim(),
+    publishSkipCi: ['1', 'true', 'yes', 'on'].includes((process.env.HALLEY_PUBLISH_SKIP_CI || '').trim().toLowerCase()),
     liveSiteUrl: (process.env.HALLEY_LIVE_SITE_URL || '').trim().replace(/\/+$/, ''),
     githubAppId: process.env.GITHUB_APP_ID || '',
     githubAppPrivateKey: (process.env.GITHUB_APP_PRIVATE_KEY || '').replace(/\\n/g, '\n'),

@@ -33,6 +33,14 @@ export interface DeployPollOptions {
   maxConsecutiveErrors?: number;
   /** First CI poll interval; grows ×1.5 per poll up to `ciPollMaxIntervalMs`. */
   ciPollIntervalMs?: number;
+  /**
+   * While the CI wait is younger than this, the poll interval stays at or below
+   * `ciFastPollMaxIntervalMs`: a typical CI run finishes well inside it, and the full backoff
+   * would otherwise notice a ~20s run up to ~10s late.
+   */
+  ciFastPollWindowMs?: number;
+  /** Poll interval cap during the fast window. */
+  ciFastPollMaxIntervalMs?: number;
   /** Cap for the CI poll backoff (default: min(15s, 10 × ciPollIntervalMs)). */
   ciPollMaxIntervalMs?: number;
   ciRegistrationGraceMs?: number;
@@ -47,6 +55,8 @@ const DEFAULT_DEPLOY_POLL_OPTIONS: Required<DeployPollOptions> = {
   runRegistrationGraceMs: 45_000,
   maxConsecutiveErrors: 5,
   ciPollIntervalMs: 1500,
+  ciFastPollWindowMs: 60_000,
+  ciFastPollMaxIntervalMs: 3000,
   ciPollMaxIntervalMs: 15_000,
   ciRegistrationGraceMs: 15_000,
   ciTimeoutMs: 15 * 60_000,
@@ -742,6 +752,44 @@ export class PublishService {
     return head;
   }
 
+  /**
+   * Squash-merges a freshly opened PR without waiting for its CI (HALLEY_PUBLISH_SKIP_CI). The
+   * merge is pinned to the verified commit. Returns the merge commit, or null when GitHub refuses
+   * so the caller can wait for CI instead. GitHub computes mergeability asynchronously after a PR
+   * is opened, so a bare "not mergeable" 405 is retried briefly; a refusal that names a branch
+   * rule is not.
+   */
+  private async tryMergeWithoutCi(
+    prNumber: number,
+    headSha: string,
+    commitTitle: string,
+    commitMessage: string,
+    ctx: { sessionId: string; runId: string },
+  ): Promise<string | null> {
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.github.squashMergePr({ prNumber, commitTitle, commitMessage, headSha });
+      } catch (err) {
+        const settling =
+          err instanceof GitHubApiError &&
+          err.status === 405 &&
+          !/required|protected|review|rule|status check/i.test(err.message);
+        if (!settling || attempt === maxAttempts || this.stopping.signal.aborted) {
+          logger.warn('publish: merging without waiting for CI was refused; waiting for CI instead', {
+            ...ctx,
+            prNumber,
+            attempt,
+            err,
+          });
+          return null;
+        }
+        await this.clock.sleep(400 * attempt, this.stopping.signal);
+      }
+    }
+    return null;
+  }
+
   /** Never rejects: callers fire-and-forget (`void publish(...)`). */
   async publish(
     sessionInput: SessionRecord,
@@ -1045,6 +1093,21 @@ export class PublishService {
       }
 
       const commitMsg = `${prBody}\n\nCo-authored-by: ${actor.name} <${actor.email}>`;
+
+      // Optional fast path: the exact commit already passed the local checks, so merge it now
+      // instead of waiting for the PR's CI run to repeat them. A refusal (e.g. branch protection
+      // requiring status checks) falls through to the normal wait-for-CI path below.
+      if (this.config.publishSkipCi) {
+        const mergedSha = await this.tryMergeWithoutCi(pr.number, verifiedSha, prTitle, commitMsg, {
+          sessionId: session.id,
+          runId,
+        });
+        if (mergedSha) {
+          await this.finalizeMergeAndAwaitDeploy(session, runnerUrl, mergedSha, pr.number, pr.url, runId, actor.id);
+          return;
+        }
+      }
+
       const nativeAutoMerge = await this.github.tryEnableNativeAutoMerge(
         pr.nodeId,
         prTitle,
@@ -1226,8 +1289,9 @@ export class PublishService {
   }
 
   /**
-   * Polls PR + checks until merged/failed. Polling backs off (×1.5 up to ciPollMaxIntervalMs) so a
-   * 15-minute wait costs ~60 polls instead of ~600, and transient GitHub errors are tolerated up
+   * Polls PR + checks until merged/failed. Polling stays quick (≤ ciFastPollMaxIntervalMs) for the
+   * first ciFastPollWindowMs, then backs off (×1.5 up to ciPollMaxIntervalMs) so a 15-minute wait
+   * costs ~80 polls instead of ~600, and transient GitHub errors are tolerated up
    * to `maxConsecutiveErrors` (auth/404 errors fail immediately). Never throws.
    */
   private async waitForCiAndMerge(opts: {
@@ -1244,6 +1308,11 @@ export class PublishService {
     const deadline = startedAt + this.deployPollOptions.ciTimeoutMs;
     const ciRegDeadline = startedAt + this.deployPollOptions.ciRegistrationGraceMs;
     const maxInterval = this.deployPollOptions.ciPollMaxIntervalMs;
+    const fastUntil = startedAt + this.deployPollOptions.ciFastPollWindowMs;
+    const fastMaxInterval = Math.min(
+      maxInterval,
+      Math.max(this.deployPollOptions.ciPollIntervalMs, this.deployPollOptions.ciFastPollMaxIntervalMs),
+    );
     let interval = this.deployPollOptions.ciPollIntervalMs;
     let checkedCiPresence = false;
     let hasCiWorkflow = false;
@@ -1334,7 +1403,10 @@ export class PublishService {
       const remaining = deadline - this.clock.now();
       if (remaining <= 0) break;
       await this.clock.sleep(Math.min(interval, remaining), this.stopping.signal);
-      interval = Math.min(maxInterval, Math.round(interval * CI_POLL_BACKOFF_FACTOR));
+      interval = Math.min(
+        this.clock.now() < fastUntil ? fastMaxInterval : maxInterval,
+        Math.round(interval * CI_POLL_BACKOFF_FACTOR),
+      );
     }
 
     if (this.stopping.signal.aborted) return { kind: 'stopped' };

@@ -42,6 +42,7 @@ Halley runs as a static **two-container** Compose stack with **no `/var/run/dock
    - `ANTHROPIC_API_KEY`
    - `HALLEY_REPO` (e.g. `owner/site-repo`) & `HALLEY_BASE_BRANCH` (`main`)
    - `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` + `GITHUB_APP_INSTALLATION_ID` (or `GITHUB_TOKEN`)
+   - Optional: `HALLEY_PUBLISH_SKIP_CI=true` merges the publish PR as soon as it is opened instead of waiting for its CI run (Halley has already run the site's `check`, `build` and `verify:*` scripts on that exact commit). If branch protection refuses the merge, Halley waits for CI as usual.
 2. Start with [`docker-compose.prod.yml`](docker-compose.prod.yml):
    ```bash
    # Optional: expose on a custom host port such as 2243 (container port stays 3000)
