@@ -8,6 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': 'http://127.0.0.1:3000',
+      '/halley-preview-sw.js': 'http://127.0.0.1:3000',
       '/p': {
         target: 'http://127.0.0.1:3000',
         ws: true,

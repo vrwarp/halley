@@ -150,13 +150,25 @@ export function createControlPlane(
     );
   });
 
-  // Preview isolation Service Worker (clientId -> sessionId)
-  app.get('/halley-preview-sw.js', () => {
-    return new Response(HALLEY_PREVIEW_SW_JS, {
+  // Unified preview-isolation + PWA app-shell Service Worker
+  app.get('/halley-preview-sw.js', async () => {
+    let indexHtml = '';
+    try {
+      indexHtml = await fs.readFile(path.join(config.webDistDir, 'index.html'), 'utf8');
+    } catch {
+      // Dev mode without built dist/index.html
+    }
+    const swVersion = crypto
+      .createHash('sha256')
+      .update(HALLEY_PREVIEW_SW_JS)
+      .update(indexHtml)
+      .digest('hex')
+      .slice(0, 12);
+    return new Response(HALLEY_PREVIEW_SW_JS.replace('__HALLEY_SW_VERSION__', swVersion), {
       status: 200,
       headers: {
         'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Service-Worker-Allowed': '/',
       },
     });
@@ -1884,6 +1896,23 @@ export function createControlPlane(
 
   // Serve built React Web UI in production
   const webRoot = config.webDistDir;
+  app.use('/*', async (c, next) => {
+    await next();
+    const p = c.req.path;
+    if (p === '/manifest.webmanifest') {
+      c.header('Cache-Control', 'no-cache');
+      c.header('Content-Type', 'application/manifest+json; charset=utf-8');
+    } else if (p.startsWith('/assets/')) {
+      c.header('Cache-Control', 'public, max-age=31536000, immutable');
+    } else if (
+      p.startsWith('/icons/') ||
+      p === '/favicon.ico' ||
+      p === '/favicon.svg' ||
+      p === '/apple-touch-icon.png'
+    ) {
+      c.header('Cache-Control', 'public, max-age=86400');
+    }
+  });
   app.use('/*', serveStatic({ root: webRoot }));
   app.get('*', async (c, next) => {
     if (
@@ -1895,7 +1924,7 @@ export function createControlPlane(
       return next();
     }
     // Never return index.html with text/html for missing static asset extensions
-    if (/\.(?:js|mjs|ts|css|map|wasm|webp|png|jpg|jpeg|svg|ico|woff2?)$/i.test(c.req.path)) {
+    if (/\.(?:js|mjs|ts|css|map|wasm|webp|png|jpg|jpeg|svg|ico|woff2?|webmanifest)$/i.test(c.req.path)) {
       return c.notFound();
     }
     try {

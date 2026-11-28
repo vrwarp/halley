@@ -70,20 +70,69 @@ const STARTING_STATUS_HTML = `<!doctype html>
 const ASTRO_TOOLBAR_STUB_JS = 'export default {};\nexport const loadDevToolbarApps = async () => [];\n';
 
 /**
- * Service Worker script served at `/halley-preview-sw.js` with `Service-Worker-Allowed: /`.
- * Eliminates the global `Path=/` `halley_preview_session` cookie so multiple open session tabs
- * never cross-contaminate escaped root-relative requests (`/@vite/*`, `/src/*`, `/images/*`, CSS `url()`).
- * Each preview iframe browsing context has a unique `clientId` whose URL starts with `/p/<sessionId>/`.
+ * Unified root-scoped Service Worker served at `/halley-preview-sw.js` with `Service-Worker-Allowed: /`.
+ *
+ * 1. Preview tab isolation: eliminates the global `Path=/` `halley_preview_session` cookie so
+ *    multiple open session tabs never cross-contaminate escaped root-relative requests
+ *    (`/@vite/*`, `/src/*`, `/images/*`, CSS `url()`). Each preview iframe browsing context has
+ *    a unique `clientId` whose URL starts with `/p/<sessionId>/`.
+ * 2. PWA app shell & offline fallback: precaches icons/manifest/`/offline.html`, caches Halley's
+ *    own hashed `/assets/*` bundles, serves `/offline.html` on offline top-level navigations, and
+ *    supports non-disruptive `SKIP_WAITING` updates when a new deployment rolls out.
  */
 export const HALLEY_PREVIEW_SW_JS = `
+const SW_VERSION = '__HALLEY_SW_VERSION__';
+const CACHE_NAME = 'halley-shell-' + SW_VERSION;
+const OFFLINE_URL = '/offline.html';
+const PRECACHE_URLS = [
+  OFFLINE_URL,
+  '/manifest.webmanifest',
+  '/favicon.svg',
+  '/favicon.ico',
+  '/apple-touch-icon.png',
+  '/icons/icon-192.png',
+  '/icons/icon-512.png',
+];
+
 const clientSessions = new Map();
 
-self.addEventListener('install', () => {
-  self.skipWaiting();
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches
+      .open(CACHE_NAME)
+      .then((cache) => cache.addAll(PRECACHE_URLS))
+      .catch(() => {
+        // Non-fatal: SW still installs cleanly even if an optional precache item fails
+      })
+      .then(() => {
+        // Activate immediately on first install so preview isolation works right away;
+        // on upgrades when an active worker already controls clients, wait for SKIP_WAITING.
+        if (!self.registration.active) {
+          return self.skipWaiting();
+        }
+      }),
+  );
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key.startsWith('halley-shell-') && key !== CACHE_NAME)
+            .map((key) => caches.delete(key)),
+        ),
+      )
+      .then(() => self.clients.claim()),
+  );
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 function extractSessionFromUrl(rawUrl) {
@@ -103,7 +152,18 @@ function isReservedTopLevelPath(pathname) {
     pathname.startsWith('/__halley_p/') ||
     pathname.startsWith('/api/') ||
     pathname.startsWith('/internal/') ||
-    pathname.startsWith('/ws/')
+    pathname.startsWith('/ws/') ||
+    pathname.startsWith('/__editor/')
+  );
+}
+
+function isPwaIconOrManifest(pathname) {
+  return (
+    pathname.startsWith('/icons/') ||
+    pathname === '/favicon.svg' ||
+    pathname === '/favicon.ico' ||
+    pathname === '/apple-touch-icon.png' ||
+    pathname === '/manifest.webmanifest'
   );
 }
 
@@ -116,9 +176,26 @@ self.addEventListener('fetch', (event) => {
 
   if (req.mode === 'navigate') {
     const navSid = extractSessionFromUrl(req.url);
-    if (navSid && event.resultingClientId) {
-      clientSessions.set(event.resultingClientId, navSid);
+    if (navSid) {
+      if (event.resultingClientId) {
+        clientSessions.set(event.resultingClientId, navSid);
+      }
+      return;
     }
+    if (isReservedTopLevelPath(url.pathname)) return;
+
+    event.respondWith(
+      fetch(req).catch(async () => {
+        const cached = await caches.match(OFFLINE_URL);
+        return (
+          cached ||
+          new Response('Offline — please reconnect and reload.', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+          })
+        );
+      }),
+    );
     return;
   }
 
@@ -135,19 +212,46 @@ self.addEventListener('fetch', (event) => {
           if (sid) clientSessions.set(event.clientId, sid);
         }
       }
-      if (!sid) {
-        return fetch(req);
+      if (sid) {
+        const rewrittenUrl = new URL(
+          '/__halley_p/' + encodeURIComponent(sid) + url.pathname + url.search,
+          self.location.origin,
+        );
+        return fetch(rewrittenUrl.toString(), {
+          method: req.method,
+          headers: req.headers,
+          credentials: 'same-origin',
+          redirect: req.redirect,
+        });
       }
-      const rewrittenUrl = new URL(
-        '/__halley_p/' + encodeURIComponent(sid) + url.pathname + url.search,
-        self.location.origin,
-      );
-      return fetch(rewrittenUrl.toString(), {
-        method: req.method,
-        headers: req.headers,
-        credentials: 'same-origin',
-        redirect: req.redirect,
-      });
+
+      // Non-preview (Halley shell) GET requests: cache hashed bundles & icons
+      if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
+        const cache = await caches.open(CACHE_NAME);
+        const cached = await cache.match(req);
+        if (cached) return cached;
+        const response = await fetch(req);
+        if (response.ok && response.type === 'basic') {
+          cache.put(req, response.clone());
+        }
+        return response;
+      }
+
+      if (req.method === 'GET' && isPwaIconOrManifest(url.pathname)) {
+        const cache = await caches.open(CACHE_NAME);
+        const cached = await cache.match(req);
+        const networkPromise = fetch(req)
+          .then((response) => {
+            if (response.ok && response.type === 'basic') {
+              cache.put(req, response.clone());
+            }
+            return response;
+          })
+          .catch(() => cached);
+        return cached || (await networkPromise) || Response.error();
+      }
+
+      return fetch(req);
     })(),
   );
 });
