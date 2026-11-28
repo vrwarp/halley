@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bg-glow" cx="66%" cy="34%" r="65%">
+      <stop offset="0%" stop-color="#332A22" />
+      <stop offset="55%" stop-color="#1C1917" />
+      <stop offset="100%" stop-color="#141210" />
+    </radialGradient>
+    <linearGradient id="comet-tail-main" x1="336" y1="176" x2="108" y2="404" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE68A" stop-opacity="0.95" />
+      <stop offset="35%" stop-color="#F59E0B" stop-opacity="0.82" />
+      <stop offset="75%" stop-color="#D97706" stop-opacity="0.32" />
+      <stop offset="100%" stop-color="#B45309" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="comet-tail-sub" x1="312" y1="158" x2="136" y2="338" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FCD34D" stop-opacity="0.65" />
+      <stop offset="60%" stop-color="#D97706" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#B45309" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="star-fill" x1="256" y1="96" x2="392" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FEF3C7" />
+      <stop offset="48%" stop-color="#FBBF24" />
+      <stop offset="100%" stop-color="#D97706" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#bg-glow)" />
+
+  <!-- Secondary upper comet wisp -->
+  <path
+    d="M316 158 C246 196 184 246 132 316 C182 272 246 226 326 184 Z"
+    fill="url(#comet-tail-sub)"
+  />
+
+  <!-- Primary comet tail -->
+  <path
+    d="M326 172 C244 228 170 302 100 398 C188 330 264 264 342 192 Z"
+    fill="url(#comet-tail-main)"
+  />
+
+  <!-- Comet head: 4-point editorial spark -->
+  <path
+    d="M336 92 C343 145 367 169 420 176 C367 183 343 207 336 260 C329 207 305 183 252 176 C305 169 329 145 336 92 Z"
+    fill="url(#star-fill)"
+  />
+
+  <!-- Warm core highlight -->
+  <circle cx="336" cy="176" r="18" fill="#FFFBEB" fill-opacity="0.92" />
+
+  <!-- Subtle companion star -->
+  <path
+    d="M196 154 C198.5 169 205 175.5 220 178 C205 180.5 198.5 187 196 202 C193.5 187 187 180.5 172 178 C187 175.5 193.5 169 196 154 Z"
+    fill="#FDE68A"
+    fill-opacity="0.8"
+  />
+</svg>

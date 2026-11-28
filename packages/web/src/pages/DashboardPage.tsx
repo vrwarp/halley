@@ -10,13 +10,14 @@ import {
   Plus,
   RotateCcw,
   Settings,
-  Sparkles,
   Trash2,
   Zap,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { BranchOffModal } from '../components/BranchOffModal.js';
+import { HalleyLogo } from '../components/HalleyLogo.js';
+import { InstallAppButton } from '../components/InstallAppButton.js';
 
 interface Props {
   user: UserDto;
@@ -223,12 +224,13 @@ export function DashboardPage({
 
   return (
     <div className="min-h-dvh bg-[#FAF9F7] text-[#1C1917]">
-      <header className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/90 backdrop-blur">
+      <header
+        className="sticky top-0 z-20 border-b border-[#E7E5E4] bg-white/90 backdrop-blur"
+        style={{ paddingTop: 'env(safe-area-inset-top)' }}
+      >
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-2 px-4 py-3 sm:px-6 sm:py-3.5">
           <div className="flex items-center gap-2.5 min-w-0">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-stone-900 text-amber-400">
-              <Sparkles className="h-4 w-4" />
-            </div>
+            <HalleyLogo className="h-8 w-8 shrink-0 rounded-lg" />
             <div className="min-w-0">
               <h1 className="text-sm font-semibold tracking-tight text-stone-900">Halley</h1>
               <p className="truncate text-xs text-stone-500">{repo}</p>
@@ -240,6 +242,7 @@ export function DashboardPage({
               Daily AI budget: ${spend.spentTodayUsd.toFixed(2)} / $
               {(spend.dailyCapUsd + spend.extraGrantedUsd).toFixed(2)}
             </span>
+            <InstallAppButton />
             {user.isAdmin && (
               <>
                 {onOpenOptimize && (

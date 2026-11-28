@@ -1,6 +1,6 @@
-import { Sparkles } from 'lucide-react';
 import { useState } from 'react';
 import { api } from '../api.js';
+import { HalleyLogo } from '../components/HalleyLogo.js';
 
 interface Props {
   repo: string;
@@ -33,12 +33,16 @@ export function SignInPage({
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#FAF9F7] px-4">
+    <div
+      className="flex min-h-dvh items-center justify-center bg-[#FAF9F7] px-4"
+      style={{
+        paddingTop: 'max(1rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(1rem, env(safe-area-inset-bottom))',
+      }}
+    >
       <div className="w-full max-w-md rounded-2xl border border-[#E7E5E4] bg-white p-8 shadow-sm">
         <div className="flex items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 text-amber-700 border border-amber-200/70">
-            <Sparkles className="h-4 w-4" />
-          </div>
+          <HalleyLogo className="h-9 w-9 shrink-0 rounded-xl shadow-xs" />
           <div>
             <p className="text-xs font-medium uppercase tracking-wider text-stone-500">Halley</p>
             <h1 className="text-lg font-semibold text-stone-900">{repo}</h1>
