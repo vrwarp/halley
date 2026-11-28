@@ -98,6 +98,55 @@ function formatSectionLabel(section: string): string {
   return `${titled} (${section})`;
 }
 
+function humanizeRouteSlug(route: string): string {
+  if (route === '/') return 'Home';
+  const seg = route.split('/').filter(Boolean).pop() ?? route;
+  if (seg.toLowerCase() === 'im-new') return "I'm New";
+  return seg
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function decodeBasicEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&apos;|&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&ndash;/g, '–')
+    .replace(/&mdash;/g, '—');
+}
+
+function extractPageTitle(src: string, ext: string, route: string): string {
+  if (route === '/') return 'Home';
+  if (ext === '.md' || ext === '.mdx') {
+    const fm = src.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    if (fm) {
+      const m = fm[1]!.match(/^\s*title\s*:\s*(?:['"]([^'"]+)['"]|([^\r\n#]+))/m);
+      const raw = (m?.[1] ?? m?.[2] ?? '').trim();
+      if (raw) return raw;
+    }
+  } else {
+    // Match static title="..." or title={'...'} on Layout/BaseLayout/PageHeader
+    const propMatch =
+      /<(?:BaseLayout|Layout|PageHeader)\b[^>]*?\btitle\s*=\s*(?:"([^"]+)"|'([^']+)'|\{\s*['"]([^'"]+)['"]\s*\})/s.exec(
+        src,
+      );
+    const fromProp = (propMatch?.[1] ?? propMatch?.[2] ?? propMatch?.[3] ?? '').trim();
+    if (fromProp) {
+      // Strip trailing " | Site Name" or " — Site Name" suffixes if present
+      const cleaned = decodeBasicEntities(fromProp).split(/\s+[|—–-]\s+/)[0]!.trim();
+      if (cleaned) return cleaned;
+    }
+    const h1Match = /<h1\b[^>]*>([^<{]+)<\/h1>/i.exec(src);
+    if (h1Match?.[1]?.trim()) {
+      return decodeBasicEntities(h1Match[1].trim());
+    }
+  }
+  return humanizeRouteSlug(route);
+}
+
 async function walkPages(
   dir: string,
   pagesRoot: string,
@@ -147,10 +196,12 @@ async function walkPages(
 
     let unlisted = false;
     let mtimeMs: number | undefined;
+    let pageTitle = humanizeRouteSlug(route);
     try {
       const [src, stat] = await Promise.all([fs.readFile(full, 'utf8'), fs.stat(full)]);
       unlisted = await isPageSourceUnlisted(src, ext);
       mtimeMs = stat.mtimeMs;
+      pageTitle = extractPageTitle(src, ext, route);
     } catch (err) {
       // ENOENT: page removed between readdir and read — list it without metadata.
       ignoreMissingPath(`reading page metadata for ${full}`, err);
@@ -158,7 +209,7 @@ async function walkPages(
 
     routes.push({
       route,
-      label: route === '/' ? 'Home (/)' : route,
+      label: `${pageTitle} (${route})`,
       file: fileRel,
       section: sectionFromRoute(route, isIndexFile),
       unlisted,
