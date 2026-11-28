@@ -446,7 +446,8 @@ export async function renderFullDiffClient(
 
     const objectUrl = URL.createObjectURL(diffBlob);
     return { diffUrl: objectUrl, objectUrl };
-  } catch {
+  } catch (err) {
+    console.warn('[halley] perceptual diff image failed', err);
     return null;
   }
 }

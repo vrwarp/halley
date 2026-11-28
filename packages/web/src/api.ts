@@ -22,13 +22,68 @@ import type {
   VisualDiffPageDto,
 } from '@halley/shared';
 
-async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error((data as { error?: string }).error || `Request failed (${res.status})`);
+/** Error thrown by {@link apiFetch}; carries the HTTP status (0 for network failures). */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly url: string;
+  constructor(message: string, status: number, url: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.url = url;
   }
-  return (await res.json()) as T;
+}
+
+export function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === 'AbortError';
+}
+
+/** `error` string from a JSON error body; undefined for non-JSON bodies (e.g. a proxy HTML page). */
+function serverErrorMessage(raw: string): string | undefined {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    // Expected: non-JSON error bodies (proxy/HTML pages). Anything else is a real bug.
+    if (err instanceof SyntaxError) return undefined;
+    throw err;
+  }
+  const error = (data as { error?: unknown } | null)?.error;
+  return typeof error === 'string' && error ? error : undefined;
+}
+
+async function apiFetch<T>(url: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, signal ? { ...init, signal } : init);
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    throw new ApiError(
+      `Network error contacting ${url}: ${err instanceof Error ? err.message : String(err)}`,
+      0,
+      url,
+    );
+  }
+  const raw = await res.text();
+  if (!res.ok) {
+    const serverMessage = serverErrorMessage(raw);
+    throw new ApiError(
+      serverMessage ? `${serverMessage} (HTTP ${res.status})` : `Request failed (HTTP ${res.status})`,
+      res.status,
+      url,
+    );
+  }
+  if (res.status === 204) return undefined as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    const ct = res.headers.get('content-type') ?? 'unknown content-type';
+    throw new ApiError(
+      `Unexpected non-JSON response from ${url} (HTTP ${res.status}, ${ct})`,
+      res.status,
+      url,
+    );
+  }
 }
 
 export interface AuthMeResponse {
@@ -50,7 +105,7 @@ export interface PriorThreadDto {
 }
 
 export const api = {
-  me: () => apiFetch<AuthMeResponse>('/api/auth/me'),
+  me: (signal?: AbortSignal) => apiFetch<AuthMeResponse>('/api/auth/me', undefined, signal),
   devLogin: (email?: string, name?: string) =>
     apiFetch<{ user: UserDto; spend: SpendStatusDto }>('/api/auth/dev-login', {
       method: 'POST',
@@ -65,8 +120,8 @@ export const api = {
       body: JSON.stringify({ persona }),
     }),
 
-  listSessions: () =>
-    apiFetch<{ sessions: EditorSessionDto[]; spend: SpendStatusDto }>('/api/sessions'),
+  listSessions: (signal?: AbortSignal) =>
+    apiFetch<{ sessions: EditorSessionDto[]; spend: SpendStatusDto }>('/api/sessions', undefined, signal),
   listHistory: () => apiFetch<{ entries: LiveHistoryEntryDto[] }>('/api/history'),
   createSession: (title: string) =>
     apiFetch<{ session: EditorSessionDto }>('/api/sessions', {
@@ -74,8 +129,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
     }),
-  getSession: (id: string) =>
-    apiFetch<{ session: EditorSessionDto; spend: SpendStatusDto }>(`/api/sessions/${id}`),
+  getSession: (id: string, signal?: AbortSignal) =>
+    apiFetch<{ session: EditorSessionDto; spend: SpendStatusDto }>(`/api/sessions/${id}`, undefined, signal),
   wakeSession: (id: string) =>
     apiFetch<{ session: EditorSessionDto }>(`/api/sessions/${id}/wake`, { method: 'POST' }),
   restartSession: (id: string) =>
@@ -273,9 +328,10 @@ export const api = {
   uploadImage: async (id: string, file: File): Promise<StagedAttachment> => {
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetch(`/api/sessions/${id}/uploads`, { method: 'POST', body: fd });
-    if (!res.ok) throw new Error('Upload failed');
-    const data = (await res.json()) as { attachment: StagedAttachment };
+    const data = await apiFetch<{ attachment: StagedAttachment }>(`/api/sessions/${id}/uploads`, {
+      method: 'POST',
+      body: fd,
+    });
     return data.attachment;
   },
   publish: (
@@ -308,14 +364,14 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
     }),
-  getTranscript: (id: string) =>
+  getTranscript: (id: string, signal?: AbortSignal) =>
     apiFetch<{
       entries: TranscriptEntryDto[];
       live: import('@halley/shared').LiveRunStateDto;
       volumeExpired?: boolean;
       priorThread?: PriorThreadDto | null;
       pageRequests?: PageRequestMetadata[];
-    }>(`/api/sessions/${id}/transcript`),
+    }>(`/api/sessions/${id}/transcript`, undefined, signal),
   getDebugTrace: (id: string) =>
     apiFetch<import('@halley/shared').DebugTraceDto>(`/api/sessions/${id}/debug-trace`),
 

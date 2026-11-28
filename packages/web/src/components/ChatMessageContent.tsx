@@ -1,6 +1,6 @@
 import { friendlyElementKind } from '@halley/shared';
 import { ArrowUpRight, ExternalLink } from 'lucide-react';
-import React from 'react';
+import React, { memo } from 'react';
 
 const IGNORED_PATH_PREFIXES = ['/images/', '/api/', '/p/', '/src/', '/public/', '/node_modules/', '/internal/', '/ws/'];
 const FILE_EXT_RE = /\.(?:astro|tsx?|jsx?|mjs|cjs|json|css|scss|html|md|mdx|webp|png|jpe?g|gif|svg|pdf|yml|yaml|sh|lock|txt)$/i;
@@ -29,8 +29,9 @@ function extractPreviewRouteFromUrl(rawUrl: string, astroBase?: string): string 
     if (normalizedBase && (parsed.pathname === normalizedBase || parsed.pathname.startsWith(normalizedBase + '/'))) {
       return parsed.pathname.slice(normalizedBase.length) || '/';
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    // Expected for relative / malformed URLs (new URL throws TypeError): not a preview link.
+    if (!(err instanceof TypeError)) throw err;
   }
   return null;
 }
@@ -187,7 +188,8 @@ function renderInline({ text, onNavigateRoute, knownRoutes, astroBase }: InlineP
   return nodes;
 }
 
-export function ChatMessageContent({
+/** Memoized: re-parses only when its text / routes / handler identity change. */
+export const ChatMessageContent = memo(function ChatMessageContent({
   text,
   onNavigateRoute,
   knownRoutes,
@@ -262,7 +264,7 @@ export function ChatMessageContent({
   }
 
   return <div className="space-y-2 text-sm leading-relaxed text-stone-800">{blocks}</div>;
-}
+});
 
 /**
  * Strips internal `[Selected Element N] ...` and `[Uploaded Image] ...` lines from user transcript bubbles
@@ -286,8 +288,9 @@ export function parseUserMessageDisplay(raw: string): {
       let snippet = elMatch[3] ?? elMatch[2] ?? '';
       try {
         snippet = JSON.parse(snippet) as string;
-      } catch {
-        // keep raw
+      } catch (err) {
+        // Expected: snippet is not a JSON string literal, keep it raw.
+        if (!(err instanceof SyntaxError)) throw err;
       }
       badges.push(
         elMatch[3]
@@ -303,8 +306,9 @@ export function parseUserMessageDisplay(raw: string): {
       let name = imgMatch[1] ?? 'Image';
       try {
         name = JSON.parse(name) as string;
-      } catch {
-        // keep raw
+      } catch (err) {
+        // Expected: filename is not a JSON string literal, keep it raw.
+        if (!(err instanceof SyntaxError)) throw err;
       }
       badges.push(`Image: ${name}`);
       continue;

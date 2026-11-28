@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   onOpenSession: (id: string) => void;
@@ -275,8 +276,8 @@ export function OptimizeAstroPanel({ onOpenSession, onSpendChanged, autoFocus }:
       setTimeout(() => {
         setCopiedId((cur) => (cur === id ? null : cur));
       }, 2000);
-    } catch {
-      // ignore clipboard errors
+    } catch (err) {
+      reportIgnored(err, 'clipboard write denied');
     }
   };
 

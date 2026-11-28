@@ -25,6 +25,7 @@ import {
 } from '../lib/perceptual-diff-client.js';
 import { ConflictCards } from './ConflictCards.js';
 import { VisualReview } from './VisualReview.js';
+import { reportIgnored } from '../lib/retry.js';
 
 interface Props {
   session: EditorSessionDto;
@@ -177,8 +178,12 @@ export function PublishModal({
             [vp]: { ...prev[vp], [route]: processed.fullPage },
           }));
         })
-        .catch(() => {
-          // Ignore aborts or transient per-route errors
+        .catch((err) => {
+          // Aborts (modal closed / viewport switched) or a transient per-route error: that route
+          // just shows no diff.
+          if (!(err instanceof DOMException && err.name === 'AbortError')) {
+            reportIgnored(err, `screenshot diff failed for ${route}`);
+          }
         })
         .finally(() => {
           if (generationRef.current !== gen) return;
@@ -248,7 +253,8 @@ export function PublishModal({
         resetScreenshotCache();
       }
       return { rev, routes: resolvedRoutes };
-    } catch {
+    } catch (err) {
+      console.warn('[halley] loading publish review failed', err);
       return null;
     } finally {
       setLoadingChanges(false);
@@ -273,8 +279,9 @@ export function PublishModal({
               void onChangedFilesUpdated();
             }
           }
-        } catch {
-          // Non-fatal in offline/dev mode
+        } catch (err) {
+          // Non-fatal in offline/dev mode: the merge review is optional.
+          reportIgnored(err, 'publish pre-sync review unavailable');
         }
       }
       if (!active) return;
