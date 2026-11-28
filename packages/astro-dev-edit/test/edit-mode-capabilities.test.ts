@@ -4,6 +4,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyTailwindStylePresets,
+  discoverSiteRoutes,
   EditUndoStack,
   inspectAstroElement,
   listSiteImages,
@@ -438,7 +439,28 @@ const item = { cover: '/images/dynamic.webp' };
     expect(next).toBe(`<a class="btn" data-x={fn('a > b')} href={url('/new')} target="_blank">`);
   });
 
-  it('client bridge contains zero execCommand calls and parses cleanly', async () => {
+  it('extracts human-readable page titles in discoverSiteRoutes for link picker labels', async () => {
+    const tmp = await makeTempSite({
+      'src/pages/index.astro': `<BaseLayout title="The Crossing | Church in Hayward"><h1>Welcome</h1></BaseLayout>`,
+      'src/pages/im-new.astro': `<BaseLayout title="I'm New — The Crossing"><main><h1>Plan Your Visit</h1></main></BaseLayout>`,
+      'src/pages/get-connected/youth.astro': `<main><h1>Youth &amp; Young Adults</h1></main>`,
+      'src/pages/events/retreat.md': `---\ntitle: "Fall Redwoods Retreat"\n---\n# Retreat\n`,
+      'src/pages/our-beliefs.astro': `<main><div>Static content</div></main>`,
+    });
+    try {
+      const routes = await discoverSiteRoutes(tmp);
+      const byRoute = Object.fromEntries(routes.map((r) => [r.route, r.label]));
+      expect(byRoute['/']).toBe('Home (/)');
+      expect(byRoute['/im-new']).toBe("I'm New (/im-new)");
+      expect(byRoute['/get-connected/youth']).toBe('Youth & Young Adults (/get-connected/youth)');
+      expect(byRoute['/events/retreat']).toBe('Fall Redwoods Retreat (/events/retreat)');
+      expect(byRoute['/our-beliefs']).toBe('Our Beliefs (/our-beliefs)');
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('client bridge contains zero execCommand calls, enforces unified dark bar invariants, and parses cleanly', async () => {
     const { buildClientBridgeScript } = await import('../src/client-bridge.js');
     const bridge = buildClientBridgeScript('/thecrossing.website');
     expect(() => new Function(bridge)).not.toThrow();
@@ -446,5 +468,20 @@ const item = { cover: '/images/dynamic.webp' };
     expect(bridge).toContain('/__editor/mutate');
     expect(bridge).toContain('/__editor/undo');
     expect(bridge).toContain('/__editor/upload-image');
+
+    // Unified dark bar & progressive disclosure invariants
+    expect(bridge).toContain('#18181B');
+    expect(bridge).toContain('data-act="format"');
+    expect(bridge).toContain('data-act="format-back"');
+    expect(bridge).toContain('data-more="add-drill"');
+    expect(bridge).toContain('data-more="add-back"');
+    expect(bridge).toContain('data-more="ask-loop"');
+    expect(bridge).not.toContain('data-act="add"');
+    expect(bridge).toContain('Required page title');
+    expect(bridge).toContain('Photo focus (crop protection)');
+    expect(bridge).toContain('Shared &middot; updates across all pages');
+    expect(bridge).not.toContain('auto-WebP');
+    expect(bridge).toContain('data-pop-close="1"');
   });
 });
+

@@ -995,14 +995,22 @@ describe.concurrent('Halley E2E (with fake Anthropic SSE + fake GitHub + real As
       await pEl.evaluate((el) => el.blur());
       await patchSaved();
 
-      // 3b. Test expanded Edit Mode: Style preset (Center), Duplicate, and one-click Undo (zero reload)
+      // 3b. Test redesigned Unified Dark Bar: T Format stationary morph, Style preset, More -> Add block drill-down, Duplicate, and Undo
       const initialPCount = await frameLocator.locator('p').count();
+      await frameLocator.locator('button[data-act="format"]').click();
+      await frameLocator.locator('button[data-cmd="bold"]').waitFor({ state: 'visible', timeout: 5_000 });
+      await frameLocator.locator('button[data-act="format-back"]').click();
+      await frameLocator.locator('button[data-act="style"]').waitFor({ state: 'visible', timeout: 5_000 });
+
       await frameLocator.locator('button[data-act="style"]').click();
       await frameLocator.locator('button[data-align="center"]').click();
       await page.waitForTimeout(400);
       expect(await pEl.getAttribute('class')).toContain('text-center');
 
       await frameLocator.locator('button[data-act="more"]').click();
+      await frameLocator.locator('button[data-more="add-drill"]').click();
+      await frameLocator.locator('button[data-add="paragraph"]').waitFor({ state: 'visible', timeout: 5_000 });
+      await frameLocator.locator('button[data-more="add-back"]').click();
       await frameLocator.locator('button[data-more="duplicate"]').click();
       await page.waitForTimeout(400);
       expect(await frameLocator.locator('p').count()).toBe(initialPCount + 1);
