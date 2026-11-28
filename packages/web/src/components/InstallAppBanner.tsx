@@ -1,5 +1,6 @@
 import { Download, PlusSquare, Share, X } from 'lucide-react';
 import { useState } from 'react';
+import { reportIgnored } from '../lib/retry.js';
 import { usePwaInstall } from '../pwa/usePwaInstall.js';
 
 const DISMISS_STORAGE_KEY = 'halley_install_banner_dismissed_v1';
@@ -7,7 +8,8 @@ const DISMISS_STORAGE_KEY = 'halley_install_banner_dismissed_v1';
 function readDismissed(): boolean {
   try {
     return window.localStorage.getItem(DISMISS_STORAGE_KEY) === '1';
-  } catch {
+  } catch (err) {
+    reportIgnored(err, 'install-banner-read-dismissed');
     return false;
   }
 }
@@ -30,8 +32,8 @@ export function InstallAppBanner() {
     setDismissed(true);
     try {
       window.localStorage.setItem(DISMISS_STORAGE_KEY, '1');
-    } catch {
-      // ignore storage errors
+    } catch (err) {
+      reportIgnored(err, 'install-banner-write-dismissed');
     }
   };
 
