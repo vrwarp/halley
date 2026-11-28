@@ -1,8 +1,6 @@
-import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { parseAstroSource } from '@halley/astro-dev-edit';
 import type {
   AstroAuditMetricsDto,
@@ -13,8 +11,13 @@ import type {
 } from '@halley/shared';
 import sharp from 'sharp';
 import { createCheckpoint, type GitIdentity } from './checkpoints-and-git.js';
+import { readdirEntriesOrEmpty, readFileOr, writeFileAtomic } from './fs-util.js';
+import { ignore, ignoreExpected, isMissingPathError } from './log.js';
+import { execFileGroup, getProcessRunner, killProcessGroup } from './proc.js';
+import { realClock, type Clock } from './clock.js';
 
-const execFileAsync = promisify(execFile);
+// git runs through the injectable ProcessRunner (own process group)
+const execFileAsync = execFileGroup;
 
 const ALLOWED_INLINE_TAGS = new Set(['strong', 'b', 'em', 'i', 'br', 'span', 'a']);
 const TEXT_ELEMENT_TAGS = new Set([
@@ -115,23 +118,59 @@ function shouldReadTextBlob(filePath: string, size: number): boolean {
   return false;
 }
 
+/** Deadline and output ceiling for one `git cat-file --batch` audit read. */
+const BLOB_BATCH_TIMEOUT_MS = 60_000;
+const BLOB_BATCH_MAX_BYTES = 256 * 1024 * 1024;
+
 async function readBlobsBatch(
   gitDir: string,
   entries: TreeEntry[],
+  clock: Clock = realClock,
 ): Promise<Map<string, string>> {
   const result = new Map<string, string>();
   if (entries.length === 0) return result;
 
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-c', 'safe.directory=*', 'cat-file', '--batch'], {
+    const child = getProcessRunner().spawn('git', ['-c', 'safe.directory=*', 'cat-file', '--batch'], {
       cwd: gitDir,
+      detached: true,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
     const chunks: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-    child.on('error', reject);
+    let bytes = 0;
+    let failure: Error | null = null;
+    const fail = (err: Error) => {
+      if (failure) return;
+      failure = err;
+      killProcessGroup(child, 'SIGKILL');
+    };
+    const timer = clock.setTimeout(
+      () => fail(new Error(`git cat-file --batch timed out after ${BLOB_BATCH_TIMEOUT_MS}ms`)),
+      BLOB_BATCH_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    child.stdout!.on('data', (chunk: Buffer) => {
+      if (failure) return;
+      bytes += chunk.length;
+      if (bytes > BLOB_BATCH_MAX_BYTES) {
+        fail(new Error(`git cat-file --batch output exceeded ${BLOB_BATCH_MAX_BYTES} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    // a killed reader closes stdin under us: EPIPE is expected then
+    child.stdin!.on('error', (err) => ignoreExpected(err, 'optimizer: cat-file stdin closed'));
+    child.on('error', (err) => {
+      clock.clearTimeout(timer);
+      reject(err);
+    });
     child.on('close', () => {
+      clock.clearTimeout(timer);
+      if (failure) {
+        reject(failure);
+        return;
+      }
       const buf = Buffer.concat(chunks);
       let offset = 0;
       for (const entry of entries) {
@@ -151,8 +190,8 @@ async function readBlobsBatch(
     });
 
     const input = `${entries.map((e) => e.blobSha).join('\n')}\n`;
-    child.stdin.write(input);
-    child.stdin.end();
+    child.stdin!.write(input);
+    child.stdin!.end();
   });
 }
 
@@ -552,7 +591,9 @@ export async function scanBareGitRepo(
     try {
       const parsed = await parseAstroSource(source, { position: true });
       parsedRoot = parsed.ast as unknown as AstNode;
-    } catch {
+    } catch (err) {
+      // unparsable .astro (mid-edit or broken): skipped here; `astro check` reports it
+      ignoreExpected(err, 'optimizer: parse astro source');
       parsedRoot = null;
     }
     if (!parsedRoot) continue;
@@ -820,7 +861,8 @@ export async function scanBareGitRepo(
       scripts?: Record<string, string>;
     };
     pkgScripts = parsedPkg.scripts ?? {};
-  } catch {
+  } catch (err) {
+    ignore(err, 'optimizer: parse package.json scripts');
     pkgScripts = {};
   }
   const hasVerifySeo = Boolean(pkgScripts['verify:seo']);
@@ -1093,12 +1135,7 @@ export interface DeterministicPrePassResult {
 
 async function listSrcTextFiles(dir: string): Promise<string[]> {
   const out: string[] = [];
-  let entries;
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
+  const entries = await readdirEntriesOrEmpty(dir, 'optimizer: list source directory');
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
@@ -1144,7 +1181,9 @@ export async function runDeterministicOptimizationPrePass(
       let oldBuf: Buffer;
       try {
         oldBuf = await fs.readFile(absOld);
-      } catch {
+      } catch (err) {
+        // the image was removed since the scan: nothing to convert
+        if (!isMissingPathError(err)) ignore(err, 'optimizer: read image for webp conversion', { absOld });
         continue;
       }
 
@@ -1153,7 +1192,7 @@ export async function runDeterministicOptimizationPrePass(
         continue;
       }
 
-      await fs.writeFile(absNew, webpBuf);
+      await writeFileAtomic(absNew, webpBuf);
 
       // Rewrite exact path occurrences (`/images/foo.png` and `images/foo.png`) in src/
       const oldWithSlash = `/${rel}`;
@@ -1182,21 +1221,21 @@ export async function runDeterministicOptimizationPrePass(
     }
 
     for (const sf of dirtySrcFiles) {
-      await fs.writeFile(sf, fileContents.get(sf)!, 'utf8');
+      await writeFileAtomic(sf, fileContents.get(sf)!);
     }
   }
 
   const gitignoreFindings = findings.filter((f) => f.actionKind === 'deterministic_gitignore');
   if (gitignoreFindings.length > 0) {
     const giPath = path.join(repoRoot, '.gitignore');
-    let content = await fs.readFile(giPath, 'utf8').catch(() => '');
+    let content = await readFileOr(giPath, '', 'optimizer: read .gitignore');
     const toAppend: string[] = [];
     if (!/^\s*\/?dist\/?\s*$/m.test(content)) toAppend.push('dist/');
     if (!/^\s*\/?\.astro\/?\s*$/m.test(content)) toAppend.push('.astro/');
     if (toAppend.length > 0) {
       const prefix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
       content = `${content}${prefix}${toAppend.join('\n')}\n`;
-      await fs.writeFile(giPath, content, 'utf8');
+      await writeFileAtomic(giPath, content);
       completedSummaries.push(`Added ${toAppend.join(', ')} to \`.gitignore\``);
     }
   }

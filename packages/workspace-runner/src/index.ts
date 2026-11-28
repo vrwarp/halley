@@ -2,109 +2,60 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
-import {
-  discoverSiteRoutes,
-  inspectAstroElement,
-  patchStaticSpan,
-  PerFileMutex,
-  resolveEditorRelFile,
-} from '@halley/astro-dev-edit';
-import {
-  ChatClientMessageSchema,
-  SyncStartRequestSchema,
-  type ChatServerMessage,
-  type ConflictResolutionRecordDto,
-  type MergeReviewStateDto,
-  type OptimizationFindingDto,
-} from '@halley/shared';
+import { fileURLToPath } from 'node:url';
+import { discoverSiteRoutes, PerFileMutex } from '@halley/astro-dev-edit';
+import { type ChatServerMessage, type MergeReviewStateDto } from '@halley/shared';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { AstroDevManager, detectAstroSiteUrl } from './astro-manager.js';
+import { AstroDevManager, computePreviewBase, detectAstroBase, type AstroDevManagerOptions } from './astro-manager.js';
 import {
-  buildOptimizationPrompt,
-  runDeterministicOptimizationPrePass,
-} from './astro-optimizer.js';
-import {
-  commitVirtualMergeResolution,
+  configureGitClock,
   createCheckpoint,
-  ensureGitRerere,
   getGitChanges,
-  hasProtectedPathChanges,
-  listCheckpoints,
-  mergeWithBase,
-  resetToRef,
-  revertSingleFile,
+  recoverInterruptedSync,
   runLockedGit,
-  startRevertCommits,
-  undoToCheckpoint,
-  virtualMergeWithBase,
   type GitIdentity,
 } from './checkpoints-and-git.js';
+import { type ConflictEvidencePack } from './conflict-protocol.js';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { writeFileAtomic } from './fs-util.js';
+import { AsyncMutex } from './mutex.js';
 import {
-  applyResolvedFile,
-  buildConflictEvidencePack,
-  buildContradictionRecord,
-  estimateEscalationCost,
-  getUpstreamCommits,
-  resolvePackWithLlm,
-  tryDeterministicResolve,
-  type ConflictEvidencePack,
-} from './conflict-protocol.js';
+  errCode,
+  ignore,
+  ignoreCodes,
+  ignoreExpected,
+  logger,
+  readJsonBodyOrEmpty,
+  requestContextMiddleware,
+} from './log.js';
 import { NodeModulesCacheManager } from './nm-cache.js';
-import { PageCreationService, PageValidationError } from './pages.js';
-import { HalleyPiRuntime } from './pi-runtime.js';
+import { PageCreationService } from './pages.js';
+import { HalleyPiRuntime, type PiRuntimeOptions } from './pi-runtime.js';
+import { RUNNER_PROTOCOL_HEADER, RUNNER_PROTOCOL_VERSION } from './runner-protocol.js';
+import { registerEditorRoutes } from './routes/editor.js';
+import { registerSessionRoutes } from './routes/session.js';
+import { registerPagesRoutes } from './routes/pages.js';
+import { registerGitRoutes } from './routes/git.js';
+import { registerSyncRoutes } from './routes/sync.js';
+import { registerVerifyRoutes } from './routes/verify.js';
+import { registerUploadsRoutes } from './routes/uploads.js';
+import { registerAgentRoutes } from './routes/agent.js';
+import type { RunnerContext } from './runner-context.js';
+import { createRunnerWs } from './ws.js';
 import { UploadManager } from './uploads.js';
+import { setProcessRunner, type ProcessRunner, onParentDeath } from './proc.js';
 import {
+  configureVerification,
   invalidateSpeculativeVerification,
-  runAllVerificationChecks,
+  killActiveShellGroups,
   runSpeculativeVerification,
 } from './verify.js';
-import { buildChangeCards, resolveVisualReviewRoutes } from './visual-diff.js';
 
-const REPO_ROOT = process.env.HALLEY_WORKSPACE_DIR || '/workspace';
-const STATE_DIR = process.env.HALLEY_STATE_DIR || '/halley-state';
-const SESSION_ID = process.env.HALLEY_SESSION_ID || 'local';
-const BASE_BRANCH = process.env.HALLEY_BASE_BRANCH || 'main';
-let baseSha = process.env.HALLEY_BASE_SHA || '';
-const RUNNER_PORT = Number(process.env.RUNNER_PORT || 4100);
-const ASTRO_PORT = Number(process.env.ASTRO_PORT || 4321);
-const CONTROL_PLANE_INTERNAL_URL =
-  process.env.CONTROL_PLANE_INTERNAL_URL || 'http://127.0.0.1:3000';
-const SUPERVISOR_URL = process.env.HALLEY_SUPERVISOR_URL || '';
-let activeHostSecret = process.env.WORKSPACE_HOST_SECRET || '';
-let workspaceToken = process.env.WORKSPACE_TOKEN || 'dev-token';
+export { RUNNER_PROTOCOL_HEADER, RUNNER_PROTOCOL_VERSION } from './runner-protocol.js';
 
-const explicitEnvPersona = process.env.HALLEY_PERSONA;
-const explicitEnvEditorName = process.env.HALLEY_EDITOR_NAME;
-const explicitEnvEditorEmail = process.env.HALLEY_EDITOR_EMAIL;
-const explicitEnvReadOnly = process.env.HALLEY_READ_ONLY;
-
-// Scrub secrets from process.env immediately so child processes (astro dev SSR, agent bash, build scripts) never inherit them
-delete process.env.WORKSPACE_TOKEN;
-delete process.env.WORKSPACE_HOST_SECRET;
-
-const MODEL_ID = process.env.HALLEY_MODEL_ID || 'haiku-latest';
-const THINKING_LEVEL = (process.env.HALLEY_THINKING_LEVEL || 'high') as
-  | 'off'
-  | 'low'
-  | 'medium'
-  | 'high';
-let persona: 'non-technical' | 'developer' =
-  explicitEnvPersona === 'developer' ? 'developer' : 'non-technical';
-
-let readOnly = explicitEnvReadOnly === 'true';
-let prevBaseSha = '';
-
-const gitIdentity: GitIdentity = {
-  botName: process.env.HALLEY_GIT_BOT_NAME || 'Halley Bot',
-  botEmail: process.env.HALLEY_GIT_BOT_EMAIL || 'halley-bot@users.noreply.github.com',
-  editorName: explicitEnvEditorName || 'Halley Editor',
-  editorEmail: explicitEnvEditorEmail || 'editor@example.com',
-};
-
-const SESSION_META_PATH = path.join(STATE_DIR, 'session-meta.json');
-const MERGE_REVIEW_STATE_PATH = path.join(STATE_DIR, 'merge-review.json');
+export type ThinkingLevel = 'off' | 'low' | 'medium' | 'high';
 
 interface PersistedSessionMeta {
   editorName?: string;
@@ -122,10 +73,220 @@ interface PersistedMergeReviewDiskState {
   needsLlmPass?: boolean;
 }
 
-async function loadPersistedSessionMeta(): Promise<void> {
-  try {
-    const raw = await fs.readFile(SESSION_META_PATH, 'utf8');
-    const meta = JSON.parse(raw) as PersistedSessionMeta;
+/** Everything the runner reads from its environment, parsed once (see `loadRunnerConfig`). */
+export interface RunnerConfig {
+  repoRoot: string;
+  stateDir: string;
+  sessionId: string;
+  baseBranch: string;
+  baseSha: string;
+  runnerPort: number;
+  astroPort: number;
+  /** Bind address of the HTTP server (default 0.0.0.0). */
+  hostname: string;
+  controlPlaneInternalUrl: string;
+  supervisorUrl: string;
+  hostSecret: string;
+  workspaceToken: string;
+  explicitPersona?: string;
+  explicitEditorName?: string;
+  explicitEditorEmail?: string;
+  explicitReadOnly?: string;
+  modelId: string;
+  thinkingLevel: ThinkingLevel;
+  gitBotName: string;
+  gitBotEmail: string;
+  speculativeIdleMs: number;
+  inlineCheckpointDebounceMs: number;
+  shutdownBudgetMs: number;
+  maxUploadBytes: number;
+  nmCacheDir: string;
+  pkgCacheDir: string;
+  mirrorPath: string;
+  devLocalRepo?: string;
+  /** Verification runs in an isolated sandbox (no need to pause the live preview). */
+  verifySandbox: boolean;
+  wsHeartbeatMs: number;
+  wsMaxBufferedBytes: number;
+  wsMaxQueuedMessages: number;
+  /** Start the HTTP + WebSocket server (false: tests drive `app.fetch` / `wsHandlers` directly). */
+  listen: boolean;
+}
+
+/** Pure: parses the runner environment. The entry point scrubs the secrets from process.env after. */
+export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  const stateDir = env.HALLEY_STATE_DIR || '/halley-state';
+  const workspacesRoot = path.dirname(path.dirname(stateDir));
+  return {
+    repoRoot: env.HALLEY_WORKSPACE_DIR || '/workspace',
+    stateDir,
+    sessionId: env.HALLEY_SESSION_ID || 'local',
+    baseBranch: env.HALLEY_BASE_BRANCH || 'main',
+    baseSha: env.HALLEY_BASE_SHA || '',
+    runnerPort: Number(env.RUNNER_PORT || 4100),
+    astroPort: Number(env.ASTRO_PORT || 4321),
+    hostname: env.RUNNER_BIND_HOST || '0.0.0.0',
+    controlPlaneInternalUrl: env.CONTROL_PLANE_INTERNAL_URL || 'http://127.0.0.1:3000',
+    supervisorUrl: env.HALLEY_SUPERVISOR_URL || '',
+    hostSecret: env.WORKSPACE_HOST_SECRET || '',
+    workspaceToken: env.WORKSPACE_TOKEN || 'dev-token',
+    explicitPersona: env.HALLEY_PERSONA,
+    explicitEditorName: env.HALLEY_EDITOR_NAME,
+    explicitEditorEmail: env.HALLEY_EDITOR_EMAIL,
+    explicitReadOnly: env.HALLEY_READ_ONLY,
+    modelId: env.HALLEY_MODEL_ID || 'haiku-latest',
+    thinkingLevel: (env.HALLEY_THINKING_LEVEL || 'high') as ThinkingLevel,
+    gitBotName: env.HALLEY_GIT_BOT_NAME || 'Halley Bot',
+    gitBotEmail: env.HALLEY_GIT_BOT_EMAIL || 'halley-bot@users.noreply.github.com',
+    speculativeIdleMs: Number(env.HALLEY_SPECULATIVE_IDLE_MS || 15_000),
+    inlineCheckpointDebounceMs: Number(env.HALLEY_INLINE_CHECKPOINT_DEBOUNCE_MS || 1_500),
+    // Must stay below the supervisor's SIGTERM->SIGKILL grace (HALLEY_RUNNER_STOP_GRACE_MS, 5s).
+    shutdownBudgetMs: Number(env.HALLEY_RUNNER_SHUTDOWN_BUDGET_MS || 4_000),
+    maxUploadBytes: Number(env.HALLEY_MAX_UPLOAD_MB || 25) * 1024 * 1024,
+    nmCacheDir: env.HALLEY_NM_CACHE_DIR || path.join(workspacesRoot, 'nm-cache'),
+    pkgCacheDir: env.HALLEY_PKG_CACHE_DIR || path.join(workspacesRoot, 'pkg-cache'),
+    mirrorPath: env.HALLEY_MIRROR_PATH || '/halley-mirror/repo.git',
+    devLocalRepo: env.HALLEY_DEV_LOCAL_REPO || undefined,
+    verifySandbox: Boolean(env.HALLEY_VERIFY_SANDBOX_DIR),
+    wsHeartbeatMs: Number(env.HALLEY_WS_HEARTBEAT_MS || 20_000),
+    wsMaxBufferedBytes: Number(env.HALLEY_WS_MAX_BUFFERED_BYTES || 4 * 1024 * 1024),
+    wsMaxQueuedMessages: Number(env.HALLEY_WS_MAX_QUEUED_MESSAGES || 500),
+    listen: true,
+  };
+}
+
+/** The subset of `HalleyPiRuntime` the runner uses; tests inject a fake. */
+export type PiRuntimeLike = Pick<
+  HalleyPiRuntime,
+  | 'start'
+  | 'stop'
+  | 'isBusy'
+  | 'reloadAgentsMd'
+  | 'addSystemContextNote'
+  | 'getResolvedModelId'
+  | 'submitPageCreationRequest'
+  | 'submitUserInput'
+  | 'submitOptimizationRequest'
+  | 'abort'
+  | 'continueRun'
+  | 'getDebugTrace'
+  | 'resolveModelAlias'
+>;
+
+/** The subset of `AstroDevManager` the runner uses; tests inject a fake. */
+export type AstroManagerLike = Pick<
+  AstroDevManager,
+  'start' | 'stop' | 'pause' | 'resume' | 'restart' | 'getStatus'
+>;
+
+export interface RunnerDeps {
+  /** Drives the runner's timers and the repo's verification runs (shell timeouts, backoffs). */
+  clock?: Clock;
+  /**
+   * Child-process seam (git, npm/pnpm, build shells, astro). Installed process-wide for the
+   * runner's lifetime and restored on shutdown; omit for real processes.
+   */
+  processRunner?: ProcessRunner;
+  randomUUID?: () => string;
+  createPiRuntime?: (opts: PiRuntimeOptions) => PiRuntimeLike;
+  createAstroManager?: (opts: AstroDevManagerOptions) => AstroManagerLike;
+  /** Receives the handle before boot completes (so a SIGTERM during boot can still shut down cleanly). */
+  onCreated?: (handle: RunnerHandle) => void;
+}
+
+/** Per-socket delivery state for ordering, heartbeat and backpressure. */
+export interface WsClientState {
+  missedPongs: number;
+  /** Ordered events waiting for `bufferedAmount` to drain (never dropped; bounded). */
+  queue: string[];
+  /** Latest transcript_state held back by backpressure (latest-wins). */
+  pendingTranscript: string | null;
+  /** Last `seq` sent on this connection (per-connection counter; see WebSocket delivery). */
+  seq: number;
+}
+
+export interface RunnerWsHandlers {
+  /** Attaches a connected socket (sends the snapshot, wires message/pong/close handlers). */
+  handleConnection: (ws: WebSocket) => void;
+  /** Runs one heartbeat round (ping all; terminate sockets that missed 2 pongs). */
+  heartbeat: () => void;
+  clientCount: () => number;
+  /** Highest number of consecutive unanswered pings across open clients (0 when all answered). */
+  maxMissedPongs: () => number;
+  /** Current WS ordering state. */
+  sequence: () => { epoch: string; seq: number };
+}
+
+export interface RunnerHandle {
+  app: Hono;
+  server?: ReturnType<typeof serve>;
+  wss: WebSocketServer;
+  wsHandlers: RunnerWsHandlers;
+  /** Stops timers, astro dev and the Pi runtime (bounded by `shutdownBudgetMs`). Never exits the process. */
+  shutdown: () => Promise<void>;
+  /** Resolves once astro dev + Pi are started (createRunner already awaited it). */
+  ready: Promise<void>;
+  bootTimings: Record<string, number>;
+}
+
+/**
+ * Builds a workspace runner. Importing this module has no side effects; the process entry point
+ * at the bottom calls `createRunner(loadRunnerConfig())` only when run as the main module.
+ */
+export async function createRunner(config: RunnerConfig, deps: RunnerDeps = {}): Promise<RunnerHandle> {
+  const clock = deps.clock ?? realClock;
+  const restoreProcessRunner = deps.processRunner ? setProcessRunner(deps.processRunner) : null;
+  const restoreVerifyClock = configureVerification(config.repoRoot, { clock });
+  const restoreGitClock = configureGitClock(clock);
+  const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
+  const REPO_ROOT = config.repoRoot;
+  const STATE_DIR = config.stateDir;
+  const SESSION_ID = config.sessionId;
+  const BASE_BRANCH = config.baseBranch;
+  let baseSha = config.baseSha;
+  const RUNNER_PORT = config.runnerPort;
+  const ASTRO_PORT = config.astroPort;
+  const CONTROL_PLANE_INTERNAL_URL = config.controlPlaneInternalUrl;
+  const SUPERVISOR_URL = config.supervisorUrl;
+  let activeHostSecret = config.hostSecret;
+  let workspaceToken = config.workspaceToken;
+  const explicitEnvPersona = config.explicitPersona;
+  const explicitEnvEditorName = config.explicitEditorName;
+  const explicitEnvEditorEmail = config.explicitEditorEmail;
+  const explicitEnvReadOnly = config.explicitReadOnly;
+  const MODEL_ID = config.modelId;
+  const THINKING_LEVEL = config.thinkingLevel;
+  let persona: 'non-technical' | 'developer' =
+    explicitEnvPersona === 'developer' ? 'developer' : 'non-technical';
+  let readOnly = explicitEnvReadOnly === 'true';
+  let prevBaseSha = '';
+
+  const gitIdentity: GitIdentity = {
+    botName: config.gitBotName,
+    botEmail: config.gitBotEmail,
+    editorName: explicitEnvEditorName || 'Halley Editor',
+    editorEmail: explicitEnvEditorEmail || 'editor@example.com',
+  };
+
+  const SESSION_META_PATH = path.join(STATE_DIR, 'session-meta.json');
+  const MERGE_REVIEW_STATE_PATH = path.join(STATE_DIR, 'merge-review.json');
+
+  async function loadPersistedSessionMeta(): Promise<void> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(SESSION_META_PATH, 'utf8');
+    } catch (err) {
+      ignoreCodes(err, ['ENOENT'], 'runner: read persisted session meta (none yet)');
+      return;
+    }
+    let meta: PersistedSessionMeta;
+    try {
+      meta = JSON.parse(raw) as PersistedSessionMeta;
+    } catch (err) {
+      // env from the control plane is authoritative anyway; the file is rewritten on boot
+      logger.error('runner: persisted session meta is corrupt; ignoring it', { err, path: SESSION_META_PATH });
+      return;
+    }
     // Authoritative env vars from control-plane SQLite win on wake; fallback to persisted meta only when omitted
     if (!explicitEnvEditorName && meta.editorName) gitIdentity.editorName = meta.editorName;
     if (!explicitEnvEditorEmail && meta.editorEmail) gitIdentity.editorEmail = meta.editorEmail;
@@ -137,187 +298,398 @@ async function loadPersistedSessionMeta(): Promise<void> {
     if (explicitEnvReadOnly === undefined && typeof meta.readOnly === 'boolean') {
       readOnly = meta.readOnly;
     }
-  } catch {
-    // no persisted meta yet
   }
-}
 
-async function savePersistedSessionMeta(): Promise<void> {
-  await fs.mkdir(STATE_DIR, { recursive: true });
-  const meta: PersistedSessionMeta = {
-    editorName: gitIdentity.editorName,
-    editorEmail: gitIdentity.editorEmail,
-    persona,
-    baseSha,
-    ...(prevBaseSha ? { prevBaseSha } : {}),
-    readOnly,
+  async function savePersistedSessionMeta(): Promise<void> {
+    await fs.mkdir(STATE_DIR, { recursive: true });
+    const meta: PersistedSessionMeta = {
+      editorName: gitIdentity.editorName,
+      editorEmail: gitIdentity.editorEmail,
+      persona,
+      baseSha,
+      ...(prevBaseSha ? { prevBaseSha } : {}),
+      readOnly,
+    };
+    await writeFileAtomic(SESSION_META_PATH, JSON.stringify(meta, null, 2), { durable: true });
+  }
+
+  /** Persists session meta; failures are logged (state is re-sent by the control plane on wake). */
+  const saveMetaLogged = (context: string) =>
+    savePersistedSessionMeta().catch((err) =>
+      logger.error('runner: failed to persist session meta', { err, context }),
+    );
+
+  /** getGitChanges for best-effort counts in responses/broadcasts: an error is logged, never thrown. */
+  const changesOrEmpty = (baseRef = `origin/${BASE_BRANCH}`) =>
+    getGitChanges(REPO_ROOT, baseRef).catch((err) => {
+      ignore(err, 'runner: list git changes for change count', { baseRef });
+      return [] as Awaited<ReturnType<typeof getGitChanges>>;
+    });
+
+  /** Current HEAD commit sha, or null (unborn HEAD / git failure, logged). */
+  const resolveHeadSha = async (): Promise<string | null> => {
+    const res = await runLockedGit(REPO_ROOT, ['rev-parse', '--verify', '-q', 'HEAD']);
+    const sha = res.stdout.trim();
+    if (res.code === 0 && /^[0-9a-f]{40,64}$/i.test(sha)) return sha;
+    ignore(res.stderr || 'no HEAD', 'runner: resolve HEAD sha');
+    return null;
   };
-  const tmp = `${SESSION_META_PATH}.tmp-${process.pid}`;
-  await fs.writeFile(tmp, JSON.stringify(meta, null, 2), 'utf8');
-  await fs.rename(tmp, SESSION_META_PATH);
-}
 
-// Single OS-process PerFileMutex shared across inline `/__editor/patch`, Pi `edit`/`write`/`bash`, and `PageCreationService`
-const fileLock = new PerFileMutex();
-const uploadManager = new UploadManager(path.join(STATE_DIR, 'uploads'));
+  const syncPageRequestsLogged = (context: string) =>
+    pageService
+      .syncPageRequestsFromDisk()
+      .catch((err) => ignore(err, 'runner: sync page requests from disk', { context }));
 
-const wsClients = new Set<WebSocket>();
-let latestTranscript: Extract<ChatServerMessage, { type: 'transcript_state' }> | null = null;
-let currentWorkspaceLocked = false;
-let currentLockedFile: string | undefined;
-let currentPreviewPaused = false;
-let currentPreviewPauseReason: string | undefined;
+  // Single OS-process PerFileMutex shared across inline `/__editor/patch`, Pi `edit`/`write`/`bash`, and `PageCreationService`
+  const fileLock = new PerFileMutex();
+  const uploadManager = new UploadManager(path.join(STATE_DIR, 'uploads'));
 
-function broadcast(msg: ChatServerMessage): void {
-  const payload = JSON.stringify(msg);
-  for (const ws of wsClients) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(payload);
+  // ---------------------------------------------------------------------------------------------
+  // WebSocket delivery: ordering (`epoch` + `seq`), heartbeat and backpressure.
+  //
+  // Every server->client frame carries `epoch` (random per runner boot) and `seq`: a monotonic
+  // counter PER CONNECTION, stamped at the moment the frame is written to that socket, so each
+  // client sees 1, 2, 3, ... with no gaps unless a frame was really lost. (A single global counter
+  // made one tab's unicast frames look like gaps to every other tab, causing needless resyncs.)
+  // A client seeing `seq > last + 1` or a new `epoch` resyncs.
+  // ---------------------------------------------------------------------------------------------
+  const wsEpoch = randomUUID();
+  const wsClients = new Map<WebSocket, WsClientState>();
+  let latestTranscript: Extract<ChatServerMessage, { type: 'transcript_state' }> | null = null;
+  let currentWorkspaceLocked = false;
+  let currentLockedFile: string | undefined;
+  let currentPreviewPaused = false;
+  let currentPreviewPauseReason: string | undefined;
+
+  /** Appends the ordering fields to an already-serialized JSON object (avoids re-stringifying large transcripts). */
+  function withSeq(payload: string, seq: number): string {
+    const close = payload.lastIndexOf('}');
+    if (close === -1) return payload;
+    const body = payload.slice(0, close).trimEnd();
+    const sep = body.endsWith('{') ? '' : ',';
+    return `${body}${sep}"seq":${seq},"epoch":${JSON.stringify(wsEpoch)}}`;
+  }
+
+  function rawSend(ws: WebSocket, unstamped: string): void {
+    const state = wsClients.get(ws);
+    if (!state) return;
+    const payload = withSeq(unstamped, ++state.seq);
+    try {
+      ws.send(payload, (err) => {
+        if (err) ignoreExpected(err, 'ws: send failed (socket closing)');
+        else if (wsClients.get(ws)) flushClient(ws);
+      });
+    } catch (err) {
+      ignore(err, 'ws: send threw');
     }
   }
-}
 
-function notifySessionDiverged(changedFilesCount?: number): void {
-  if (!CONTROL_PLANE_INTERNAL_URL || !workspaceToken) return;
-  const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/diverged`;
-  void fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${workspaceToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(
-      typeof changedFilesCount === 'number' ? { changedFilesCount } : {},
-    ),
-    signal: AbortSignal.timeout(5000),
-  }).catch(() => {});
-}
-
-async function notifyOptimizationSettled(): Promise<void> {
-  if (!CONTROL_PLANE_INTERNAL_URL || !workspaceToken) return;
-  const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/optimization-settled`;
-  await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${workspaceToken}`,
-    },
-    signal: AbortSignal.timeout(5000),
-  }).catch(() => {});
-}
-
-const IDLE_SPECULATIVE_DELAY_MS = Number(process.env.HALLEY_SPECULATIVE_IDLE_MS || 15_000);
-let idleSpeculativeTimer: NodeJS.Timeout | null = null;
-
-function cancelSpeculativeVerify(): void {
-  if (idleSpeculativeTimer) {
-    clearTimeout(idleSpeculativeTimer);
-    idleSpeculativeTimer = null;
-  }
-  invalidateSpeculativeVerification(REPO_ROOT);
-}
-
-function triggerImmediateSpeculativeVerify(): void {
-  if (idleSpeculativeTimer) {
-    clearTimeout(idleSpeculativeTimer);
-    idleSpeculativeTimer = null;
-  }
-  if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
-  void runSpeculativeVerification(REPO_ROOT, {
-    supervisorUrl: SUPERVISOR_URL || undefined,
-    hostSecret: activeHostSecret || undefined,
-    sessionId: SESSION_ID,
-  });
-}
-
-function scheduleIdleSpeculativeVerify(delayMs = IDLE_SPECULATIVE_DELAY_MS): void {
-  cancelSpeculativeVerify();
-  if (shuttingDown || readOnly || delayMs <= 0) return;
-  idleSpeculativeTimer = setTimeout(async () => {
-    idleSpeculativeTimer = null;
-    if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
+  function closeForBackpressure(ws: WebSocket, state: WsClientState): void {
+    logger.warn('ws: client too slow; closing so it resyncs', {
+      queued: state.queue.length,
+      bufferedAmount: ws.bufferedAmount,
+    });
+    wsClients.delete(ws);
     try {
-      const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`);
-      if (changes.length === 0) return;
-    } catch {
+      ws.close(1013, 'Backpressure: resync required');
+    } catch (err) {
+      ignore(err, 'ws: close slow client');
+      ws.terminate();
+    }
+  }
+
+  /** Delivers queued events (in order), then a held-back transcript, while the socket has room. */
+  function flushClient(ws: WebSocket): void {
+    const state = wsClients.get(ws);
+    if (!state || ws.readyState !== ws.OPEN) return;
+    while (state.queue.length > 0 && ws.bufferedAmount <= config.wsMaxBufferedBytes) {
+      rawSend(ws, state.queue.shift()!);
+    }
+    if (state.queue.length === 0 && state.pendingTranscript && ws.bufferedAmount <= config.wsMaxBufferedBytes) {
+      const t = state.pendingTranscript;
+      state.pendingTranscript = null;
+      rawSend(ws, t);
+    }
+    if (state.queue.length > 0 || state.pendingTranscript) scheduleFlush();
+  }
+
+  let flushTimer: TimerHandle | null = null;
+  function scheduleFlush(): void {
+    if (flushTimer) return;
+    flushTimer = clock.setTimeout(() => {
+      flushTimer = null;
+      for (const ws of wsClients.keys()) flushClient(ws);
+    }, 100);
+    flushTimer.unref?.();
+  }
+
+  /** Sends one message to one client. `kind: 'state'` may be coalesced; events are queued, never dropped. */
+  function deliver(ws: WebSocket, payload: string, kind: 'event' | 'state' | 'transcript'): void {
+    const state = wsClients.get(ws);
+    if (!state || ws.readyState !== ws.OPEN) return;
+    const congested = ws.bufferedAmount > config.wsMaxBufferedBytes;
+    if (kind === 'transcript') {
+      if (congested || state.queue.length > 0) {
+        state.pendingTranscript = payload; // latest wins; seq is stamped when actually sent
+        scheduleFlush();
+        return;
+      }
+      rawSend(ws, payload);
       return;
     }
+    if (congested || state.queue.length > 0) {
+      state.queue.push(payload);
+      if (state.queue.length > config.wsMaxQueuedMessages) {
+        closeForBackpressure(ws, state);
+        return;
+      }
+      scheduleFlush();
+      return;
+    }
+    rawSend(ws, payload);
+  }
+
+  /** Unicast to one client (snapshot, errors). */
+  function safeSend(ws: WebSocket, payload: string): void {
+    deliver(ws, payload, 'state');
+  }
+
+  function broadcastRaw(payload: string): void {
+    for (const ws of wsClients.keys()) deliver(ws, payload, 'event');
+  }
+
+  function broadcastTranscript(payload: string): void {
+    for (const ws of wsClients.keys()) deliver(ws, payload, 'transcript');
+  }
+
+  function broadcast(msg: ChatServerMessage): void {
+    broadcastRaw(JSON.stringify(msg));
+  }
+
+  /** Tells connected clients that a background checkpoint failed instead of failing silently (W3). */
+  function reportCheckpointFailure(context: string, err: unknown): void {
+    logger.error(`checkpoint failed: ${context}`, { err });
+    broadcast({
+      type: 'error',
+      message: `Halley could not save a checkpoint of your latest changes (${context}). Your edits are still on disk; we will retry on the next change. ${err instanceof Error ? err.message : ''}`.trim(),
+    });
+  }
+
+  let lastTranscriptPayload = '';
+
+  function notifySessionDiverged(changedFilesCount?: number): void {
+    if (!CONTROL_PLANE_INTERNAL_URL || !workspaceToken) return;
+    const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/diverged`;
+    void fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${workspaceToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(
+        typeof changedFilesCount === 'number' ? { changedFilesCount } : {},
+      ),
+      signal: clock.timeoutSignal(5000),
+    }).catch((err) =>
+      // the control plane re-derives divergence on its next poll; this is only a fast path
+      ignoreExpected(err, 'runner: notify control plane of divergence'),
+    );
+  }
+
+  async function notifyOptimizationSettled(): Promise<void> {
+    if (!CONTROL_PLANE_INTERNAL_URL || !workspaceToken) return;
+    const endpoint = `${CONTROL_PLANE_INTERNAL_URL.replace(/\/$/, '')}/internal/session/optimization-settled`;
+    await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${workspaceToken}`,
+      },
+      signal: clock.timeoutSignal(5000),
+    }).catch((err) => ignore(err, 'runner: notify control plane that optimization settled'));
+  }
+
+  const IDLE_SPECULATIVE_DELAY_MS = config.speculativeIdleMs;
+  let idleSpeculativeTimer: TimerHandle | null = null;
+
+  function cancelSpeculativeVerify(): void {
+    if (idleSpeculativeTimer) {
+      clock.clearTimeout(idleSpeculativeTimer);
+      idleSpeculativeTimer = null;
+    }
+    invalidateSpeculativeVerification(REPO_ROOT);
+  }
+
+  function triggerImmediateSpeculativeVerify(): void {
+    if (idleSpeculativeTimer) {
+      clock.clearTimeout(idleSpeculativeTimer);
+      idleSpeculativeTimer = null;
+    }
+    if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
     void runSpeculativeVerification(REPO_ROOT, {
       supervisorUrl: SUPERVISOR_URL || undefined,
       hostSecret: activeHostSecret || undefined,
       sessionId: SESSION_ID,
     });
-  }, delayMs);
-  idleSpeculativeTimer.unref?.();
-}
-
-let inlineEditTimer: NodeJS.Timeout | null = null;
-function cancelInlineEditTimer(): void {
-  if (inlineEditTimer) {
-    clearTimeout(inlineEditTimer);
-    inlineEditTimer = null;
   }
-}
-function scheduleInlineCheckpoint(summary: string): void {
-  cancelSpeculativeVerify();
-  cancelInlineEditTimer();
-  inlineEditTimer = setTimeout(async () => {
-    inlineEditTimer = null;
-    try {
-      const ckpt = await createCheckpoint(REPO_ROOT, summary, gitIdentity);
-      if (ckpt) {
-        const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-        broadcast({
-          type: 'checkpoint_created',
-          checkpoint: ckpt,
-          changedFilesCount: changes.length,
-        });
-        notifySessionDiverged(changes.length);
-        if (changes.length > 0) {
-          scheduleIdleSpeculativeVerify();
-        }
+
+  function scheduleIdleSpeculativeVerify(delayMs = IDLE_SPECULATIVE_DELAY_MS): void {
+    cancelSpeculativeVerify();
+    if (shuttingDown || readOnly || delayMs <= 0) return;
+    idleSpeculativeTimer = clock.setTimeout(async () => {
+      idleSpeculativeTimer = null;
+      if (shuttingDown || readOnly || piRuntime?.isBusy() || inlineEditTimer) return;
+      try {
+        const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`);
+        if (changes.length === 0) return;
+      } catch (err) {
+        ignore(err, 'runner: list changes before idle speculative verify');
+        return;
       }
-    } catch {
-      // ignore background checkpoint error
+      void runSpeculativeVerification(REPO_ROOT, {
+        supervisorUrl: SUPERVISOR_URL || undefined,
+        hostSecret: activeHostSecret || undefined,
+        sessionId: SESSION_ID,
+      });
+    }, delayMs);
+    idleSpeculativeTimer.unref?.();
+  }
+
+  let inlineEditTimer: TimerHandle | null = null;
+  /** Debounced inline checkpoint currently being written (busy for LRU eviction). */
+  let inlineCheckpointInFlight: Promise<void> | null = null;
+  /** Foreground `/internal/verify` runs in progress (busy for LRU eviction). */
+  let activeVerifyRuns = 0;
+  function cancelInlineEditTimer(): void {
+    if (inlineEditTimer) {
+      clock.clearTimeout(inlineEditTimer);
+      inlineEditTimer = null;
     }
-  }, 1500);
-}
+  }
+  function scheduleInlineCheckpoint(summary: string): void {
+    cancelSpeculativeVerify();
+    cancelInlineEditTimer();
+    inlineEditTimer = clock.setTimeout(() => {
+      inlineEditTimer = null;
+      const run = (async () => {
+        try {
+          const ckpt = await createCheckpoint(REPO_ROOT, summary, gitIdentity);
+          if (ckpt) {
+            const changes = await changesOrEmpty();
+            broadcast({
+              type: 'checkpoint_created',
+              checkpoint: ckpt,
+              changedFilesCount: changes.length,
+            });
+            notifySessionDiverged(changes.length);
+            if (changes.length > 0) {
+              scheduleIdleSpeculativeVerify();
+            }
+          }
+        } catch (err) {
+          reportCheckpointFailure('inline edit', err);
+        }
+      })();
+      inlineCheckpointInFlight = run;
+      void run.finally(() => {
+        if (inlineCheckpointInFlight === run) inlineCheckpointInFlight = null;
+      });
+    }, config.inlineCheckpointDebounceMs);
+    inlineEditTimer.unref?.();
+  }
 
-const astroManager = new AstroDevManager({
-  repoRoot: REPO_ROOT,
-  stateDir: STATE_DIR,
-  sessionId: SESSION_ID,
-  astroPort: ASTRO_PORT,
-  runnerPort: RUNNER_PORT,
-  isReadOnly: () => readOnly,
-  onPatched: ({ file }) => {
-    scheduleInlineCheckpoint(`Inline edit in ${file}`);
-  },
-});
+  const astroOptions: AstroDevManagerOptions = {
+    repoRoot: REPO_ROOT,
+    stateDir: STATE_DIR,
+    sessionId: SESSION_ID,
+    astroPort: ASTRO_PORT,
+    runnerPort: RUNNER_PORT,
+    isReadOnly: () => readOnly,
+    onPatched: ({ file }) => {
+      scheduleInlineCheckpoint(`Inline edit in ${file}`);
+    },
+    clock,
+  };
+  const astroManager: AstroManagerLike = deps.createAstroManager
+    ? deps.createAstroManager(astroOptions)
+    : new AstroDevManager(astroOptions);
 
-let piRuntime: HalleyPiRuntime | null = null;
+  let piRuntime: PiRuntimeLike | null = null;
 
-let shuttingDown = false;
-const shutdown = async () => {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  cancelSpeculativeVerify();
-  cancelInlineEditTimer();
-  await Promise.allSettled([
-    astroManager.stop().catch(() => {}),
-    piRuntime?.stop().catch(() => {}),
-  ]);
-  process.exit(0);
-};
-process.on('SIGINT', () => void shutdown());
-process.on('SIGTERM', () => void shutdown());
+  let shuttingDown = false;
+  const SHUTDOWN_BUDGET_MS = config.shutdownBudgetMs;
+  let wsHeartbeatTimer: TimerHandle | null = null;
+  // eslint-disable-next-line prefer-const
+  let closeServer: () => void = () => undefined;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    cancelSpeculativeVerify();
+    cancelInlineEditTimer();
+    if (wsHeartbeatTimer) clock.clearTimeout(wsHeartbeatTimer);
+    if (flushTimer) clock.clearTimeout(flushTimer);
+    killActiveShellGroups('SIGTERM');
+    let budgetTimer: TimerHandle | null = null;
+    const budget = new Promise<void>((resolve) => {
+      budgetTimer = clock.setTimeout(() => {
+        logger.warn('runner shutdown budget exceeded; exiting', { budgetMs: SHUTDOWN_BUDGET_MS });
+        resolve();
+      }, SHUTDOWN_BUDGET_MS);
+      budgetTimer.unref?.();
+    });
+    // astro dev and the Pi harness stop in parallel, bounded by the budget
+    await Promise.race([
+      Promise.allSettled([
+        astroManager.stop().catch((e) => ignore(e, 'shutdown: stop astro dev')),
+        piRuntime?.stop().catch((e) => ignore(e, 'shutdown: stop pi runtime')),
+      ]),
+      budget,
+    ]);
+    clock.clearTimeout(budgetTimer);
+    killActiveShellGroups('SIGKILL');
+    for (const ws of wsClients.keys()) ws.terminate();
+    wsClients.clear();
+    closeServer();
+    restoreVerifyClock();
+    restoreGitClock();
+    restoreProcessRunner?.();
+  };
 
-async function main() {
+  // ---------------------------------------------------------------------------------------------
+  // Boot (part 1, before the HTTP server listens): persisted state + crash recovery.
+  // ---------------------------------------------------------------------------------------------
+  const bootTimings: Record<string, number> = {};
+  const bootT0 = clock.now();
+  const timed = async <T>(phase: string, fn: () => Promise<T>): Promise<T> => {
+    const t = clock.now();
+    try {
+      return await fn();
+    } finally {
+      bootTimings[phase] = clock.now() - t;
+    }
+  };
+  let booted = false;
+  let bootFailed: unknown = null;
+
   await loadPersistedSessionMeta();
+  // W4: finish (or discard) a sync merge interrupted by a crash before anything can checkpoint
+  try {
+    const recovery = await timed('syncRecovery', () => recoverInterruptedSync(REPO_ROOT));
+    if (recovery.action === 'completed' && recovery.intent?.kind === 'sync' && recovery.intent.newBaseSha) {
+      if (recovery.intent.prevBaseSha) prevBaseSha = recovery.intent.prevBaseSha;
+      baseSha = recovery.intent.newBaseSha;
+    }
+    if (recovery.action !== 'none') {
+      logger.warn('runner: recovered interrupted sync on startup', { recovery });
+    }
+  } catch (err) {
+    logger.error('runner: interrupted sync recovery failed on startup', { err });
+  }
   // Persist authoritative env metadata immediately so disk matches control-plane SQLite
-  await savePersistedSessionMeta().catch(() => {});
+  await saveMetaLogged('boot');
 
-  console.log('[halley-boot] starting_preview');
-  const { originalBase, previewBase } = await astroManager.start();
+  // Same derivation astro-manager uses for its wrapper config; refreshed from astroManager.start()
+  let originalBase = await detectAstroBase(REPO_ROOT);
+  let previewBase = computePreviewBase(SESSION_ID, originalBase);
 
   const pageService = new PageCreationService({
     repoRoot: REPO_ROOT,
@@ -327,6 +699,7 @@ async function main() {
     fileLock,
     getAstroPort: () => ASTRO_PORT,
     getPreviewBase: () => previewBase,
+    clock,
     onBroadcast: (msg) => {
       broadcast(msg);
       if (msg.type === 'checkpoint_created') {
@@ -334,13 +707,9 @@ async function main() {
       }
     },
   });
-  await pageService.load();
-  await pageService
-    .syncPageRequestsFromDisk({ reconcileInterrupted: true, broadcast: false })
-    .catch(() => {});
 
-  console.log('[halley-boot] starting_ai');
-  piRuntime = new HalleyPiRuntime({
+  const piOptions = (): PiRuntimeOptions => ({
+    clock,
     repoRoot: REPO_ROOT,
     stateDir: STATE_DIR,
     sessionId: SESSION_ID,
@@ -363,9 +732,15 @@ async function main() {
       broadcast({ type: 'workspace_lock', locked, file });
     },
     onRunFinishedWithEdits: async (summary) => {
-      const ckpt = await createCheckpoint(REPO_ROOT, summary, gitIdentity);
+      let ckpt: Awaited<ReturnType<typeof createCheckpoint>> = null;
+      try {
+        ckpt = await createCheckpoint(REPO_ROOT, summary, gitIdentity);
+      } catch (err) {
+        reportCheckpointFailure('AI edit', err);
+        return;
+      }
       if (ckpt) {
-        const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
+        const changes = await changesOrEmpty();
         broadcast({
           type: 'checkpoint_created',
           checkpoint: ckpt,
@@ -394,11 +769,13 @@ async function main() {
         type: 'transcript_state',
         ...snapshot,
       };
-      broadcast(latestTranscript);
+      // W8: identical consecutive states (e.g. a tick that only touched internal docs) are not resent
+      const payload = JSON.stringify(latestTranscript);
+      if (payload === lastTranscriptPayload) return;
+      lastTranscriptPayload = payload;
+      broadcastTranscript(payload);
     },
   });
-
-  await piRuntime.start();
 
   // Persistent virtual merge review state (survives sleep/wake with zero working-tree markers)
   let activeMergeState: MergeReviewStateDto | null = null;
@@ -420,11 +797,10 @@ async function main() {
         ...(activeVirtualTreeSha ? { virtualTreeSha: activeVirtualTreeSha } : {}),
         ...(activeMergeNeedsLlmPass ? { needsLlmPass: true } : {}),
       };
-      const tmp = `${MERGE_REVIEW_STATE_PATH}.tmp-${process.pid}`;
-      await fs.writeFile(tmp, JSON.stringify(payload, null, 2), 'utf8');
-      await fs.rename(tmp, MERGE_REVIEW_STATE_PATH);
-    } catch {
-      // non-fatal
+      await writeFileAtomic(MERGE_REVIEW_STATE_PATH, JSON.stringify(payload, null, 2), { durable: true });
+    } catch (err) {
+      // Non-fatal for the request, but a lost review state means conflict choices vanish on wake
+      logger.error('failed to persist merge review state', { err, path: MERGE_REVIEW_STATE_PATH });
     }
   };
 
@@ -437,26 +813,139 @@ async function main() {
       activeVirtualTreeSha = parsed.virtualTreeSha;
       activeMergeNeedsLlmPass = Boolean(parsed.needsLlmPass);
     }
-  } catch {
-    // no persisted merge state
+  } catch (err) {
+    // ENOENT: no persisted merge state; corrupt JSON is logged (the review must be restarted)
+    if (errCode(err) === 'ENOENT') ignoreExpected(err, 'runner: no persisted merge review state');
+    else logger.error('runner: persisted merge review state is unreadable', { err, path: MERGE_REVIEW_STATE_PATH });
   }
 
-  const nmCacheDir =
-    process.env.HALLEY_NM_CACHE_DIR || path.join(path.dirname(path.dirname(STATE_DIR)), 'nm-cache');
-  const pkgCacheDir =
-    process.env.HALLEY_PKG_CACHE_DIR || path.join(path.dirname(path.dirname(STATE_DIR)), 'pkg-cache');
-  const runnerNmCache = new NodeModulesCacheManager(nmCacheDir, pkgCacheDir, 2);
+  const runnerNmCache = new NodeModulesCacheManager(config.nmCacheDir, config.pkgCacheDir, 2);
 
   const app = new Hono();
+
+  app.onError((err, c) => {
+    logger.error('runner: request failed', { err, method: c.req.method, path: c.req.path });
+    return c.json({ error: err instanceof Error ? err.message : 'Internal error' }, 500);
+  });
+
+  app.use('*', requestContextMiddleware());
+
+  // Every runner response carries the protocol version so the supervisor/control plane can detect skew
+  app.use('*', async (c, next) => {
+    await next();
+    c.header(RUNNER_PROTOCOL_HEADER, String(RUNNER_PROTOCOL_VERSION));
+  });
+
+  // Until astro dev + Pi are up only health endpoints answer (the server listens early so the
+  // supervisor sees boot progress instead of connection refusals).
+  app.use('*', async (c, next) => {
+    if (booted) return next();
+    const pathname = new URL(c.req.url).pathname;
+    if (pathname === '/health' || pathname.endsWith('/__editor/health')) return next();
+    return c.json(
+      {
+        error: bootFailed ? 'Workspace failed to start' : 'Workspace is still starting',
+        booting: !bootFailed,
+      },
+      503,
+    );
+  });
+
+  const isRunnerBusy = (): boolean =>
+    (piRuntime?.isBusy() ?? false) ||
+    activeSyncOps > 0 ||
+    activeMergeState?.status === 'needs_choices' ||
+    // W-LRU: a debounced inline edit not yet checkpointed, a checkpoint being written, or a
+    // foreground verify must not be killed by LRU eviction
+    inlineEditTimer !== null ||
+    inlineCheckpointInFlight !== null ||
+    activeVerifyRuns > 0;
+
+  // LRU eviction handshake: the supervisor asks to drain right before SIGTERM. Draining is granted
+  // only when idle and makes the runner refuse new work, so nothing can start in between.
+  let draining = false;
+  let drainTimer: TimerHandle | null = null;
+  app.post('/internal/drain', async (c) => {
+    const body = (await readJsonBodyOrEmpty(c)) as { cancel?: boolean };
+    if (drainTimer) clock.clearTimeout(drainTimer);
+    drainTimer = null;
+    if (body.cancel) {
+      draining = false;
+      return c.json({ ok: true, drained: false });
+    }
+    if (isRunnerBusy()) {
+      draining = false;
+      return c.json({ ok: true, drained: false, busy: true });
+    }
+    draining = true;
+    // Self-heal if the stop never comes (supervisor crashed mid-eviction)
+    drainTimer = clock.setTimeout(() => {
+      draining = false;
+      drainTimer = null;
+    }, 30_000);
+    drainTimer.unref?.();
+    return c.json({ ok: true, drained: true });
+  });
+  app.use('*', async (c, next) => {
+    if (!draining || c.req.method === 'GET' || c.req.method === 'HEAD') return next();
+    return c.json({ error: 'Workspace is going to sleep; reconnect to wake it.', draining: true }, 503);
+  });
+
+  /**
+   * Every endpoint that rewrites the working tree / HEAD runs through ONE async mutex (FIFO), so an
+   * undo can never interleave with a sync merge, a revert or a partial-undo exclusion. All of them
+   * refuse with the same 409 while the agent is mid-turn (it edits the same files), checked again
+   * once the mutex is acquired. `restore-sha` is exempt from the busy check: it is publish's
+   * rollback of its own exclude-paths commit and must always be able to run (it auto-saves first).
+   */
+  const TREE_MUTATING_ROUTES = new Set([
+    '/internal/git/revert-file',
+    '/internal/git/exclude-paths',
+    '/internal/git/restore-sha',
+    '/internal/git/undo',
+    '/internal/git/revert-start',
+    '/internal/sync/start',
+    '/internal/sync/choose',
+    '/internal/sync/undo',
+    '/internal/sync/escalate',
+    '/internal/sync/apply-advanced',
+  ]);
+  const PI_BUSY_EXEMPT_ROUTES = new Set(['/internal/git/restore-sha']);
+  const PI_BUSY_MESSAGE = 'Pi is currently editing; try again once it finishes.';
+  const treeMutex = new AsyncMutex();
+  app.use('/internal/*', async (c, next) => {
+    if (c.req.method !== 'POST' || !TREE_MUTATING_ROUTES.has(c.req.path)) return next();
+    const piBlocks = () => !PI_BUSY_EXEMPT_ROUTES.has(c.req.path) && (piRuntime?.isBusy() ?? false);
+    if (piBlocks()) return c.json({ error: PI_BUSY_MESSAGE, piBusy: true }, 409);
+    activeSyncOps += 1; // queued + running tree operations count as busy (LRU drain)
+    try {
+      let refused: Response | undefined;
+      await treeMutex.run(async () => {
+        if (piBlocks()) {
+          refused = c.json({ error: PI_BUSY_MESSAGE, piBusy: true }, 409);
+          return;
+        }
+        await next();
+      });
+      if (refused) return refused;
+    } finally {
+      activeSyncOps = Math.max(0, activeSyncOps - 1);
+    }
+  });
 
   app.get('/health', (c) => {
     const astro = astroManager.getStatus();
     const piBusy = piRuntime?.isBusy() ?? false;
-    const busy = piBusy || activeSyncOps > 0 || activeMergeState?.status === 'needs_choices';
+    const busy = isRunnerBusy();
     return c.json({
       ok: true,
+      protocolVersion: RUNNER_PROTOCOL_VERSION,
       sessionId: SESSION_ID,
-      astroReady: astro.ready,
+      // Ready only once the whole runner (Pi included) accepts requests
+      astroReady: astro.ready && booted,
+      booting: !booted && !bootFailed,
+      bootFailed: bootFailed ? (bootFailed instanceof Error ? bootFailed.message : String(bootFailed)) : undefined,
+      bootTimings,
       astroState: astro.state,
       astroCrashCount: astro.crashCount,
       astroLastExitCode: astro.lastExitCode,
@@ -464,16 +953,16 @@ async function main() {
       astroLogs: astro.logs.slice(-10),
       piBusy,
       busy,
+      pendingInlineCheckpoint: inlineEditTimer !== null || inlineCheckpointInFlight !== null,
+      activeVerifyRuns,
       originalBase,
       previewBase,
       readOnly,
       baseSha,
+      wsClients: wsClients.size,
     });
   });
 
-  // ==========================================================================
-  // Single-Writer Inline Editor Endpoints (`/__editor/*` or `/p/:id/.../__editor/*`)
-  // ==========================================================================
   let routesInflight: Promise<Awaited<ReturnType<typeof discoverSiteRoutes>>> | null = null;
   const loadRoutesDedup = () => {
     if (!routesInflight) {
@@ -484,1573 +973,324 @@ async function main() {
     return routesInflight;
   };
 
-  app.use('*', async (c, next) => {
-    const pathname = new URL(c.req.url).pathname;
-    if (c.req.method === 'GET' && pathname.endsWith('/__editor/health')) {
-      return c.json({ ok: true, astroReady: astroManager.getStatus().ready });
-    }
-    if (c.req.method === 'GET' && pathname.endsWith('/__editor/routes')) {
-      const routes = await loadRoutesDedup();
-      return c.json({ routes });
-    }
-    if (c.req.method === 'POST' && pathname.endsWith('/__editor/inspect')) {
-      try {
-        const body = (await c.req.json()) as { file?: string; loc?: string };
-        const relFile = resolveEditorRelFile(REPO_ROOT, String(body.file ?? ''));
-        if (relFile.startsWith('..') || relFile === '.github' || relFile.startsWith('.github/')) {
-          return c.json({ editability: 'dynamic', reason: 'Protected path' });
-        }
-        const abs = path.resolve(REPO_ROOT, relFile);
-        const source = await fs.readFile(abs, 'utf8');
-        const inspected = await inspectAstroElement(source, String(body.loc ?? ''));
-        if (!inspected) {
-          return c.json({ editability: 'dynamic', reason: 'Unmapped AST node' });
-        }
-        return c.json({
-          editability: inspected.editability,
-          reason: inspected.reason,
-          snapshotHash: inspected.snapshotHash,
-          tagName: inspected.tagName,
-        });
-      } catch (err) {
-        return c.json(
-          {
-            editability: 'dynamic',
-            error: err instanceof Error ? err.message : 'Inspect failed',
-          },
-          400,
-        );
-      }
-    }
-    if (c.req.method === 'POST' && pathname.endsWith('/__editor/patch')) {
-      if (readOnly) {
-        return c.json({ error: 'Session is read-only' }, 403);
-      }
-      try {
-        const body = (await c.req.json()) as {
-          file?: string;
-          loc?: string;
-          expectedHash?: string;
-          newHtml?: string;
-        };
-        const relFile = resolveEditorRelFile(REPO_ROOT, String(body.file ?? ''));
-        const astroStatus = astroManager.getStatus();
-        const result = await patchStaticSpan({
-          repoRoot: REPO_ROOT,
-          relFile,
-          loc: String(body.loc ?? ''),
-          expectedHash: String(body.expectedHash ?? ''),
-          newHtml: String(body.newHtml ?? ''),
-          previewBase: astroStatus.previewBase || previewBase,
-          originalBase: astroStatus.originalBase || originalBase,
-          fileLock,
-        });
-        if (!result.ok) {
-          return c.json({ error: result.error }, result.code);
-        }
-        scheduleInlineCheckpoint(`Inline edit in ${relFile}`);
-        return c.json({
-          ok: true,
-          updatedSource: result.updatedSource,
-          newHash: result.newHash,
-          newLoc: result.newLoc,
-          topLineDelta: result.topLineDelta,
-          afterLine: result.afterLine,
-          afterLineDelta: result.afterLineDelta,
-          sameLineEndCol: result.sameLineEndCol,
-          sameLineByteDelta: result.sameLineByteDelta,
-        });
-      } catch (err) {
-        return c.json(
-          { error: err instanceof Error ? err.message : 'Patch failed' },
-          500,
-        );
-      }
-    }
-    return next();
-  });
-
-  app.post('/internal/token', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
-      workspaceToken?: string;
-      hostSecret?: string;
-    };
-    if (body.hostSecret?.trim()) {
-      activeHostSecret = body.hostSecret.trim();
-    }
-    if (!body.workspaceToken || !body.workspaceToken.trim()) {
-      return c.json({ error: 'Missing workspaceToken' }, 400);
-    }
-    workspaceToken = body.workspaceToken.trim();
-    return c.json({ ok: true });
-  });
-
-  app.post('/internal/astro/restart', async (c) => {
-    await astroManager.restart();
-    const astro = astroManager.getStatus();
-    return c.json({
-      ok: true,
-      astroReady: astro.ready,
-      astroState: astro.state,
-    });
-  });
-
-  /**
-   * Binds a pre-warmed standby workspace to a real user session.
-   * When `syncFromMirror` is false (normal case since supervisor recycles standby slots when
-   * `origin/main` advances), performs a zero-file-churn `git symbolic-ref` branch rename so
-   * Chokidar fires zero events and pre-rendered Vite/Tailwind JIT caches stay hot!
-   */
-  app.post('/internal/claim', async (c) => {
-    const body = (await c.req.json()) as {
-      workingBranch: string;
-      baseBranch?: string;
-      editorName?: string;
-      editorEmail?: string;
-      persona?: 'non-technical' | 'developer';
-      readOnly?: boolean;
-      syncFromMirror?: boolean;
-      mirrorPath?: string;
-      workspaceToken?: string;
-      hostSecret?: string;
-    };
-
-    if (body.workspaceToken?.trim()) {
-      workspaceToken = body.workspaceToken.trim();
-    }
-    if (body.hostSecret?.trim()) {
-      activeHostSecret = body.hostSecret.trim();
-    }
-
-    const targetBaseBranch = body.baseBranch || BASE_BRANCH;
-    const mirrorPath = body.mirrorPath || process.env.HALLEY_MIRROR_PATH || '/halley-mirror/repo.git';
-    let needsAstroRestart = false;
-
-    if (body.syncFromMirror) {
-      const hasMirror = await fs
-        .access(path.join(mirrorPath, 'HEAD'))
-        .then(() => true)
-        .catch(() => false);
-      if (hasMirror) {
-        const oldHead = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-        await runLockedGit(
-          REPO_ROOT,
-          ['fetch', mirrorPath, `+refs/heads/${targetBaseBranch}:refs/remotes/origin/${targetBaseBranch}`],
-          undefined,
-          30_000,
-        );
-        const changedFilesOut = await runLockedGit(REPO_ROOT, [
-          'diff',
-          '--name-only',
-          oldHead,
-          `origin/${targetBaseBranch}`,
-        ]);
-        const changedList = changedFilesOut.stdout.split(/\r?\n/).filter(Boolean);
-
-        const changedLocks = changedList.some(
-          (f) => f === 'package.json' || f === 'package-lock.json' || f === 'pnpm-lock.yaml',
-        );
-        if (changedLocks || changedList.some((f) => f.startsWith('astro.config.'))) {
-          needsAstroRestart = true;
-          await astroManager.pause().catch(() => {});
-        }
-
-        await runLockedGit(REPO_ROOT, [
-          'checkout',
-          '-B',
-          body.workingBranch,
-          `origin/${targetBaseBranch}`,
-        ]);
-
-        if (changedLocks) {
-          await runnerNmCache.ensureSessionNodeModules({
-            workspaceDir: REPO_ROOT,
-            stateDir: STATE_DIR,
-            devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
-          });
-        }
-        await piRuntime?.reloadAgentsMd().catch(() => {});
-      } else {
-        const curSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-        await runLockedGit(REPO_ROOT, ['update-ref', `refs/heads/${body.workingBranch}`, curSha]);
-        await runLockedGit(REPO_ROOT, ['symbolic-ref', 'HEAD', `refs/heads/${body.workingBranch}`]);
-      }
-    } else {
-      // Zero working-tree churn branch rename
-      const curSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-      await runLockedGit(REPO_ROOT, ['update-ref', `refs/heads/${body.workingBranch}`, curSha]);
-      await runLockedGit(REPO_ROOT, ['symbolic-ref', 'HEAD', `refs/heads/${body.workingBranch}`]);
-    }
-
-    if (needsAstroRestart) {
-      await astroManager.restart().catch(() => {});
-    }
-
-    await ensureGitRerere(REPO_ROOT).catch(() => {});
-    baseSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-    if (body.editorName) gitIdentity.editorName = body.editorName;
-    if (body.editorEmail) gitIdentity.editorEmail = body.editorEmail;
-    if (body.persona === 'developer' || body.persona === 'non-technical') {
-      persona = body.persona;
-    }
-    if (typeof body.readOnly === 'boolean') {
-      readOnly = body.readOnly;
-    }
-    await savePersistedSessionMeta();
-
-    const astroStatus = astroManager.getStatus();
-    return c.json({
-      ok: true,
-      baseSha,
-      originalBase: astroStatus.originalBase || originalBase,
-      previewBase: astroStatus.previewBase || previewBase,
-    });
-  });
-
-  app.post('/internal/read-only', async (c) => {
-    const body = (await c.req.json()) as { readOnly: boolean };
-    readOnly = Boolean(body.readOnly);
-    if (readOnly) cancelSpeculativeVerify();
-    await savePersistedSessionMeta().catch(() => {});
-    return c.json({ ok: true, readOnly });
-  });
-
-  app.post('/internal/persona', async (c) => {
-    const body = (await c.req.json()) as { persona?: string };
-    persona = body.persona === 'developer' ? 'developer' : 'non-technical';
-    await savePersistedSessionMeta().catch(() => {});
-    return c.json({ ok: true, persona });
-  });
-
-  app.post('/internal/owner', async (c) => {
-    const body = (await c.req.json()) as {
-      editorName?: string;
-      editorEmail?: string;
-      persona?: string;
-    };
-    if (body.editorName?.trim()) gitIdentity.editorName = body.editorName.trim();
-    if (body.editorEmail?.trim()) gitIdentity.editorEmail = body.editorEmail.trim();
-    if (body.persona === 'developer' || body.persona === 'non-technical') {
-      persona = body.persona;
-    }
-    await savePersistedSessionMeta().catch(() => {});
-    return c.json({ ok: true });
-  });
-
-  app.get('/internal/routes', async (c) => {
-    const routes = await loadRoutesDedup();
-    return c.json({ routes });
-  });
-
-  app.get('/internal/page-options', async (c) => {
-    const capped = c.req.query('capped') === 'true';
-    const options = await pageService.getPageCreationOptions(capped);
-    return c.json(options);
-  });
-
-  app.post('/internal/pages', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    try {
-      const body = (await c.req.json()) as Record<string, unknown>;
-      const capped = Boolean(body.capped);
-      const isBusy = piRuntime?.isBusy() ?? false;
-      const result = await pageService.createPage(body, { capped, isBusy });
-
-      if (!capped && piRuntime) {
-        const reqViewport = (
-          body.editorContext as { viewport?: 'desktop' | 'tablet' | 'mobile' } | undefined
-        )?.viewport;
-        await piRuntime.submitPageCreationRequest(
-          result.pageRequest,
-          result.instructions,
-          isBusy ? 'followUp' : undefined,
-          reqViewport,
-        );
-      } else {
-        scheduleIdleSpeculativeVerify();
-      }
-
-      return c.json(
-        {
-          ok: true,
-          route: result.route,
-          file: result.file,
-          pageRequest: result.pageRequest,
-          checkpoint: result.checkpoint,
-          changedFilesCount: result.changedFilesCount,
-        },
-        201,
-      );
-    } catch (err) {
-      if (err instanceof PageValidationError) {
-        return c.json(
-          { error: err.message, collisionRoute: err.collisionRoute },
-          err.statusCode,
-        );
-      }
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to create page' },
-        400,
-      );
-    }
-  });
-
-  app.post('/internal/pages/:pageRequestId/retry', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    const id = c.req.param('pageRequestId')!;
-    const body = (await c.req.json().catch(() => ({}))) as {
-      capped?: boolean;
-      viewport?: 'desktop' | 'tablet' | 'mobile';
-    };
-    const existing = pageService.getPageRequest(id);
-    if (!existing) return c.json({ error: 'Page request not found' }, 404);
-    if (body.capped) {
-      const updated = await pageService.updateStatus(id, 'capped');
-      return c.json({ ok: true, pageRequest: updated });
-    }
-    const isBusy = piRuntime?.isBusy() ?? false;
-    const updated = await pageService.updateStatus(id, isBusy ? 'queued' : 'writing');
-    if (piRuntime && updated && existing.instructions) {
-      await piRuntime.submitPageCreationRequest(
-        updated,
-        existing.instructions,
-        isBusy ? 'followUp' : undefined,
-        body.viewport,
-      );
-    }
-    return c.json({ ok: true, pageRequest: updated });
-  });
-
-  app.delete('/internal/pages', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    const route =
-      c.req.query('route') ||
-      ((await c.req.json().catch(() => ({}))) as { route?: string }).route;
-    if (!route) return c.json({ error: 'Missing route' }, 400);
-    try {
-      const res = await pageService.deletePage(route);
-      scheduleIdleSpeculativeVerify();
-      return c.json(res);
-    } catch (err) {
-      if (err instanceof PageValidationError) {
-        return c.json({ error: err.message }, err.statusCode);
-      }
-      return c.json({ error: err instanceof Error ? err.message : 'Failed to delete page' }, 400);
-    }
-  });
-
-  app.post('/internal/pages/visibility', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    const body = (await c.req.json()) as {
-      route: string;
-      unlisted: boolean;
-      capped?: boolean;
-      viewport?: 'desktop' | 'tablet' | 'mobile';
-    };
-    try {
-      const res = await pageService.setPageVisibility(body.route, Boolean(body.unlisted));
-      if (res.followUpPrompt && !body.capped && piRuntime) {
-        await piRuntime.submitUserInput({
-          requestId: `visibility-${Date.now()}`,
-          text: res.followUpPrompt,
-          editorContext: { currentRoute: res.route, viewport: body.viewport, mode: 'browse' },
-          whenBusy: piRuntime.isBusy() ? 'followUp' : undefined,
-        });
-      } else {
-        scheduleIdleSpeculativeVerify();
-      }
-      return c.json({
-        ok: true,
-        route: res.route,
-        unlisted: res.unlisted,
-        file: res.file,
-        checkpoint: res.checkpoint,
-        changedFilesCount: res.changedFilesCount,
-      });
-    } catch (err) {
-      if (err instanceof PageValidationError) {
-        return c.json({ error: err.message }, err.statusCode);
-      }
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to update page visibility' },
-        400,
-      );
-    }
-  });
-
-  app.post('/internal/pages/rename', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    const body = (await c.req.json()) as {
-      fromRoute: string;
-      toSection: string;
-      toSlug: string;
-    };
-    try {
-      const res = await pageService.renamePage(body);
-      scheduleIdleSpeculativeVerify();
-      return c.json(res);
-    } catch (err) {
-      if (err instanceof PageValidationError) {
-        return c.json(
-          { error: err.message, collisionRoute: err.collisionRoute },
-          err.statusCode,
-        );
-      }
-      return c.json(
-        { error: err instanceof Error ? err.message : 'Failed to change page URL' },
-        400,
-      );
-    }
-  });
-
-  app.post('/internal/git/notify-patched', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { file?: string };
-    scheduleInlineCheckpoint(`Inline edit in ${body.file || 'page'}`);
-    return c.json({ ok: true });
-  });
-
-  app.get('/internal/git/changes', async (c) => {
-    const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
-    const changes = await getGitChanges(REPO_ROOT, baseRef);
-    const checkpoints = await listCheckpoints(REPO_ROOT, baseSha);
-    return c.json({ changes, checkpoints, baseSha });
-  });
-
-  app.post('/internal/git/revert-file', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    const body = (await c.req.json()) as { path: string; baseRef?: string };
-    await revertSingleFile(REPO_ROOT, body.path, body.baseRef || `origin/${BASE_BRANCH}`, gitIdentity);
-    await pageService.syncPageRequestsFromDisk().catch(() => {});
-    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-    const checkpoints = await listCheckpoints(REPO_ROOT, baseSha).catch(() => []);
-    if (checkpoints[0]) {
-      broadcast({
-        type: 'checkpoint_created',
-        checkpoint: checkpoints[0],
-        changedFilesCount: changes.length,
-      });
-    }
-    notifySessionDiverged(changes.length);
-    if (changes.length > 0) {
-      scheduleIdleSpeculativeVerify();
-    }
-    return c.json({ ok: true, changedFilesCount: changes.length });
-  });
-
-  /**
-   * Transactionally excludes unticked Undo paths right before verification, returning
-   * `preExcludeSha` so `PublishService` can restore the unticked files if checks fail.
-   */
-  app.post('/internal/git/exclude-paths', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    const body = (await c.req.json()) as { paths?: string[]; baseRef?: string };
-    const paths = (body.paths ?? []).filter((p) => p && !p.startsWith('.github'));
-    if (paths.length === 0) {
-      return c.json({ ok: true, preExcludeSha: null });
-    }
-    await createCheckpoint(REPO_ROOT, 'Before partial-undo selection', gitIdentity);
-    const preExcludeSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-    const baseRef = body.baseRef || `origin/${BASE_BRANCH}`;
-    for (const relPath of paths) {
-      const inBase = await runLockedGit(REPO_ROOT, ['cat-file', '-e', `${baseRef}:${relPath}`]);
-      if (inBase.code === 0) {
-        await runLockedGit(REPO_ROOT, ['checkout', baseRef, '--', relPath]);
-      } else {
-        await fs.rm(path.join(REPO_ROOT, relPath), { force: true });
-        await runLockedGit(REPO_ROOT, ['rm', '-f', '--ignore-unmatch', relPath]);
-      }
-    }
-    await createCheckpoint(
-      REPO_ROOT,
-      `Exclude ${paths.length} unselected file${paths.length === 1 ? '' : 's'} from Undo`,
-      gitIdentity,
-    );
-    const changes = await getGitChanges(REPO_ROOT, baseRef).catch(() => []);
-    return c.json({ ok: true, preExcludeSha, changedFilesCount: changes.length });
-  });
-
-  app.post('/internal/git/restore-sha', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    const body = (await c.req.json()) as { targetSha?: string };
-    if (!body.targetSha) return c.json({ error: 'Missing targetSha' }, 400);
-    const ok = await resetToRef(REPO_ROOT, body.targetSha);
-    if (!ok) return c.json({ error: 'Failed to restore SHA' }, 500);
-    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-    return c.json({ ok: true, changedFilesCount: changes.length });
-  });
-
-  app.post('/internal/git/undo', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    const body = (await c.req.json()) as { targetSha: string };
-    const ckpt = await undoToCheckpoint(REPO_ROOT, body.targetSha, gitIdentity);
-    await pageService.syncPageRequestsFromDisk().catch(() => {});
-    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-    if (ckpt) {
-      broadcast({ type: 'checkpoint_created', checkpoint: ckpt, changedFilesCount: changes.length });
-    }
-    notifySessionDiverged(changes.length);
-    if (changes.length > 0) {
-      scheduleIdleSpeculativeVerify();
-    }
-    return c.json({ ok: true, checkpoint: ckpt, changedFilesCount: changes.length });
-  });
-
-  app.post('/internal/git/checkpoint', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelInlineEditTimer();
-    const body = (await c.req.json().catch(() => ({}))) as { summary?: string };
-    const ckpt = await createCheckpoint(REPO_ROOT, body.summary || 'Manual checkpoint', gitIdentity);
-    return c.json({ ok: true, checkpoint: ckpt });
-  });
-
-  app.get('/internal/git/protected-diff', async (c) => {
-    const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
-    const protectedFiles = await hasProtectedPathChanges(REPO_ROOT, baseRef);
-    return c.json({ clean: protectedFiles.length === 0, protectedFiles });
-  });
-
-  const handleMergeWithBase = async (c: import('hono').Context) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
-      baseBranch?: string;
-      skipFetch?: boolean;
-    };
-    await ensureGitRerere(REPO_ROOT);
-    const outcome = await mergeWithBase(REPO_ROOT, {
-      baseBranch: body.baseBranch || BASE_BRANCH,
-      identity: gitIdentity,
-      skipFetch: body.skipFetch,
-      onResolveConflict: async (conflictedFiles) => {
-        if (!piRuntime) return false;
-        return piRuntime.submitConflictResolutionPrompt(conflictedFiles);
-      },
-    });
-    if ((outcome.status === 'clean' || outcome.status === 'resolved') && outcome.newBaseSha) {
-      baseSha = outcome.newBaseSha;
-      await savePersistedSessionMeta().catch(() => {});
-    }
-    return c.json(outcome);
+  // Route modules get an explicit, typed view of the runner's state (getters/setters for the
+  // mutable parts, so a module always reads the current value).
+  const ctx: RunnerContext = {
+    config,
+    randomUUID,
+    REPO_ROOT,
+    STATE_DIR,
+    SESSION_ID,
+    BASE_BRANCH,
+    get baseSha() {
+      return baseSha;
+    },
+    set baseSha(v) {
+      baseSha = v;
+    },
+    CONTROL_PLANE_INTERNAL_URL,
+    SUPERVISOR_URL,
+    get activeHostSecret() {
+      return activeHostSecret;
+    },
+    set activeHostSecret(v) {
+      activeHostSecret = v;
+    },
+    get workspaceToken() {
+      return workspaceToken;
+    },
+    set workspaceToken(v) {
+      workspaceToken = v;
+    },
+    MODEL_ID,
+    THINKING_LEVEL,
+    get persona() {
+      return persona;
+    },
+    set persona(v) {
+      persona = v;
+    },
+    get readOnly() {
+      return readOnly;
+    },
+    set readOnly(v) {
+      readOnly = v;
+    },
+    get prevBaseSha() {
+      return prevBaseSha;
+    },
+    set prevBaseSha(v) {
+      prevBaseSha = v;
+    },
+    gitIdentity,
+    savePersistedSessionMeta,
+    saveMetaLogged,
+    changesOrEmpty,
+    resolveHeadSha,
+    syncPageRequestsLogged,
+    fileLock,
+    uploadManager,
+    get latestTranscript() {
+      return latestTranscript;
+    },
+    set latestTranscript(v) {
+      latestTranscript = v;
+    },
+    get currentPreviewPaused() {
+      return currentPreviewPaused;
+    },
+    set currentPreviewPaused(v) {
+      currentPreviewPaused = v;
+    },
+    get currentPreviewPauseReason() {
+      return currentPreviewPauseReason;
+    },
+    set currentPreviewPauseReason(v) {
+      currentPreviewPauseReason = v;
+    },
+    broadcast,
+    reportCheckpointFailure,
+    notifySessionDiverged,
+    notifyOptimizationSettled,
+    cancelSpeculativeVerify,
+    triggerImmediateSpeculativeVerify,
+    scheduleIdleSpeculativeVerify,
+    get activeVerifyRuns() {
+      return activeVerifyRuns;
+    },
+    set activeVerifyRuns(v) {
+      activeVerifyRuns = v;
+    },
+    cancelInlineEditTimer,
+    scheduleInlineCheckpoint,
+    astroManager,
+    get piRuntime() {
+      return piRuntime;
+    },
+    set piRuntime(v) {
+      piRuntime = v;
+    },
+    get originalBase() {
+      return originalBase;
+    },
+    set originalBase(v) {
+      originalBase = v;
+    },
+    get previewBase() {
+      return previewBase;
+    },
+    set previewBase(v) {
+      previewBase = v;
+    },
+    pageService,
+    get activeMergeState() {
+      return activeMergeState;
+    },
+    set activeMergeState(v) {
+      activeMergeState = v;
+    },
+    get activeConflictPacks() {
+      return activeConflictPacks;
+    },
+    set activeConflictPacks(v) {
+      activeConflictPacks = v;
+    },
+    get activeVirtualTreeSha() {
+      return activeVirtualTreeSha;
+    },
+    set activeVirtualTreeSha(v) {
+      activeVirtualTreeSha = v;
+    },
+    get activeMergeNeedsLlmPass() {
+      return activeMergeNeedsLlmPass;
+    },
+    set activeMergeNeedsLlmPass(v) {
+      activeMergeNeedsLlmPass = v;
+    },
+    get activeSyncOps() {
+      return activeSyncOps;
+    },
+    set activeSyncOps(v) {
+      activeSyncOps = v;
+    },
+    persistMergeReviewState,
+    runnerNmCache,
+    loadRoutesDedup,
+    clock,
+    wsClients,
+    wsEpoch,
+    safeSend,
+    get lastTranscriptPayload() {
+      return lastTranscriptPayload;
+    },
+    set lastTranscriptPayload(v) {
+      lastTranscriptPayload = v;
+    },
+    get currentWorkspaceLocked() {
+      return currentWorkspaceLocked;
+    },
+    set currentWorkspaceLocked(v) {
+      currentWorkspaceLocked = v;
+    },
+    get currentLockedFile() {
+      return currentLockedFile;
+    },
+    set currentLockedFile(v) {
+      currentLockedFile = v;
+    },
+    get draining() {
+      return draining;
+    },
+    set draining(v) {
+      draining = v;
+    },
+    get shuttingDown() {
+      return shuttingDown;
+    },
+    set shuttingDown(v) {
+      shuttingDown = v;
+    },
+    get wsHeartbeatTimer() {
+      return wsHeartbeatTimer;
+    },
+    set wsHeartbeatTimer(v) {
+      wsHeartbeatTimer = v;
+    },
+    get ready() {
+      return ready;
+    },
   };
 
-  app.post('/internal/git/rebase', handleMergeWithBase);
-  app.post('/internal/git/sync', handleMergeWithBase);
+  registerEditorRoutes(app, ctx);
+  registerSessionRoutes(app, ctx);
+  registerPagesRoutes(app, ctx);
+  registerGitRoutes(app, ctx);
+  registerSyncRoutes(app, ctx);
+  registerVerifyRoutes(app, ctx);
+  registerUploadsRoutes(app, ctx);
+  registerAgentRoutes(app, ctx);
 
-  const runPostSyncTasks = async (upstreamSummary: string, newSha: string, prevSha: string) => {
-    prevBaseSha = prevSha;
-    baseSha = newSha;
-    await savePersistedSessionMeta().catch(() => {});
-    await piRuntime?.reloadAgentsMd().catch(() => {});
-    if (upstreamSummary) {
-      piRuntime?.addSystemContextNote(`Live site updates merged into this draft: ${upstreamSummary}`);
-    }
-    if (prevSha && newSha && prevSha !== newSha) {
-      const diffFiles = (
-        await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${prevSha}..${newSha}`])
-      ).stdout
-        .split(/\r?\n/)
-        .filter(Boolean);
-      const changedDeps = diffFiles.some(
-        (f) => f === 'package.json' || f === 'package-lock.json' || f === 'pnpm-lock.yaml',
-      );
-      const changedConfig = diffFiles.some((f) => f.startsWith('astro.config.'));
-      if (changedDeps) {
-        await astroManager.pause().catch(() => {});
-        await runnerNmCache
-          .ensureSessionNodeModules({
-            workspaceDir: REPO_ROOT,
-            stateDir: STATE_DIR,
-            devLocalRepo: process.env.HALLEY_DEV_LOCAL_REPO || undefined,
-          })
-          .catch(() => {});
-        await astroManager.restart().catch(() => {});
-      } else if (changedConfig) {
-        await astroManager.restart().catch(() => {});
-      }
-    }
-  };
+  // ---------------------------------------------------------------------------------------------
+  // WebSocket handlers
+  // ---------------------------------------------------------------------------------------------
+  const { wss, wsHandlers } = createRunnerWs(ctx);
 
-  app.post('/internal/context-note', async (c) => {
-    const body = (await c.req.json()) as { note?: string; persist?: boolean };
-    if (body.note?.trim()) {
-      piRuntime?.addSystemContextNote(body.note.trim());
-      if (body.persist) {
-        await fs.mkdir(STATE_DIR, { recursive: true });
-        await fs.writeFile(path.join(STATE_DIR, 'handoff-context.txt'), body.note.trim(), 'utf8');
-      }
-    }
-    return c.json({ ok: true });
-  });
-
-  app.post('/internal/sync/start', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    if (piRuntime?.isBusy()) {
-      return c.json({ error: 'Pi is currently editing; try again once it finishes.' }, 409);
-    }
-    cancelInlineEditTimer();
-    activeSyncOps += 1;
-    try {
-      const rawBody = await c.req.json().catch(() => ({}));
-      const parsedBody = SyncStartRequestSchema.safeParse(rawBody);
-      const body = (parsedBody.success ? parsedBody.data : rawBody) as {
-        baseBranch?: string;
-        kind?: 'sync' | 'publish' | 'revert';
-        autoSyncOnly?: boolean;
-        autoApplyCleanOnly?: boolean;
-        skipFetch?: boolean;
-      };
-      const baseBranch = body.baseBranch || BASE_BRANCH;
-      const kind = body.kind ?? 'sync';
-      const baseRef = `origin/${baseBranch}`;
-
-      // If we already deferred an LLM conflict pass from PublishModal open (`autoApplyCleanOnly: true`)
-      // and now the user clicked Publish/Resolve (`!autoApplyCleanOnly && !autoSyncOnly`), run the LLM pass on those virtual packs!
-      const vres = await virtualMergeWithBase(REPO_ROOT, {
-        baseBranch,
-        identity: gitIdentity,
-        skipFetch: body.skipFetch,
-        fetchAuthBearer: activeHostSecret || workspaceToken || undefined,
-      });
-
-      if (vres.status === 'error') {
-        return c.json({ error: vres.error || 'Failed to sync with live site' }, 502);
-      }
-
-      if (vres.status === 'clean' && vres.alreadyUpToDate) {
-        if (activeMergeState && activeMergeState.newBaseSha === vres.newBaseSha) {
-          return c.json({
-            review: {
-              ...activeMergeState,
-              alreadyUpToDate: true,
-            },
-          });
-        }
-        const review: MergeReviewStateDto = {
-          mergeId: crypto.randomUUID(),
-          kind,
-          status: 'clean',
-          preSyncSha: vres.preSyncSha,
-          prevBaseSha: prevBaseSha || vres.prevBaseSha,
-          newBaseSha: vres.newBaseSha,
-          alreadyUpToDate: true,
-          summary: 'Your draft is already up to date with the live site.',
-          records: [],
-          upstreamCommits: [],
-          touchedUserFiles: [],
-        };
-        return c.json({ review });
-      }
-
-      cancelSpeculativeVerify();
-
-      const upstreamCommits = await getUpstreamCommits(REPO_ROOT, vres.prevBaseSha, baseRef);
-
-      if (vres.status === 'clean') {
-        const userChanged = (await getGitChanges(REPO_ROOT, vres.prevBaseSha)).map((ch) => ch.path);
-        const upstreamChanged = (
-          await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${vres.prevBaseSha}..${baseRef}`])
-        ).stdout
-          .split(/\r?\n/)
-          .filter(Boolean);
-        const overlap = userChanged.filter((f) => upstreamChanged.includes(f));
-
-        const summary =
-          overlap.length > 0
-            ? `Merged ${upstreamCommits.length} live update${upstreamCommits.length === 1 ? '' : 's'} into ${overlap.length} file${overlap.length === 1 ? '' : 's'} you edited — please review.`
-            : `Updated with ${upstreamCommits.length} change${upstreamCommits.length === 1 ? '' : 's'} from the live site.`;
-        await runPostSyncTasks(
-          upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-          vres.newBaseSha,
-          vres.prevBaseSha,
-        );
-        const review: MergeReviewStateDto = {
-          mergeId: crypto.randomUUID(),
-          kind,
-          status: overlap.length > 0 ? 'ready_for_review' : 'applied',
-          preSyncSha: vres.preSyncSha,
-          prevBaseSha: vres.prevBaseSha,
-          newBaseSha: vres.newBaseSha,
-          summary,
-          records: [],
-          upstreamCommits,
-          touchedUserFiles: overlap,
-        };
-        activeMergeState = review;
-        activeConflictPacks.clear();
-        activeVirtualTreeSha = undefined;
-        activeMergeNeedsLlmPass = false;
-        await persistMergeReviewState();
-        return c.json({ review });
-      }
-
-      // Virtual merge hit conflicts — `/workspace` is completely untouched and free of `<<<<<<<` markers!
-      activeConflictPacks = new Map();
-      activeVirtualTreeSha = vres.virtualTreeSha;
-      const records: ConflictResolutionRecordDto[] = [];
-      let firstPassUsageUsd = 0;
-      let needsAi = false;
-
-      for (const relPath of vres.conflictedFiles) {
-        const pack = await buildConflictEvidencePack(
-          REPO_ROOT,
-          relPath,
-          vres.prevBaseSha,
-          baseBranch,
-          kind,
-          {
-            baseSha: vres.prevBaseSha,
-            oursSha: vres.preSyncSha,
-            theirsSha: vres.newBaseSha,
-            virtualTreeSha: vres.virtualTreeSha,
-          },
-        );
-        activeConflictPacks.set(relPath, pack);
-
-        const det = tryDeterministicResolve(pack);
-        if (det) {
-          records.push(det);
-        } else if (body.autoSyncOnly) {
-          needsAi = true;
-        } else if (body.autoApplyCleanOnly) {
-          // PublishModal open preflight: $0 cost, zero disk mutation, build clear choice card until Publish/Resolve
-          needsAi = true;
-          records.push(
-            buildContradictionRecord(pack, {
-              explanation:
-                'Both your draft and the live site changed this section. Click Publish to combine automatically, or pick a version below.',
-              modelUsed: 'deferred',
-            }),
-          );
-        } else {
-          const res = await resolvePackWithLlm(REPO_ROOT, pack, {
-            controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
-            workspaceToken,
-            modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
-            thinkingLevel: THINKING_LEVEL,
-            purpose: 'conflict',
-          });
-          firstPassUsageUsd += res.usageUsd;
-          records.push(res.record);
-        }
-      }
-
-      if (body.autoSyncOnly && (needsAi || records.some((r) => r.status === 'needs_choice'))) {
-        activeConflictPacks.clear();
-        activeVirtualTreeSha = undefined;
-        return c.json({
-          heldForUser: true,
-          overlapCount: vres.conflictedFiles.length,
-          upstreamCommits,
+  let server: ReturnType<typeof serve> | undefined;
+  if (config.listen) {
+    server = serve({
+      fetch: app.fetch,
+      port: RUNNER_PORT,
+      hostname: config.hostname,
+      createServer,
+    });
+    server.on('upgrade', (req, socket, head) => {
+      if ((req.url ?? '').startsWith('/ws') && booted) {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          wss.emit('connection', ws, req);
         });
+      } else {
+        socket.destroy();
       }
-
-      const needsChoices = records.some((r) => r.status === 'needs_choice');
-      if (!needsChoices) {
-        const committed = await commitVirtualMergeResolution(REPO_ROOT, {
-          virtualTreeSha: vres.virtualTreeSha,
-          preSyncSha: vres.preSyncSha,
-          newBaseSha: vres.newBaseSha,
-          resolvedFiles: records.map((rec) => ({
-            path: rec.path,
-            content: rec.resolvedContent ?? '',
-          })),
-          identity: gitIdentity,
-        });
-        if (committed.ok) {
-          await runPostSyncTasks(
-            upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-            vres.newBaseSha,
-            vres.prevBaseSha,
-          );
-          const review: MergeReviewStateDto = {
-            mergeId: crypto.randomUUID(),
-            kind,
-            status: 'ready_for_review',
-            preSyncSha: vres.preSyncSha,
-            prevBaseSha: vres.prevBaseSha,
-            newBaseSha: vres.newBaseSha,
-            summary: `Combined ${records.length} overlapping change${records.length === 1 ? '' : 's'} automatically — please review.`,
-            records,
-            upstreamCommits,
-            touchedUserFiles: vres.conflictedFiles,
-            firstPassUsageUsd,
-          };
-          activeMergeState = review;
-          activeVirtualTreeSha = undefined;
-          activeMergeNeedsLlmPass = false;
-          await persistMergeReviewState();
-          return c.json({ review });
-        }
-      }
-
-      const review: MergeReviewStateDto = {
-        mergeId: crypto.randomUUID(),
-        kind,
-        status: 'needs_choices',
-        preSyncSha: vres.preSyncSha,
-        prevBaseSha: vres.prevBaseSha,
-        newBaseSha: vres.newBaseSha,
-        summary: `${records.filter((r) => r.status === 'needs_choice').length} conflict${records.filter((r) => r.status === 'needs_choice').length === 1 ? '' : 's'} need your choice.`,
-        records,
-        upstreamCommits,
-        touchedUserFiles: vres.conflictedFiles,
-        firstPassUsageUsd,
-      };
-      activeMergeState = review;
-      activeMergeNeedsLlmPass = Boolean(body.autoApplyCleanOnly && needsAi);
-      await persistMergeReviewState();
-      return c.json({ review });
-    } finally {
-      activeSyncOps = Math.max(0, activeSyncOps - 1);
-    }
-  });
-
-  app.post('/internal/sync/choose', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    if (!activeMergeState) return c.json({ error: 'No active merge review' }, 404);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    activeSyncOps += 1;
-    try {
-      const body = (await c.req.json()) as {
-        choices: Array<{ recordId: string; optionId: string; customInstruction?: string }>;
-      };
-
-      for (const choice of body.choices) {
-        const rec = activeMergeState.records.find((r) => r.id === choice.recordId);
-        const pack = rec ? activeConflictPacks.get(rec.path) : undefined;
-        if (!rec || !pack) continue;
-
-        if (choice.optionId === 'custom') {
-          if (!choice.customInstruction?.trim()) {
-            return c.json(
-              { error: 'Please enter instructions for what you want Halley to do.' },
-              400,
-            );
-          }
-          const res = await resolvePackWithLlm(
-            REPO_ROOT,
-            pack,
-            {
-              controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
-              workspaceToken,
-              modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
-              thinkingLevel: THINKING_LEVEL,
-              purpose: 'conflict',
-            },
-            { customInstruction: choice.customInstruction.trim() },
-          );
-          rec.resolvedContent = res.record.resolvedContent ?? pack.oursContent ?? '';
-          rec.resolvedPreview = res.record.resolvedPreview;
-          rec.customInstruction = choice.customInstruction.trim();
-          rec.chosenOptionId = 'custom';
-          rec.status = 'chosen';
-        } else if (choice.optionId === 'theirs') {
-          rec.resolvedContent = pack.theirsContent ?? undefined;
-          rec.chosenOptionId = 'theirs';
-          rec.status = 'chosen';
-        } else if (choice.optionId === 'ours') {
-          rec.resolvedContent = pack.oursContent ?? undefined;
-          rec.chosenOptionId = 'ours';
-          rec.status = 'chosen';
-        } else if (choice.optionId === 'combined') {
-          rec.chosenOptionId = 'combined';
-          rec.status = 'chosen';
-        }
-      }
-
-      const stillPending = activeMergeState.records.some((r) => r.status === 'needs_choice');
-      if (!stillPending) {
-        const resolvedList = activeMergeState.records.map((rec) => {
-          const pack = activeConflictPacks.get(rec.path);
-          const content =
-            rec.chosenOptionId === 'theirs'
-              ? (pack?.theirsContent ?? null)
-              : rec.chosenOptionId === 'ours'
-                ? (pack?.oursContent ?? null)
-                : (rec.resolvedContent ?? pack?.oursContent ?? '');
-          return { path: rec.path, content };
-        });
-
-        if (activeMergeState.kind !== 'revert' || activeVirtualTreeSha) {
-          const committed = await commitVirtualMergeResolution(REPO_ROOT, {
-            virtualTreeSha: activeVirtualTreeSha,
-            preSyncSha: activeMergeState.preSyncSha,
-            newBaseSha: activeMergeState.newBaseSha,
-            resolvedFiles: resolvedList,
-            identity: gitIdentity,
-            commitMessage:
-              activeMergeState.kind === 'revert'
-                ? 'halley-checkpoint: Undo published edit (resolved conflicts)'
-                : undefined,
-          });
-          if (!committed.ok) {
-            return c.json({ error: committed.error }, 400);
-          }
-        } else {
-          for (const item of resolvedList) {
-            const applied = await applyResolvedFile(REPO_ROOT, item.path, item.content);
-            if (!applied.ok) {
-              return c.json({ error: applied.error || `Failed to apply ${item.path}` }, 400);
-            }
-          }
-          await runLockedGit(
-            REPO_ROOT,
-            [
-              '-c',
-              `user.name=${gitIdentity.botName}`,
-              '-c',
-              `user.email=${gitIdentity.botEmail}`,
-              'commit',
-              '--no-edit',
-            ],
-            { GIT_EDITOR: 'true' },
-          );
-        }
-
-        if (activeMergeState.kind !== 'revert') {
-          await runPostSyncTasks(
-            activeMergeState.upstreamCommits.slice(0, 5).map((u) => u.subject).join('; '),
-            activeMergeState.newBaseSha,
-            activeMergeState.prevBaseSha,
-          );
-        }
-        activeMergeState.status = 'ready_for_review';
-        activeMergeState.summary = 'All conflicts resolved — review the result below.';
-        activeVirtualTreeSha = undefined;
-        activeMergeNeedsLlmPass = false;
-      }
-
-      await persistMergeReviewState();
-      return c.json({ review: activeMergeState });
-    } finally {
-      activeSyncOps = Math.max(0, activeSyncOps - 1);
-    }
-  });
-
-  app.post('/internal/sync/undo', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    const body = (await c.req.json().catch(() => ({}))) as { targetSha?: string };
-    const targetSha = body.targetSha || activeMergeState?.preSyncSha;
-    if (!targetSha) return c.json({ error: 'No pre-sync snapshot to restore' }, 400);
-    // If the conflict was purely virtual (`needs_choices`), HEAD wasn't even moved unless the user edited later!
-    if (activeMergeState?.status !== 'needs_choices' || body.targetSha) {
-      const ok = await resetToRef(REPO_ROOT, targetSha);
-      if (!ok) return c.json({ error: 'Failed to undo update' }, 500);
-      if (activeMergeState?.prevBaseSha) {
-        baseSha = activeMergeState.prevBaseSha;
-        await savePersistedSessionMeta().catch(() => {});
-      }
-    }
-    activeMergeState = null;
-    activeConflictPacks.clear();
-    activeVirtualTreeSha = undefined;
-    activeMergeNeedsLlmPass = false;
-    await persistMergeReviewState();
-    await pageService.syncPageRequestsFromDisk().catch(() => {});
-    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-    return c.json({ ok: true, changedFilesCount: changes.length });
-  });
-
-  app.post('/internal/sync/estimate-escalation', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as {
-      recordIds?: string[];
-      userNote?: string;
-      remainingBudgetUsd?: number;
-      escalationModelId?: string;
-      hardCeilingUsd?: number;
+    });
+    wss.on('connection', (ws) => wsHandlers.handleConnection(ws));
+    const srv = server;
+    closeServer = () => {
+      srv.close((err) => {
+        if (err) ignoreExpected(err, 'runner: close http server');
+      });
+      wss.close();
     };
-    const selectedPacks: ConflictEvidencePack[] = [];
-    for (const rec of activeMergeState?.records ?? []) {
-      if (!body.recordIds || body.recordIds.length === 0 || body.recordIds.includes(rec.id)) {
-        const pack = activeConflictPacks.get(rec.path);
-        if (pack) selectedPacks.push(pack);
-      }
-    }
-    const resolvedEscModel =
-      piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
-    const estimate = await estimateEscalationCost({
-      packs: selectedPacks,
-      controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
-      workspaceToken,
-      escalationModelId: resolvedEscModel,
-      hardCeilingUsd: body.hardCeilingUsd ?? 2,
-      remainingBudgetUsd: body.remainingBudgetUsd ?? 10,
-      firstPassUsageUsd: activeMergeState?.firstPassUsageUsd,
-      userNote: body.userNote,
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Boot (part 2, server already listening): astro dev and the Pi runtime start in parallel.
+  // ---------------------------------------------------------------------------------------------
+  const ready = (async () => {
+    console.log('[halley-boot] starting_preview');
+    const astroPromise = timed('astroReady', () => astroManager.start()).then((res) => {
+      originalBase = res.originalBase;
+      previewBase = res.previewBase;
+      if (!booted) console.log('[halley-boot] starting_ai');
     });
-    return c.json({ estimate });
-  });
-
-  app.post('/internal/sync/escalate', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    if (!activeMergeState) return c.json({ error: 'No active merge review to improve' }, 404);
-    activeSyncOps += 1;
-    try {
-      const body = (await c.req.json().catch(() => ({}))) as {
-        recordIds?: string[];
-        userNote?: string;
-        escalationModelId?: string;
-        escalationThinking?: 'off' | 'low' | 'medium' | 'high';
-        ceilingUsd?: number;
-      };
-      const resolvedEscModel =
-        piRuntime?.resolveModelAlias(body.escalationModelId || 'opus-latest') || 'claude-opus-4-6';
-      const runId = crypto.randomUUID();
-      const ceilingUsd = Math.min(body.ceilingUsd ?? 2, 2);
-
-      const advRecords: ConflictResolutionRecordDto[] = [];
-      let totalUsage = 0;
-      let stoppedAtCeiling = false;
-
-      for (const rec of activeMergeState.records) {
-        if (body.recordIds && body.recordIds.length > 0 && !body.recordIds.includes(rec.id)) {
-          continue;
-        }
-        const pack = activeConflictPacks.get(rec.path);
-        if (!pack) continue;
-        const res = await resolvePackWithLlm(
-          REPO_ROOT,
-          pack,
-          {
-            controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
-            workspaceToken,
-            modelId: resolvedEscModel,
-            thinkingLevel: body.escalationThinking ?? 'medium',
-            purpose: 'conflict-escalation',
-            runId,
-            runCeilingUsd: ceilingUsd,
-          },
-          {
-            rejectedAttempt: rec.resolvedContent,
-            userNote: body.userNote,
-          },
-        );
-        totalUsage += res.usageUsd;
-        advRecords.push(res.record);
-        if (res.stoppedAtCeiling) {
-          stoppedAtCeiling = true;
-          break;
-        }
-      }
-
-      const identicalToFirst =
-        advRecords.length > 0 &&
-        advRecords.every((adv) => {
-          const orig = activeMergeState!.records.find((r) => r.path === adv.path);
-          return orig && orig.resolvedContent === adv.resolvedContent;
-        });
-
-      activeMergeState.advancedAttempt = {
-        records: advRecords,
-        usageUsd: Number(totalUsage.toFixed(4)),
-        identicalToFirst,
-        stoppedAtCeiling,
-        message: stoppedAtCeiling
-          ? `Stopped at $${totalUsage.toFixed(2)} to stay within the $${ceilingUsd.toFixed(2)} ceiling. First attempt kept.`
-          : identicalToFirst
-            ? 'The Advanced model reached the same result.'
-            : 'Compare First vs Advanced below and choose which to keep.',
-      };
-      await persistMergeReviewState();
-      return c.json({ review: activeMergeState });
-    } finally {
-      activeSyncOps = Math.max(0, activeSyncOps - 1);
-    }
-  });
-
-  app.post('/internal/sync/apply-advanced', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    if (!activeMergeState?.advancedAttempt) {
-      return c.json({ error: 'No advanced attempt available' }, 404);
-    }
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    const body = (await c.req.json()) as {
-      picks: Array<{ path: string; use: 'advanced' | 'first' }>;
-    };
-    for (const pick of body.picks) {
-      if (pick.use !== 'advanced') continue;
-      const adv = activeMergeState.advancedAttempt.records.find((r) => r.path === pick.path);
-      if (!adv?.resolvedContent) continue;
-      const applied = await applyResolvedFile(REPO_ROOT, adv.path, adv.resolvedContent);
-      if (!applied.ok) return c.json({ error: applied.error }, 400);
-      const orig = activeMergeState.records.find((r) => r.path === adv.path);
-      if (orig) {
-        orig.resolvedContent = adv.resolvedContent;
-        orig.resolvedPreview = adv.resolvedPreview;
-        orig.explanation = adv.explanation;
-        orig.modelUsed = adv.modelUsed;
-        orig.status = 'chosen';
-      }
-    }
-    const ckpt = await createCheckpoint(
-      REPO_ROOT,
-      'Applied Advanced merge improvements',
-      gitIdentity,
-    ).catch(() => null);
-    const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-    if (ckpt) {
-      broadcast({
-        type: 'checkpoint_created',
-        checkpoint: ckpt,
-        changedFilesCount: changes.length,
-      });
-    }
-    notifySessionDiverged(changes.length);
-    await persistMergeReviewState();
-    scheduleIdleSpeculativeVerify();
-    return c.json({ review: activeMergeState });
-  });
-
-  app.post('/internal/git/revert-start', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    cancelInlineEditTimer();
-    activeSyncOps += 1;
-    try {
-      const body = (await c.req.json()) as { shas: string[] };
-      const targetShas = body.shas ?? [];
-      const result = await startRevertCommits(REPO_ROOT, targetShas, gitIdentity);
-      if (result.status === 'conflict' && result.conflictedFiles.length > 0) {
-        activeConflictPacks = new Map();
-        activeVirtualTreeSha = result.virtualTreeSha;
-        const records: ConflictResolutionRecordDto[] = [];
-        for (const relPath of result.conflictedFiles) {
-          const virtualRefs =
-            result.virtualTreeSha && result.preRevertSha && result.targetParentSha && targetShas[0]
-              ? {
-                  baseSha: targetShas[0],
-                  oursSha: result.preRevertSha,
-                  theirsSha: result.targetParentSha,
-                  virtualTreeSha: result.virtualTreeSha,
-                }
-              : undefined;
-          const pack = await buildConflictEvidencePack(
-            REPO_ROOT,
-            relPath,
-            baseSha,
-            BASE_BRANCH,
-            'revert',
-            virtualRefs,
-          );
-          activeConflictPacks.set(relPath, pack);
-          const det = tryDeterministicResolve(pack);
-          if (det) {
-            records.push(det);
-          } else {
-            const res = await resolvePackWithLlm(REPO_ROOT, pack, {
-              controlPlaneInternalUrl: CONTROL_PLANE_INTERNAL_URL,
-              workspaceToken,
-              modelId: piRuntime?.getResolvedModelId() || MODEL_ID,
-              thinkingLevel: THINKING_LEVEL,
-              purpose: 'conflict',
-            });
-            records.push(res.record);
-          }
-        }
-        const headSha = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-        const needsChoices = records.some((r) => r.status === 'needs_choice');
-        let resolvedAndCommitted = false;
-        if (!needsChoices) {
-          if (result.virtualTreeSha && result.targetParentSha) {
-            const committed = await commitVirtualMergeResolution(REPO_ROOT, {
-              virtualTreeSha: result.virtualTreeSha,
-              preSyncSha: headSha,
-              newBaseSha: result.targetParentSha,
-              resolvedFiles: records.map((rec) => ({
-                path: rec.path,
-                content: rec.resolvedContent ?? '',
-              })),
-              identity: gitIdentity,
-              commitMessage: `halley-checkpoint: Undo published edit (${targetShas.map((s) => s.slice(0, 7)).join(', ')})\n\nCo-authored-by: ${gitIdentity.editorName} <${gitIdentity.editorEmail}>`,
-            });
-            if (committed.ok) {
-              // Convert commit to single-parent checkpoint on HEAD so history stays linear
-              const treeSha = (
-                await runLockedGit(REPO_ROOT, ['rev-parse', `${committed.mergeCommitSha}^{tree}`])
-              ).stdout.trim();
-              const linearRes = await runLockedGit(
-                REPO_ROOT,
-                [
-                  'commit-tree',
-                  treeSha,
-                  '-p',
-                  headSha,
-                  '-m',
-                  `halley-checkpoint: Undo published edit (${targetShas.map((s) => s.slice(0, 7)).join(', ')})\n\nCo-authored-by: ${gitIdentity.editorName} <${gitIdentity.editorEmail}>`,
-                ],
-                {
-                  GIT_AUTHOR_NAME: gitIdentity.botName,
-                  GIT_AUTHOR_EMAIL: gitIdentity.botEmail,
-                  GIT_COMMITTER_NAME: gitIdentity.botName,
-                  GIT_COMMITTER_EMAIL: gitIdentity.botEmail,
-                },
-              );
-              const linearSha = linearRes.stdout.trim();
-              if (linearRes.code === 0 && /^[0-9a-f]{40}$/i.test(linearSha)) {
-                await runLockedGit(REPO_ROOT, ['update-ref', 'HEAD', linearSha]);
-                result.revertCheckpointSha = linearSha;
-              } else {
-                result.revertCheckpointSha = committed.mergeCommitSha;
-              }
-              resolvedAndCommitted = true;
-              activeVirtualTreeSha = undefined;
-            }
-          } else {
-            let allApplied = true;
-            for (const rec of records) {
-              const applied = await applyResolvedFile(
-                REPO_ROOT,
-                rec.path,
-                rec.resolvedContent ?? '',
-              );
-              if (!applied.ok) allApplied = false;
-            }
-            if (allApplied) {
-              await runLockedGit(
-                REPO_ROOT,
-                [
-                  '-c',
-                  `user.name=${gitIdentity.botName}`,
-                  '-c',
-                  `user.email=${gitIdentity.botEmail}`,
-                  'commit',
-                  '--no-edit',
-                ],
-                { GIT_EDITOR: 'true' },
-              );
-              const newHead = (await runLockedGit(REPO_ROOT, ['rev-parse', 'HEAD'])).stdout.trim();
-              if (newHead && newHead !== headSha) {
-                result.revertCheckpointSha = newHead;
-                resolvedAndCommitted = true;
-              }
-            }
-          }
-        }
-        await pageService.syncPageRequestsFromDisk().catch(() => {});
-        const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-        activeMergeState = {
-          mergeId: crypto.randomUUID(),
-          kind: 'revert',
-          status: !needsChoices && resolvedAndCommitted ? 'ready_for_review' : 'needs_choices',
-          preSyncSha: headSha,
-          prevBaseSha: baseSha,
-          newBaseSha: result.targetParentSha || baseSha,
-          summary:
-            !needsChoices && resolvedAndCommitted
-              ? 'Combined your undo with newer live-site updates — please review.'
-              : 'Someone updated these pages after your publication — choose what to keep.',
-          records,
-          upstreamCommits: [],
-          touchedUserFiles: result.conflictedFiles,
-        };
-        await persistMergeReviewState();
-        return c.json({ ...result, changedFilesCount: changes.length, review: activeMergeState });
-      }
-      await pageService.syncPageRequestsFromDisk().catch(() => {});
-      const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-      return c.json({ ...result, changedFilesCount: changes.length });
-    } finally {
-      activeSyncOps = Math.max(0, activeSyncOps - 1);
-    }
-  });
-
-  app.get('/internal/review', async (c) => {
-    const baseRef = c.req.query('baseRef') || `origin/${BASE_BRANCH}`;
-    const activeRoute = c.req.query('activeRoute') || null;
-    const changes = await getGitChanges(REPO_ROOT, baseRef);
-    const cards = await buildChangeCards(REPO_ROOT, changes, {
-      baseRef,
-      prevBaseSha: prevBaseSha || null,
-      editorName: gitIdentity.editorName,
-      conflictRecords: activeMergeState?.records,
+    const piPromise = timed('piReady', async () => {
+      await pageService.load();
+      await pageService
+        .syncPageRequestsFromDisk({ reconcileInterrupted: true, broadcast: false })
+        .catch((err) => ignore(err, 'runner: reconcile interrupted page requests on boot'));
+      const created = deps.createPiRuntime ? deps.createPiRuntime(piOptions()) : new HalleyPiRuntime(piOptions());
+      await created.start();
+      piRuntime = created;
     });
-    const targetRoutes = resolveVisualReviewRoutes(cards, activeRoute);
-    const mergedFromLiveFiles =
-      prevBaseSha && baseSha && prevBaseSha !== baseSha
-        ? (await runLockedGit(REPO_ROOT, ['diff', '--name-only', `${prevBaseSha}..${baseSha}`]))
-            .stdout
-            .split(/\r?\n/)
-            .filter(Boolean)
-        : [];
-
-    const liveSiteUrl = await detectAstroSiteUrl(REPO_ROOT);
-
-    return c.json({
-      cards,
-      pages: [],
-      targetRoutes,
-      draftFiles: changes.map((ch) => ch.path),
-      mergedFromLiveFiles,
-      astroReady: astroManager.getStatus().ready,
-      previewBase,
-      liveSiteUrl,
-      mergeReview: activeMergeState,
-      baseSha,
-      prevBaseSha: prevBaseSha || null,
-    });
-  });
-
-  app.post('/internal/verify/speculative', (c) => {
-    if (readOnly) return c.json({ ok: false, reason: 'read-only' });
-    triggerImmediateSpeculativeVerify();
-    return c.json({ ok: true });
-  });
-
-  app.post('/internal/verify', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { pausePreview?: boolean };
-    // Never need to pause live astro dev when isolated verify-sandbox is active
-    const shouldPause = Boolean(body.pausePreview) && !process.env.HALLEY_VERIFY_SANDBOX_DIR;
-    if (shouldPause) {
-      currentPreviewPaused = true;
-      currentPreviewPauseReason = 'Running pre-publish checks…';
-      broadcast({
-        type: 'preview_paused',
-        paused: true,
-        reason: 'Running pre-publish checks…',
-      });
-      await astroManager.pause();
-    }
-    try {
-      const result = await runAllVerificationChecks(REPO_ROOT, {
-        supervisorUrl: SUPERVISOR_URL || undefined,
-        hostSecret: activeHostSecret || undefined,
-        sessionId: SESSION_ID,
-        priority: 'foreground',
-        onQueued: (position, message) => {
-          broadcast({
-            type: 'publish_state',
-            payload: {
-              state: 'verifying',
-              queuePosition: position,
-              queueMessage: message,
-            },
-          });
-        },
-        onAcquired: () => {
-          broadcast({
-            type: 'publish_state',
-            payload: {
-              state: 'verifying',
-              queuePosition: null,
-              queueMessage: null,
-            },
-          });
-        },
-      });
-      return c.json(result);
-    } catch (err) {
-      return c.json(
-        {
-          allPassed: false,
-          results: [
-            {
-              name: 'Build queue',
-              command: 'halley-build-queue',
-              passed: false,
-              durationMs: 0,
-              output: err instanceof Error ? err.message : 'Verification failed',
-            },
-          ],
-        },
-        200,
-      );
-    } finally {
-      if (shouldPause) {
-        try {
-          await astroManager.resume();
-        } catch (err) {
-          console.error('[halley-runner] Failed to resume astro dev after verify:', err);
-        }
-        currentPreviewPaused = false;
-        currentPreviewPauseReason = undefined;
-        broadcast({ type: 'preview_paused', paused: false });
-      }
-    }
-  });
-
-  app.post('/internal/uploads', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    const form = await c.req.formData();
-    const file = form.get('file');
-    if (!file || typeof file === 'string') {
-      return c.json({ error: 'Missing file' }, 400);
-    }
-    const buf = Buffer.from(await file.arrayBuffer());
-    const staged = await uploadManager.stageImage(file.name, file.type || 'image/png', buf);
-    return c.json({ attachment: staged });
-  });
-
-  app.post('/internal/optimize/start', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    cancelSpeculativeVerify();
-    const body = (await c.req.json().catch(() => ({}))) as {
-      findings?: OptimizationFindingDto[];
-      modelId?: string;
-      defaultModelId?: string;
-      thinkingLevel?: 'off' | 'low' | 'medium' | 'high';
-    };
-    const findings = body.findings ?? [];
-
-    const prePass = await runDeterministicOptimizationPrePass(REPO_ROOT, findings, gitIdentity);
-    if (prePass.checkpoint) {
-      const changes = await getGitChanges(REPO_ROOT, `origin/${BASE_BRANCH}`).catch(() => []);
-      broadcast({
-        type: 'checkpoint_created',
-        checkpoint: prePass.checkpoint,
-        changedFilesCount: changes.length,
-      });
-      notifySessionDiverged();
-    }
-
-    if (prePass.agentFindings.length > 0 && piRuntime) {
-      const promptText = buildOptimizationPrompt({
-        agentFindings: prePass.agentFindings,
-        completedDeterministic: prePass.completedSummaries,
-      });
-      await piRuntime.submitOptimizationRequest(promptText, {
-        modelId: body.modelId || MODEL_ID,
-        defaultModelId: body.defaultModelId || MODEL_ID,
-        thinkingLevel: body.thinkingLevel,
-        defaultThinkingLevel: THINKING_LEVEL,
-        onSettled: () => notifyOptimizationSettled(),
-      });
-    } else {
-      await notifyOptimizationSettled();
-      if (prePass.completedSummaries.length > 0) {
-        scheduleIdleSpeculativeVerify(1_000);
-      }
-    }
-
-    return c.json({
-      ok: true,
-      completedDeterministic: prePass.completedSummaries,
-      agentRefactorCount: prePass.agentFindings.length,
-      checkpoint: prePass.checkpoint,
-    });
-  });
-
-  app.post('/internal/prompt', async (c) => {
-    if (readOnly) return c.json({ error: 'Read-only' }, 403);
-    const body = ChatClientMessageSchema.parse(await c.req.json());
-    if (body.type === 'submit_input') {
-      cancelSpeculativeVerify();
-      await piRuntime?.submitUserInput(body);
-    } else if (body.type === 'abort') {
-      await piRuntime?.abort();
-    } else if (body.type === 'continue_run') {
-      cancelSpeculativeVerify();
-      await piRuntime?.continueRun();
-    }
-    return c.json({ ok: true });
-  });
-
-  app.get('/internal/transcript', (c) => {
-    const base = latestTranscript ?? {
-      type: 'transcript_state',
-      entries: [],
-      live: { busy: false, streamingText: '', activeTools: [], queuedCount: 0 },
-      usageUsd: 0,
-    };
-    return c.json({
-      ...base,
-      pageRequests: pageService.listPageRequests(),
-    });
-  });
-
-  app.get('/internal/debug/trace', (c) => {
-    if (!piRuntime) {
-      return c.json({ error: 'Agent runtime is not ready yet' }, 503);
-    }
-    return c.json(piRuntime.getDebugTrace());
-  });
-
-  const server = serve({
-    fetch: app.fetch,
-    port: RUNNER_PORT,
-    hostname: '0.0.0.0',
-    createServer,
-  });
-
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
-  server.on('upgrade', (req, socket, head) => {
-    if ((req.url ?? '').startsWith('/ws')) {
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
-
-  wss.on('connection', (ws) => {
-    wsClients.add(ws);
-    if (latestTranscript) {
-      ws.send(JSON.stringify(latestTranscript));
-    }
-    ws.send(
-      JSON.stringify({
-        type: 'page_requests_sync',
-        pageRequests: pageService.listPageRequests(),
-      }),
+    const results = await Promise.allSettled([astroPromise, piPromise]);
+    const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failure) throw failure.reason;
+    bootTimings.total = clock.now() - bootT0;
+    booted = true;
+    logger.info('runner: boot phases', { phasesMs: bootTimings });
+    console.log(
+      `[halley-workspace-runner] session=${SESSION_ID} runner=:${RUNNER_PORT} astro=:${ASTRO_PORT}${previewBase}`,
     );
-    ws.send(
-      JSON.stringify({
-        type: 'session_state_sync',
-        workspaceLocked: currentWorkspaceLocked,
-        lockedFile: currentLockedFile,
-        previewPaused: currentPreviewPaused,
-        previewPauseReason: currentPreviewPauseReason,
-        astroReady: astroManager.getStatus().ready,
-        mergeReview: activeMergeState,
-      } satisfies ChatServerMessage),
-    );
-    ws.on('message', async (raw) => {
-      if (readOnly) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Session is read-only' }));
-        return;
-      }
-      try {
-        const parsed = ChatClientMessageSchema.parse(JSON.parse(raw.toString('utf8')));
-        if (parsed.type === 'submit_input') {
-          cancelSpeculativeVerify();
-          await piRuntime?.submitUserInput(parsed);
-        } else if (parsed.type === 'abort') {
-          await piRuntime?.abort();
-        } else if (parsed.type === 'continue_run') {
-          cancelSpeculativeVerify();
-          await piRuntime?.continueRun();
-        }
-      } catch (err) {
-        ws.send(
-          JSON.stringify({
-            type: 'error',
-            message: err instanceof Error ? err.message : 'Invalid command',
-          }),
-        );
-      }
-    });
-    ws.on('close', () => wsClients.delete(ws));
+  })();
+  ready.catch((err) => {
+    bootFailed = err ?? new Error('boot failed');
   });
 
-  console.log(
-    `[halley-workspace-runner] session=${SESSION_ID} runner=:${RUNNER_PORT} astro=:${ASTRO_PORT}${previewBase}`,
-  );
+  const handle: RunnerHandle = { app, server, wss, wsHandlers, shutdown, ready, bootTimings };
+  deps.onCreated?.(handle);
+  try {
+    await ready;
+  } catch (err) {
+    await shutdown();
+    throw err;
+  }
+  return handle;
 }
 
-main().catch((err) => {
-  console.error('[halley-workspace-runner] Fatal error:', err);
-  process.exit(1);
-});
+const isMain =
+  Boolean(process.argv[1]) &&
+  path.resolve(process.argv[1]!) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isMain) {
+  const config = loadRunnerConfig(process.env);
+  // Scrub secrets from process.env immediately so child processes (astro dev SSR, agent bash, build scripts) never inherit them
+  delete process.env.WORKSPACE_TOKEN;
+  delete process.env.WORKSPACE_HOST_SECRET;
+  // Fail-stop on unknown state (see supervisor): the supervisor records the exit and the session
+  // restarts cleanly on the next request.
+  let fatal = false;
+  process.on('uncaughtException', (err) => {
+    logger.error('runner: uncaughtException; shutting down', { err });
+    if (fatal) return;
+    fatal = true;
+    const hardExit = setTimeout(() => process.exit(1), 8_000);
+    hardExit.unref();
+    void (runner ? runner.shutdown() : Promise.resolve()).finally(() => process.exit(1));
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('runner: unhandledRejection', { err: reason });
+  });
+  let runner: RunnerHandle | null = null;
+  let exiting = false;
+  const exitAfterShutdown = () => {
+    if (exiting) return;
+    exiting = true;
+    void (runner ? runner.shutdown() : Promise.resolve()).finally(() => process.exit(0));
+  };
+  process.on('SIGINT', exitAfterShutdown);
+  process.on('SIGTERM', exitAfterShutdown);
+  // The supervisor always spawns us; if it is gone (SIGKILL / OOM) nobody can stop or route to this
+  // runner any more, so exit (taking our astro dev and build process groups with us).
+  onParentDeath(() => {
+    logger.warn('runner: supervisor process died; shutting down');
+    exitAfterShutdown();
+  });
+  createRunner(config, {
+    onCreated: (h) => {
+      runner = h;
+    },
+  })
+    .catch((err) => {
+      console.error('[halley-workspace-runner] Fatal error:', err);
+      process.exit(1);
+    });
+}

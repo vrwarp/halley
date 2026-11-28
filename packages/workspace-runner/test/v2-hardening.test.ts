@@ -9,6 +9,7 @@ import {
   isDependencyMutationCommand,
 } from '../src/bash-guard.js';
 import { FifoBuildQueue } from '../src/build-queue.js';
+import { ManualClock } from '../src/clock.js';
 import {
   commitVirtualMergeResolution,
   findFilesWithConflictMarkers,
@@ -41,7 +42,8 @@ describe('v2 workspace-runner hardening invariants', () => {
   });
 
   it('FifoBuildQueue waits for preempted speculative build cleanup before granting foreground lease and supports deferSpeculativeFor', async () => {
-    const queue = new FifoBuildQueue(5_000, 15_000, 2_000);
+    const clock = new ManualClock();
+    const queue = new FifoBuildQueue(5_000, 15_000, 2_000, () => {}, clock);
     const events: string[] = [];
 
     // 1. Speculative build starts
@@ -49,8 +51,8 @@ describe('v2 workspace-runner hardening invariants', () => {
       priority: 'speculative',
       onPreempted: () => {
         events.push('spec-preempted');
-        // Simulate 60ms child-process teardown before releasing lease
-        setTimeout(() => {
+        // Simulate 60ms child-process teardown before releasing lease (manual time)
+        clock.setTimeout(() => {
           events.push('spec-cleanup-done');
           specLease.release();
         }, 60);
@@ -64,6 +66,11 @@ describe('v2 workspace-runner hardening invariants', () => {
       return l;
     });
 
+    for (let i = 0; i < 100 && !events.includes('spec-preempted'); i++) await Promise.resolve();
+    clock.advance(59);
+    await Promise.resolve();
+    expect(events).toEqual(['spec-acquired', 'spec-preempted']); // still tearing down
+    clock.advance(1);
     const fgLease = await fgPromise;
     expect(events).toEqual([
       'spec-acquired',
@@ -85,13 +92,15 @@ describe('v2 workspace-runner hardening invariants', () => {
         return l;
       });
 
-    await new Promise((r) => setTimeout(r, 30));
+    clock.advance(30);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
     expect(specResolved).toBe(false);
 
     // Foreground still acquires immediately even while speculative is deferred!
     const urgentFg = await queue.acquire('sess-fg-2', { priority: 'foreground' });
     urgentFg.release();
 
+    clock.advance(110); // deferral (120ms) + the queue's 20ms re-pump slack, on the manual clock
     const deferredSpecLease = await deferredSpecPromise;
     expect(specResolved).toBe(true);
     deferredSpecLease.release();

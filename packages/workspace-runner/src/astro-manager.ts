@@ -1,7 +1,11 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { writeFileAtomic } from './fs-util.js';
+import { errCode, ignore, ignoreCodes, ignoreExpected, orDefault } from './log.js';
+import { envInt, getProcessRunner, killProcessGroup, withMaxOldSpace } from './proc.js';
 
 function stripJsComments(source: string): string {
   return source
@@ -18,8 +22,9 @@ export async function detectAstroBase(repoRoot: string): Promise<string> {
         const b = m[2].startsWith('/') ? m[2] : `/${m[2]}`;
         return b === '/' ? '/' : b.replace(/\/$/, '');
       }
-    } catch {
-      // try next
+    } catch (err) {
+      // config variant absent: try next
+      ignoreCodes(err, ['ENOENT'], 'astro: read config for base', { name });
     }
   }
   return '/';
@@ -39,8 +44,8 @@ export async function detectAstroSiteUrl(repoRoot: string): Promise<string | nul
         base = b === '/' ? '' : b.replace(/\/+$/, '');
       }
       return `${site}${base}`;
-    } catch {
-      // try next
+    } catch (err) {
+      ignoreCodes(err, ['ENOENT'], 'astro: read config for site url', { name });
     }
   }
   return null;
@@ -57,11 +62,16 @@ export async function findAstroConfigFile(repoRoot: string): Promise<string> {
     try {
       await fs.access(full);
       return full;
-    } catch {
-      // continue
+    } catch (err) {
+      if (errCode(err) !== 'ENOENT') ignore(err, 'astro: access config file', { full });
     }
   }
   throw new Error('No astro.config.{mjs,ts,js} found in repository');
+}
+
+function ignoreExpectedProbe(err: unknown): void {
+  // fetch() rejects with TypeError('fetch failed') / TimeoutError while the port is not serving yet
+  ignoreExpected(err, 'astro: readiness probe (still booting)');
 }
 
 export type AstroDevState = 'starting' | 'ready' | 'paused' | 'crashed';
@@ -82,25 +92,15 @@ export interface AstroDevManagerOptions {
   spawnAstro?: () => ChildProcess;
   /** Optional readiness probe override for unit testing. */
   probeReady?: () => Promise<boolean>;
+  /** Clock for restart backoff / crash window (tests). */
+  clock?: Clock;
 }
 
 const DEFAULT_RESTART_DELAYS_MS = [2_000, 5_000, 15_000];
 const DEFAULT_CRASH_WINDOW_MS = 5 * 60_000;
 
 function signalProcessGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
-  if (proc.pid) {
-    try {
-      process.kill(-proc.pid, signal);
-      return;
-    } catch {
-      // Fallback to direct child signal if not a group leader
-    }
-  }
-  try {
-    proc.kill(signal);
-  } catch {
-    // already exited
-  }
+  killProcessGroup(proc, signal);
 }
 
 export class AstroDevManager {
@@ -116,13 +116,15 @@ export class AstroDevManager {
   private crashTimestamps: number[] = [];
   private crashCount = 0;
   private lastExitCode: number | null = null;
-  private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  private restartTimer: TimerHandle | null = null;
+  private readonly clock: Clock;
   private readonly restartDelaysMs: number[];
   private readonly crashWindowMs: number;
 
   constructor(private opts: AstroDevManagerOptions) {
     this.restartDelaysMs = opts.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
     this.crashWindowMs = opts.crashWindowMs ?? DEFAULT_CRASH_WINDOW_MS;
+    this.clock = opts.clock ?? realClock;
   }
 
   getStatus() {
@@ -140,7 +142,7 @@ export class AstroDevManager {
 
   private clearRestartTimer(): void {
     if (this.restartTimer) {
-      clearTimeout(this.restartTimer);
+      this.clock.clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
   }
@@ -209,7 +211,8 @@ export default {
   },
 };
 `;
-    await fs.writeFile(this.wrapperConfigPath, configContent, 'utf8');
+    // astro dev may (re)start and read it at any moment: never expose a half-written config
+    await writeFileAtomic(this.wrapperConfigPath, configContent);
   }
 
   private async spawnAndWait(): Promise<void> {
@@ -224,18 +227,23 @@ export default {
       child = this.opts.spawnAstro();
     } else {
       const rawAstroBin = path.join(this.opts.repoRoot, 'node_modules', '.bin', 'astro');
-      const astroBin = await fs.realpath(rawAstroBin).catch(() => rawAstroBin);
-      const realRepoRoot = await fs
-        .realpath(this.opts.repoRoot)
-        .catch(() => path.resolve(this.opts.repoRoot));
-      const realWrapperDir = await fs
-        .realpath(path.dirname(this.wrapperConfigPath))
-        .catch(() => path.resolve(path.dirname(this.wrapperConfigPath)));
+      // unresolvable paths fall back to the unresolved ones (spawn then reports a missing binary)
+      const astroBin = await orDefault(fs.realpath(rawAstroBin), rawAstroBin, 'astro: resolve astro binary');
+      const realRepoRoot = await orDefault(
+        fs.realpath(this.opts.repoRoot),
+        path.resolve(this.opts.repoRoot),
+        'astro: resolve repo root',
+      );
+      const realWrapperDir = await orDefault(
+        fs.realpath(path.dirname(this.wrapperConfigPath)),
+        path.resolve(path.dirname(this.wrapperConfigPath)),
+        'astro: resolve wrapper config dir',
+      );
       const realWrapperPath = path.join(realWrapperDir, path.basename(this.wrapperConfigPath));
       // Astro 5 `resolveConfigPath` uses `path.join(root, configFile)` rather than `path.resolve`,
       // so `--config` MUST be relative to `repoRoot` when stored outside `repoRoot` in `stateDir`.
       const configArg = path.relative(realRepoRoot, realWrapperPath);
-      child = spawn(
+      child = getProcessRunner().spawn(
         astroBin,
         [
           'dev',
@@ -253,6 +261,11 @@ export default {
           env: {
             ...process.env,
             FORCE_COLOR: '0',
+            // W6: astro dev gets its own heap cap (merged into, not clobbering, NODE_OPTIONS)
+            NODE_OPTIONS: withMaxOldSpace(
+              process.env.NODE_OPTIONS,
+              envInt('HALLEY_ASTRO_MAX_OLD_SPACE_MB', 2048, 128),
+            ),
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         },
@@ -266,6 +279,7 @@ export default {
       'i',
     );
 
+    let wakePoll: (() => void) | null = null;
     const pushLog = (chunk: Buffer, isErr: boolean) => {
       const lines = chunk.toString('utf8').split(/\r?\n/).filter(Boolean);
       for (const l of lines) {
@@ -278,6 +292,7 @@ export default {
         if (listenUrlRe.test(l) || l.includes('watching for file changes')) {
           this.ready = true;
           this.state = 'ready';
+          wakePoll?.(); // end the probe loop's backoff now instead of on its next tick
         }
       }
     };
@@ -301,7 +316,7 @@ export default {
 
       console.error(`[halley-astro] ${exitMsg}`);
       this.crashCount += 1;
-      const now = Date.now();
+      const now = this.clock.now();
       this.crashTimestamps = this.crashTimestamps.filter((ts) => now - ts < this.crashWindowMs);
       this.crashTimestamps.push(now);
 
@@ -312,7 +327,7 @@ export default {
           `[astro dev crashed (${this.crashTimestamps.length}/${this.restartDelaysMs.length}); restarting in ${delay}ms]`,
         );
         this.clearRestartTimer();
-        this.restartTimer = setTimeout(() => {
+        this.restartTimer = this.clock.setTimeout(() => {
           this.restartTimer = null;
           if (!this.intentionalStop && !this.paused) {
             void this.enqueueOp(() => this.spawnAndWait()).catch((err) => {
@@ -331,8 +346,8 @@ export default {
     });
 
     // Poll deterministic HTTP /__editor/health endpoint (up to 45s on Ryzen V1500B)
-    const deadline = Date.now() + 45_000;
-    while (Date.now() < deadline) {
+    const deadline = this.clock.now() + 45_000;
+    while (this.clock.now() < deadline) {
       if (this.ready || this.proc !== child || child.exitCode !== null || this.paused || this.intentionalStop) {
         break;
       }
@@ -340,18 +355,30 @@ export default {
         const ok = this.opts.probeReady
           ? await this.opts.probeReady()
           : await fetch(`http://127.0.0.1:${this.opts.astroPort}${this.previewBase}/__editor/health`, {
-              signal: AbortSignal.timeout(3_000),
+              signal: this.clock.timeoutSignal(3_000),
             }).then((res) => res.ok);
         if (ok) {
           this.ready = true;
           this.state = 'ready';
           break;
         }
-      } catch {
-        // still booting
+      } catch (err) {
+        // still booting (ECONNREFUSED / timeout): expected while astro dev starts
+        ignoreExpectedProbe(err);
       }
       if (this.ready) break;
-      await new Promise((r) => setTimeout(r, 350));
+      await new Promise<void>((resolve) => {
+        const t = this.clock.setTimeout(() => {
+          wakePoll = null;
+          resolve();
+        }, 350);
+        t.unref?.();
+        wakePoll = () => {
+          this.clock.clearTimeout(t);
+          wakePoll = null;
+          resolve();
+        };
+      });
     }
   }
 
@@ -376,10 +403,10 @@ export default {
             return;
           }
           const onExit = () => {
-            clearTimeout(t);
+            this.clock.clearTimeout(t);
             resolve(true);
           };
-          const t = setTimeout(() => {
+          const t = this.clock.setTimeout(() => {
             p.off?.('exit', onExit);
             resolve(p.exitCode !== null);
           }, timeoutMs);
@@ -452,7 +479,9 @@ export default {
       this.ready = false;
       await this.killCurrentProc();
       if (this.wrapperConfigPath) {
-        await fs.unlink(this.wrapperConfigPath).catch(() => {});
+        await fs
+          .unlink(this.wrapperConfigPath)
+          .catch((e) => ignoreCodes(e, ['ENOENT'], 'astro: remove wrapper config on stop'));
       }
     });
   }

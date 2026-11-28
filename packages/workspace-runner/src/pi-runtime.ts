@@ -49,13 +49,18 @@ import {
 } from '@halley/shared';
 import sharp from 'sharp';
 import { checkSharedContainerBashCommand, isDependencyMutationCommand } from './bash-guard.js';
-import { sanitizeProtectedPaths } from './checkpoints-and-git.js';
+import { sanitizeProtectedPaths, withRepoGitLock } from './checkpoints-and-git.js';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { readFileOr } from './fs-util.js';
+import { ignore, ignoreExpected, logger, orDefault } from './log.js';
 import { detachHardlinkedNodeModules } from './nm-cache.js';
 import type { PageCreationService } from './pages.js';
 import { formatCompactCheckSummary, runAllVerificationChecks } from './verify.js';
 import type { UploadManager } from './uploads.js';
 
 export interface PiRuntimeOptions {
+  /** Clock for throttles, settle waits and outbound deadlines (defaults to the real clock). */
+  clock?: Clock;
   repoRoot: string;
   stateDir: string;
   sessionId: string;
@@ -81,6 +86,14 @@ export interface PiRuntimeOptions {
     live: LiveRunStateDto;
     usageUsd: number;
   }) => void;
+}
+
+interface CachedEntryDto {
+  dto: TranscriptEntryDto;
+  /** user entry carrying a `[Halley Page Request]` marker */
+  pageRequestId?: string;
+  /** successful create_page tool result */
+  pageRoute?: string;
 }
 
 function isProtectedPath(repoRoot: string, targetPath: string): boolean {
@@ -194,10 +207,121 @@ export function buildCompactionSettings(
   };
 }
 
+type TranscriptSnapshot = {
+  entries: TranscriptEntryDto[];
+  live: LiveRunStateDto;
+  usageUsd: number;
+};
+
+/**
+ * W8: latest-wins throttle. At most one emission per `intervalMs` (leading edge immediately,
+ * then a guaranteed trailing emission of the most recent value). Intermediate values are dropped
+ * without ever being mapped or serialized.
+ */
+export class LatestWinsThrottle<T> {
+  private pending: { value: T } | null = null;
+  private timer: TimerHandle | null = null;
+  private lastEmitAt = Number.NEGATIVE_INFINITY;
+
+  constructor(
+    private readonly intervalMs: number,
+    private readonly emit: (value: T) => void,
+    private readonly clock: Clock = realClock,
+  ) {}
+
+  push(value: T): void {
+    this.pending = { value };
+    if (this.timer) return;
+    const wait = this.lastEmitAt + this.intervalMs - this.clock.now();
+    if (wait <= 0) {
+      this.flush();
+      return;
+    }
+    this.timer = this.clock.setTimeout(() => {
+      this.timer = null;
+      this.flush();
+    }, wait);
+    this.timer.unref?.();
+  }
+
+  flush(): void {
+    if (this.timer) {
+      this.clock.clearTimeout(this.timer);
+      this.timer = null;
+    }
+    const p = this.pending;
+    if (!p) return;
+    this.pending = null;
+    this.lastEmitAt = this.clock.now();
+    try {
+      this.emit(p.value);
+    } catch (err) {
+      ignore(err, 'transcript throttle emit');
+    }
+  }
+
+  cancel(): void {
+    if (this.timer) this.clock.clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = null;
+  }
+}
+
+const TRANSCRIPT_BROADCAST_INTERVAL_MS = Number(process.env.HALLEY_TRANSCRIPT_INTERVAL_MS || 100);
+/** Deadline for one screenshot request to the control plane (it may queue behind other captures). */
+const SCREENSHOT_TIMEOUT_MS = Number(process.env.HALLEY_SCREENSHOT_TIMEOUT_MS || 90_000);
+/** Screenshots larger than this are refused instead of buffered. */
+const SCREENSHOT_MAX_BYTES = 25 * 1024 * 1024;
+/**
+ * Background optimization runs are aborted when the agent makes NO progress (no transcript change)
+ * for this long, so a legitimately long but active run is never cut off...
+ */
+const OPTIMIZE_RUN_IDLE_TIMEOUT_MS = Number(process.env.HALLEY_OPTIMIZE_RUN_IDLE_TIMEOUT_MS || 10 * 60_000);
+/** ...with a generous absolute ceiling as a last-resort guard against a run that loops forever. */
+const OPTIMIZE_RUN_MAX_MS = Number(
+  process.env.HALLEY_OPTIMIZE_RUN_MAX_MS || process.env.HALLEY_OPTIMIZE_RUN_TIMEOUT_MS || 3 * 60 * 60_000,
+);
+
+/**
+ * Resolves `'idle'` once `getLastProgressAt()` is older than `idleMs`, or `'max'` once `maxMs` has
+ * elapsed since creation, whichever comes first. Checks on the injected clock; `cancel()` stops it.
+ */
+export function createProgressDeadline(
+  clock: Clock,
+  getLastProgressAt: () => number,
+  opts: { idleMs: number; maxMs: number },
+): { reached: Promise<'idle' | 'max'>; cancel: () => void } {
+  const startedAt = clock.now();
+  const checkEveryMs = Math.max(1_000, Math.min(60_000, Math.floor(opts.idleMs / 4)));
+  let timer: TimerHandle | null = null;
+  let cancelled = false;
+  const reached = new Promise<'idle' | 'max'>((resolve) => {
+    const check = () => {
+      if (cancelled) return;
+      const now = clock.now();
+      if (now - startedAt >= opts.maxMs) return resolve('max');
+      if (now - Math.max(startedAt, getLastProgressAt()) >= opts.idleMs) return resolve('idle');
+      timer = clock.setTimeout(check, checkEveryMs);
+      timer.unref?.();
+    };
+    timer = clock.setTimeout(check, checkEveryMs);
+    timer.unref?.();
+  });
+  return {
+    reached,
+    cancel: () => {
+      cancelled = true;
+      if (timer) clock.clearTimeout(timer);
+    },
+  };
+}
+
 export class HalleyPiRuntime {
   private harness!: Harness;
   private root!: Conversation;
   private watchHandle: Awaited<ReturnType<Conversation['watch']>> | null = null;
+  /** Clock time of the last transcript change: progress signal for the optimization idle deadline. */
+  private lastProgressAt = 0;
   private images!: Awaited<ReturnType<typeof createNodePhotonImages>>;
   private models = createModels();
   private resolvedModelId = '';
@@ -207,6 +331,14 @@ export class HalleyPiRuntime {
   private systemContextNotes: string[] = [];
   private availableModelIds: Array<{ id: string }> = [];
   private trackedPageRequestIds = new Set<string>();
+  /** W8: last mapped snapshot, keyed by watch-value identity (isBusy/debug/broadcast reuse it). */
+  private lastMapped: { value: unknown; snapshot: TranscriptSnapshot } | null = null;
+  /**
+   * W8: per-entry DTO cache. Settled transcript entries keep their object identity across watch
+   * values, so each entry is mapped once instead of on every 120ms streaming tick.
+   */
+  private entryDtoCache = new WeakMap<object, CachedEntryDto | null>();
+  private transcriptThrottle: LatestWinsThrottle<unknown> | null = null;
 
   constructor(private opts: PiRuntimeOptions) {}
 
@@ -222,13 +354,13 @@ export class HalleyPiRuntime {
   isBusy(): boolean {
     const val = this.watchHandle?.value;
     if (!val) return false;
-    return this.mapWatchValue(val).live.busy;
+    // Same as mapWatchValue(val).live.busy without mapping the whole transcript on every /health
+    return Boolean((val.docs['pi.live'] as { run?: unknown } | undefined)?.run);
   }
 
   async reloadAgentsMd(): Promise<void> {
-    const text = await fs
-      .readFile(path.join(this.opts.repoRoot, 'AGENTS.md'), 'utf8')
-      .catch(() => '');
+    // optional file: missing is normal, other read errors are logged
+    const text = await readFileOr(path.join(this.opts.repoRoot, 'AGENTS.md'), '', 'pi: read AGENTS.md');
     this.agentsMdText = text || null;
   }
 
@@ -244,9 +376,8 @@ export class HalleyPiRuntime {
   async start(): Promise<void> {
     await fs.mkdir(this.opts.stateDir, { recursive: true });
     const sqlitePath = path.join(this.opts.stateDir, 'pi.sqlite');
-    const handoffText = await fs
-      .readFile(path.join(this.opts.stateDir, 'handoff-context.txt'), 'utf8')
-      .catch(() => '');
+    // optional file: missing is normal, other read errors are logged
+    const handoffText = await readFileOr(path.join(this.opts.stateDir, 'handoff-context.txt'), '', 'pi: read handoff context');
     if (handoffText.trim()) {
       this.addSystemContextNote(handoffText.trim());
     }
@@ -306,9 +437,8 @@ export class HalleyPiRuntime {
     registry.install(createCodingTools({ images: this.images }));
     registry.install(createFitImagesExtension(this.images));
 
-    const agentsMdText = await fs
-      .readFile(path.join(this.opts.repoRoot, 'AGENTS.md'), 'utf8')
-      .catch(() => '');
+    // optional file: missing is normal, other read errors are logged
+    const agentsMdText = await readFileOr(path.join(this.opts.repoRoot, 'AGENTS.md'), '', 'pi: read AGENTS.md');
     this.agentsMdText = agentsMdText || null;
 
     const halleyExtension = this.buildHalleyExtension(agentsMdText);
@@ -347,11 +477,24 @@ export class HalleyPiRuntime {
 
     this.watchHandle = await this.root.watch(BACKGROUND_CONTEXT);
     this.opts.onTranscriptUpdate(this.mapWatchValue(this.watchHandle.value));
+    this.transcriptThrottle = new LatestWinsThrottle<unknown>(
+      TRANSCRIPT_BROADCAST_INTERVAL_MS,
+      (value) => {
+        this.opts.onTranscriptUpdate(this.mapWatchValue(value as NonNullable<typeof this.watchHandle>['value']));
+      },
+      this.opts.clock,
+    );
     this.watchHandle.start(async (call) => {
       if (call.kind === 'value') {
-        const snapshot = this.mapWatchValue(call.value);
-        if (snapshot.live.runFailure && !snapshot.live.busy && this.opts.pageService && this.trackedPageRequestIds.size > 0) {
-          const reason = snapshot.live.runFailure.detail || snapshot.live.runFailure.reason || 'Run failed';
+        this.lastProgressAt = (this.opts.clock ?? realClock).now();
+        const liveDoc = call.value.docs['pi.live'] as
+          | { run?: unknown; runFailure?: { reason: string; detail?: unknown } }
+          | undefined;
+        if (liveDoc?.runFailure && !liveDoc.run && this.opts.pageService && this.trackedPageRequestIds.size > 0) {
+          const reason =
+            (liveDoc.runFailure.detail ? String(liveDoc.runFailure.detail) : '') ||
+            liveDoc.runFailure.reason ||
+            'Run failed';
           for (const id of Array.from(this.trackedPageRequestIds)) {
             const pr = this.opts.pageService.getPageRequest(id);
             if (!pr) {
@@ -367,7 +510,8 @@ export class HalleyPiRuntime {
             this.trackedPageRequestIds.delete(id);
           }
         }
-        this.opts.onTranscriptUpdate(snapshot);
+        // Coalesced: at most one mapped + serialized transcript_state per interval, latest wins
+        this.transcriptThrottle?.push(call.value);
       }
     });
 
@@ -376,6 +520,7 @@ export class HalleyPiRuntime {
 
   private buildHalleyExtension(agentsMdText: string) {
     const opts = this.opts;
+    const clock = opts.clock ?? realClock;
 
     // Track in-flight file mutations, screenshots, and build checks so parallel tool calls
     // emitted in the same assistant turn never race (e.g. run_checks pausing Astro mid-screenshot
@@ -428,7 +573,7 @@ export class HalleyPiRuntime {
         return await p;
       } finally {
         inFlightMutations.delete(p);
-        lastMutationFinishedAt = Date.now();
+        lastMutationFinishedAt = clock.now();
       }
     };
 
@@ -437,9 +582,9 @@ export class HalleyPiRuntime {
         await Promise.allSettled([...inFlightMutations]);
       }
       if (watcherSettleMs > 0 && lastMutationFinishedAt > 0) {
-        const elapsed = Date.now() - lastMutationFinishedAt;
+        const elapsed = clock.now() - lastMutationFinishedAt;
         if (elapsed < watcherSettleMs) {
-          await new Promise((r) => setTimeout(r, watcherSettleMs - elapsed));
+          await new Promise<void>((r) => clock.setTimeout(r, watcherSettleMs - elapsed).unref?.());
         }
       }
     };
@@ -461,8 +606,9 @@ export class HalleyPiRuntime {
         if (isProtectedPath(opts.repoRoot, args.destPath)) {
           return { output: [{ type: 'text', text: 'Cannot write to protected path.' }], isError: true };
         }
-        const staged = await opts.uploadManager.resolveStagedFile(args.stagedId);
-        if (!staged) {
+        // sharp streams the file from disk: no full read into a JS buffer first
+        const stagedPath = await opts.uploadManager.resolveStagedPath(args.stagedId);
+        if (!stagedPath) {
           return {
             output: [{ type: 'text', text: `Staged upload not found: ${args.stagedId}` }],
             isError: true,
@@ -479,7 +625,7 @@ export class HalleyPiRuntime {
             const maxWidth = args.maxWidth ?? 2400;
             const quality = args.quality ?? 84;
             // .rotate() auto-orients from EXIF; omitting .withMetadata() strips all EXIF/GPS
-            const webpBuf = await sharp(staged.bytes)
+            const webpBuf = await sharp(stagedPath)
               .rotate()
               .resize({ width: maxWidth, withoutEnlargement: true })
               .webp({ quality })
@@ -545,10 +691,16 @@ export class HalleyPiRuntime {
                   viewport: vp,
                   ...(args.fullPage ? { fullPage: true } : {}),
                 }),
+                signal: clock.timeoutSignal(SCREENSHOT_TIMEOUT_MS),
               });
+              const declaredBytes = Number(res.headers.get('content-length'));
+              if (res.ok && declaredBytes > SCREENSHOT_MAX_BYTES) {
+                await res.body?.cancel().catch((e) => ignoreExpected(e, 'pi: cancel oversized screenshot body'));
+                return { error: `Screenshot too large (${declaredBytes} bytes)` as string };
+              }
 
               if (!res.ok) {
-                const errText = await res.text().catch(() => res.statusText);
+                const errText = await orDefault(res.text(), res.statusText, 'pi: read screenshot error body');
                 return { error: `Screenshot failed (${res.status}): ${errText}` as string };
               }
 
@@ -557,6 +709,9 @@ export class HalleyPiRuntime {
               const width = Number(res.headers.get('x-screenshot-width')) || fallbackSize.width;
               const height = Number(res.headers.get('x-screenshot-height')) || fallbackSize.height;
               const imgBytes = Buffer.from(await res.arrayBuffer());
+              if (imgBytes.length > SCREENSHOT_MAX_BYTES) {
+                return { error: `Screenshot too large (${imgBytes.length} bytes)` as string };
+              }
               return {
                 vp,
                 width,
@@ -766,13 +921,16 @@ export class HalleyPiRuntime {
                 opts.repoRoot,
                 opts.stateDir,
                 process.env.HALLEY_PKG_CACHE_DIR,
-              ).catch(() => {});
+              ).catch((err) => logger.error('bash: node_modules detach failed', { err, cmd }));
             }
             const res = await base.execute(args as never, api, ctx);
-            await sanitizeProtectedPaths(opts.repoRoot).catch(() => {});
+            await sanitizeProtectedPaths(opts.repoRoot).catch((e) => ignore(e, 'bash: sanitize protected paths'));
             return res;
           });
-        return withWorkspaceLock('shell', runBash);
+        // W11: `withWorkspaceLock` only drives the UI lock indicator; it excludes nothing. Mutating
+        // shell commands also hold the in-process repo git lock so background checkpoints, undo,
+        // sync and change inspection never run against a half-applied `sed -i`/`git`/`npm` command.
+        return withWorkspaceLock('shell', () => withRepoGitLock(opts.repoRoot, runBash));
       },
     }));
 
@@ -874,7 +1032,9 @@ export class HalleyPiRuntime {
               }
             }
             if (opts.pageService) {
-              await opts.pageService.syncPageRequestsFromDisk().catch(() => {});
+              await opts.pageService
+                .syncPageRequestsFromDisk()
+                .catch((e) => ignore(e, 'pi: sync page requests from disk after run'));
             }
             return undefined;
           },
@@ -1057,91 +1217,112 @@ export class HalleyPiRuntime {
     };
   }
 
-  private mapWatchValue(value: NonNullable<typeof this.watchHandle>['value']): {
-    entries: TranscriptEntryDto[];
-    live: LiveRunStateDto;
-    usageUsd: number;
-  } {
-    const entries: TranscriptEntryDto[] = [];
+  private mapWatchValue(value: NonNullable<typeof this.watchHandle>['value']): TranscriptSnapshot {
+    if (this.lastMapped?.value === value) return this.lastMapped.snapshot;
+    const snapshot = this.mapWatchValueUncached(value);
+    this.lastMapped = { value, snapshot };
+    return snapshot;
+  }
 
-    for (const entry of value.entries) {
-      if (UserEntry.is(entry)) {
-        const textPart = entry.model?.[0]?.content;
-        const display =
-          typeof textPart === 'string'
+  /** Maps one settled entry to its DTO (without the live page-request metadata). */
+  private mapEntryBase(entry: NonNullable<typeof this.watchHandle>['value']['entries'][number]): CachedEntryDto | null {
+    if (UserEntry.is(entry)) {
+      const textPart = entry.model?.[0]?.content;
+      const display =
+        typeof textPart === 'string'
+          ? textPart
+          : Array.isArray(textPart)
             ? textPart
-            : Array.isArray(textPart)
-              ? textPart
-                  .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-                  .map((b) => b.text)
-                  .join('\n')
-              : '';
-        let pageRequest: PageRequestMetadata | undefined;
-        const firstLine = display.split('\n')[0] ?? '';
-        if (firstLine.startsWith('[Halley Page Request] ')) {
-          try {
-            const parsed = JSON.parse(firstLine.slice('[Halley Page Request] '.length)) as {
-              pageRequestId?: string;
-            };
-            if (parsed.pageRequestId && this.opts.pageService) {
-              pageRequest = this.opts.pageService.getPageRequest(parsed.pageRequestId);
-            }
-          } catch {
-            // ignore malformed marker
-          }
-        }
-        entries.push({
-          id: String(entry.id),
-          kind: entry.kind,
-          role: 'user',
-          text: display,
-          ...(pageRequest ? { pageRequest } : {}),
-        });
-      } else if (AssistantEntry.is(entry)) {
-        const msg = entry.model?.[0] as
-          | { content?: Array<{ type: string; text?: string }>; stopReason?: string }
-          | undefined;
-        const blocks = Array.isArray(msg?.content) ? msg.content : [];
-        const text = blocks
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
-          .join('');
-        if (text.trim()) {
-          entries.push({
-            id: String(entry.id),
-            kind: entry.kind,
-            role: 'assistant',
-            text,
-            ...(msg?.stopReason === 'toolUse' ? { isIntermediate: true } : {}),
-          });
-        }
-      } else if (ToolResultEntry.is(entry)) {
-        const msg = entry.model?.[0];
-        if (msg && msg.role === 'toolResult') {
-          const textOut = Array.isArray(msg.content)
-            ? msg.content
                 .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
                 .map((b) => b.text)
                 .join('\n')
             : '';
-          let toolPageRequest: PageRequestMetadata | undefined;
-          if (msg.toolName === 'create_page' && !msg.isError && this.opts.pageService) {
-            const routeMatch = textOut.match(/\(route\s+(\/[^)\s]+)\)/);
-            if (routeMatch?.[1]) {
-              toolPageRequest = this.opts.pageService.findLatestByRoute(routeMatch[1]);
-            }
-          }
-          entries.push({
-            id: String(entry.id),
-            kind: entry.kind,
-            role: 'tool',
-            text: textOut.slice(0, 600),
-            toolName: msg.toolName,
-            toolStatus: msg.isError ? 'error' : 'done',
-            toolOutput: textOut.slice(0, 1200),
-            ...(toolPageRequest ? { pageRequest: toolPageRequest } : {}),
-          });
+      let pageRequestId: string | undefined;
+      const firstLine = display.split('\n')[0] ?? '';
+      if (firstLine.startsWith('[Halley Page Request] ')) {
+        try {
+          const parsed = JSON.parse(firstLine.slice('[Halley Page Request] '.length)) as {
+            pageRequestId?: string;
+          };
+          if (parsed.pageRequestId) pageRequestId = parsed.pageRequestId;
+        } catch (err) {
+          ignoreExpected(err, 'pi: malformed page-request marker in transcript entry');
         }
+      }
+      return {
+        dto: { id: String(entry.id), kind: entry.kind, role: 'user', text: display },
+        ...(pageRequestId ? { pageRequestId } : {}),
+      };
+    }
+    if (AssistantEntry.is(entry)) {
+      const msg = entry.model?.[0] as
+        | { content?: Array<{ type: string; text?: string }>; stopReason?: string }
+        | undefined;
+      const blocks = Array.isArray(msg?.content) ? msg.content : [];
+      const text = blocks
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+      if (!text.trim()) return null;
+      return {
+        dto: {
+          id: String(entry.id),
+          kind: entry.kind,
+          role: 'assistant',
+          text,
+          ...(msg?.stopReason === 'toolUse' ? { isIntermediate: true } : {}),
+        },
+      };
+    }
+    if (ToolResultEntry.is(entry)) {
+      const msg = entry.model?.[0];
+      if (!msg || msg.role !== 'toolResult') return null;
+      const textOut = Array.isArray(msg.content)
+        ? msg.content
+            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+            .map((b) => b.text)
+            .join('\n')
+        : '';
+      let pageRoute: string | undefined;
+      if (msg.toolName === 'create_page' && !msg.isError) {
+        const routeMatch = textOut.match(/\(route\s+(\/[^)\s]+)\)/);
+        if (routeMatch?.[1]) pageRoute = routeMatch[1];
+      }
+      return {
+        dto: {
+          id: String(entry.id),
+          kind: entry.kind,
+          role: 'tool',
+          text: textOut.slice(0, 600),
+          toolName: msg.toolName,
+          toolStatus: msg.isError ? 'error' : 'done',
+          toolOutput: textOut.slice(0, 1200),
+        },
+        ...(pageRoute ? { pageRoute } : {}),
+      };
+    }
+    return null;
+  }
+
+  private mapWatchValueUncached(value: NonNullable<typeof this.watchHandle>['value']): TranscriptSnapshot {
+    const entries: TranscriptEntryDto[] = [];
+
+    for (const entry of value.entries) {
+      let cached = this.entryDtoCache.get(entry as object);
+      if (cached === undefined) {
+        cached = this.mapEntryBase(entry);
+        this.entryDtoCache.set(entry as object, cached);
+      }
+      if (!cached) continue;
+      // Page-request metadata is mutable (status changes), so it is looked up on every mapping
+      if (cached.pageRequestId && this.opts.pageService) {
+        const pageRequest = this.opts.pageService.getPageRequest(cached.pageRequestId);
+        entries.push(pageRequest ? { ...cached.dto, pageRequest } : cached.dto);
+      } else if (cached.pageRoute && this.opts.pageService) {
+        const pageRequest = this.opts.pageService.findLatestByRoute(cached.pageRoute);
+        entries.push(pageRequest ? { ...cached.dto, pageRequest } : cached.dto);
+      } else {
+        entries.push(cached.dto);
       }
     }
 
@@ -1207,7 +1388,8 @@ export class HalleyPiRuntime {
     whenBusy?: 'steer' | 'followUp';
   }): Promise<void> {
     if (this.activePurpose !== 'chat') {
-      await this.reconfigureModel(this.opts.modelId, 'chat', this.opts.thinkingLevel).catch(() => {
+      await this.reconfigureModel(this.opts.modelId, 'chat', this.opts.thinkingLevel).catch((err) => {
+        ignore(err, 'pi: restore chat model before prompt');
         this.activePurpose = 'chat';
       });
     }
@@ -1312,22 +1494,6 @@ export class HalleyPiRuntime {
     );
   }
 
-  async submitConflictResolutionPrompt(conflictedFiles: string[]): Promise<boolean> {
-    const sub = await this.root.submit(
-      {
-        type: 'input',
-        requestId: `rebase-conflict-${Date.now()}`,
-        content: [
-          `A git rebase onto the latest live site branch hit merge conflicts in: ${conflictedFiles.join(', ')}.`,
-          'Please inspect the conflict markers in those files, resolve them carefully preserving both our edits and the incoming live-site updates, stage each resolved file with `git add`, and do NOT run `git rebase --continue` yourself (Halley will run it once you finish). Confirm when all listed files are cleanly resolved.',
-        ].join(' '),
-      },
-      BACKGROUND_CONTEXT,
-    );
-    const settled = await sub.wait(BACKGROUND_CONTEXT);
-    return settled.status === 'done';
-  }
-
   async abort(): Promise<void> {
     await this.root.abort(BACKGROUND_CONTEXT);
     if (this.opts.pageService && this.trackedPageRequestIds.size > 0) {
@@ -1387,23 +1553,42 @@ export class HalleyPiRuntime {
       BACKGROUND_CONTEXT,
     );
 
-    void sub
-      .wait(BACKGROUND_CONTEXT)
-      .catch(() => {})
+    const clock = this.opts.clock ?? realClock;
+    const startedAt = clock.now();
+    this.lastProgressAt = startedAt;
+    const progressDeadline = createProgressDeadline(clock, () => this.lastProgressAt, {
+      idleMs: OPTIMIZE_RUN_IDLE_TIMEOUT_MS,
+      maxMs: OPTIMIZE_RUN_MAX_MS,
+    });
+    const deadline = progressDeadline.reached;
+    void Promise.race([sub.wait(BACKGROUND_CONTEXT).then(() => 'done' as const), deadline])
+      .then(async (outcome) => {
+        if (outcome === 'done') return;
+        logger.warn('pi: optimization run stopped making progress or hit its ceiling; aborting', {
+          reason: outcome,
+          idleTimeoutMs: OPTIMIZE_RUN_IDLE_TIMEOUT_MS,
+          maxMs: OPTIMIZE_RUN_MAX_MS,
+          ranForMs: clock.now() - startedAt,
+        });
+        await this.abort();
+      })
+      .catch((e) => ignore(e, 'pi: optimization run ended with an error'))
       .finally(async () => {
+        progressDeadline.cancel();
         try {
           await this.reconfigureModel(
             opts.defaultModelId,
             'chat',
             opts.defaultThinkingLevel ?? this.opts.thinkingLevel,
           );
-        } catch {
+        } catch (err) {
+          ignore(err, 'pi: restore chat model after optimization run');
           this.activePurpose = 'chat';
         }
         try {
           await opts.onSettled?.();
-        } catch {
-          // ignore callback failure
+        } catch (err) {
+          ignore(err, 'pi: optimization onSettled callback failed');
         }
       });
   }
@@ -1413,7 +1598,8 @@ export class HalleyPiRuntime {
   }
 
   async stop(): Promise<void> {
-    await this.watchHandle?.stop().catch(() => {});
-    await this.harness?.close(BACKGROUND_CONTEXT).catch(() => {});
+    this.transcriptThrottle?.cancel();
+    await this.watchHandle?.stop().catch((e) => ignore(e, 'pi: stop file watcher'));
+    await this.harness?.close(BACKGROUND_CONTEXT).catch((e) => ignore(e, 'pi: close harness'));
   }
 }

@@ -30,4 +30,11 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 git config --global --add safe.directory '*'
+
+# No git process can be running yet: any .git/index.lock / HEAD.lock under session workspaces was
+# left by a git killed with the previous container (OOM, docker stop) and would block every
+# checkpoint until removed. (The runner also clears stale locks at runtime.)
+find "${WORKSPACES_DIR}/sessions" "${WORKSPACES_DIR}/verify-sandbox" -mindepth 2 -maxdepth 4 \
+  -path '*/.git/*' \( -name index.lock -o -name HEAD.lock \) -type f -print -delete 2>/dev/null || true
+
 exec node /app/packages/workspace-runner/dist/supervisor.js

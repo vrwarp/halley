@@ -7,15 +7,16 @@ import { promisify } from 'node:util';
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
 import { AstroDevManager } from '../src/astro-manager.js';
+import { ManualClock } from '../src/clock.js';
 import {
   createCheckpoint,
   hasProtectedPathChanges,
+  commitVirtualMergeResolution,
   listCheckpoints,
-  mergeWithBase,
-  rebaseOnBase,
   sanitizeProtectedPaths,
   startRevertCommits,
   undoToCheckpoint,
+  virtualMergeWithBase,
 } from '../src/checkpoints-and-git.js';
 import { UploadManager } from '../src/uploads.js';
 import { runAllVerificationChecks, runAstroHygieneGuard } from '../src/verify.js';
@@ -28,6 +29,15 @@ const identity = {
   editorName: 'Sarah',
   editorEmail: 'sarah@thecrossing.website',
 };
+
+/** Event-loop turns until `cond` holds (no timed sleeps). */
+async function until(cond: () => boolean, maxTurns = 50_000): Promise<void> {
+  for (let i = 0; i < maxTurns; i++) {
+    if (cond()) return;
+    await new Promise<void>((r) => setImmediate(r));
+  }
+  throw new Error('condition never became true');
+}
 
 describe('workspace-runner git, protection & hygiene', () => {
   it('protects .github/** from rogue edits, creates checkpoints with Co-authored-by, and supports undo', async () => {
@@ -138,40 +148,39 @@ describe('workspace-runner git, protection & hygiene', () => {
       await execFileAsync('git', ['commit', '-m', 'Grace live update'], { cwd: wsA });
       await execFileAsync('git', ['push', 'origin', 'main'], { cwd: wsA });
 
-      // 1. If resolver leaves conflict markers behind, mergeWithBase must reject and abort cleanly
-      const badOutcome = await mergeWithBase(wsB, {
-        baseBranch: 'main',
+      // The legacy working-tree-marker merge (`mergeWithBase` + agent resolver holding the repo
+      // lock) was removed; the virtual merge reports conflicts without touching the tree.
+      const vres = await virtualMergeWithBase(wsB, { baseBranch: 'main', identity });
+      expect(vres.status).toBe('conflict');
+      expect(vres.conflictedFiles).toEqual(['page.txt']);
+      expect(await fs.readFile(path.join(wsB, 'page.txt'), 'utf8')).toBe('line 1 (editor B v2)\n');
+
+      // 1. A resolution that still carries conflict markers is rejected; nothing is applied
+      const bad = await commitVirtualMergeResolution(wsB, {
+        virtualTreeSha: vres.virtualTreeSha,
+        preSyncSha: vres.preSyncSha,
+        newBaseSha: vres.newBaseSha,
+        resolvedFiles: [{ path: 'page.txt', content: '<<<<<<< HEAD\nbad\n=======\nstill bad\n>>>>>>> main\n' }],
         identity,
-        onResolveConflict: async (files) => {
-          expect(files).toEqual(['page.txt']);
-          await fs.writeFile(path.join(wsB, 'page.txt'), '<<<<<<< HEAD\nbad\n=======\nstill bad\n>>>>>>> main\n');
-          await execFileAsync('git', ['add', 'page.txt'], { cwd: wsB });
-          return true;
-        },
       });
-      expect(badOutcome.status).toBe('conflict');
-      // Working tree must be cleanly aborted (no MERGE_HEAD)
+      expect(bad.ok).toBe(false);
       const mergeHeadExists = await fs
         .access(path.join(wsB, '.git', 'MERGE_HEAD'))
         .then(() => true)
         .catch(() => false);
       expect(mergeHeadExists).toBe(false);
+      expect(await fs.readFile(path.join(wsB, 'page.txt'), 'utf8')).toBe('line 1 (editor B v2)\n');
 
-      // 2. Resolver runs ONCE (not twice for 2 checkpoints) and succeeds cleanly
-      let resolverCalls = 0;
-      const outcome = await rebaseOnBase(wsB, {
-        baseBranch: 'main',
+      // 2. Resolved ONCE (not once per checkpoint) and committed as a 2-parent merge
+      const committed = await commitVirtualMergeResolution(wsB, {
+        virtualTreeSha: vres.virtualTreeSha,
+        preSyncSha: vres.preSyncSha,
+        newBaseSha: vres.newBaseSha,
+        resolvedFiles: [{ path: 'page.txt', content: 'line 1 (A + B v2)\n' }],
         identity,
-        onResolveConflict: async (files) => {
-          resolverCalls++;
-          expect(files).toEqual(['page.txt']);
-          await fs.writeFile(path.join(wsB, 'page.txt'), 'line 1 (A + B v2)\n');
-          await execFileAsync('git', ['add', 'page.txt'], { cwd: wsB });
-          return true;
-        },
       });
-      expect(outcome.status).toBe('resolved');
-      expect(resolverCalls).toBe(1);
+      expect(committed.ok).toBe(true);
+      const outcome = { newBaseSha: vres.newBaseSha };
       expect(outcome.newBaseSha).toBeTruthy();
       expect(await fs.readFile(path.join(wsB, 'page.txt'), 'utf8')).toBe('line 1 (A + B v2)\n');
       expect(await fs.readFile(path.join(wsB, 'other.txt'), 'utf8')).toBe('other updated by Grace\n');
@@ -287,7 +296,9 @@ describe('workspace-runner git, protection & hygiene', () => {
 
   it('auto-restarts AstroDevManager on unexpected exit, pauses/resumes cleanly, and marks crashed after budget exhausted', async () => {
     const procs: Array<EventEmitter & { exitCode: number | null; kill: () => boolean }> = [];
+    const clock = new ManualClock();
     const mgr = new AstroDevManager({
+      clock,
       repoRoot: '/tmp',
       sessionId: 'test-astro',
       astroPort: 4321,
@@ -329,19 +340,20 @@ describe('workspace-runner git, protection & hygiene', () => {
 
     procs[1]!.exitCode = 137;
     procs[1]!.emit('exit', 137, 'SIGKILL');
-    await new Promise((r) => setTimeout(r, 60));
-    expect(procs.length).toBe(3);
-    expect(mgr.getStatus().state).toBe('ready');
+    clock.advance(19);
+    expect(procs.length).toBe(2); // restart backoff runs on the injected clock
+    clock.advance(1);
+    await until(() => procs.length === 3 && mgr.getStatus().state === 'ready');
 
     procs[2]!.exitCode = 137;
     procs[2]!.emit('exit', 137, 'SIGKILL');
-    await new Promise((r) => setTimeout(r, 60));
-    expect(procs.length).toBe(4);
+    clock.advance(20);
+    await until(() => procs.length === 4 && mgr.getStatus().state === 'ready');
 
     procs[3]!.exitCode = 137;
     procs[3]!.emit('exit', 137, 'SIGKILL');
-    await new Promise((r) => setTimeout(r, 60));
-    expect(mgr.getStatus().state).toBe('crashed');
+    expect(mgr.getStatus().state).toBe('crashed'); // budget exhausted: decided synchronously
+    clock.advance(60_000);
     expect(procs.length).toBe(4);
 
     await mgr.stop();
@@ -535,10 +547,12 @@ describe('workspace-runner git, protection & hygiene', () => {
       await fs.writeFile(path.join(wsDir, 'node_modules/pkg/index.js'), 'export default 1;');
       await writeNodeModulesMeta(stateDir, { mode: 'hardlinked', hash: 'abc123' });
 
+      const inoBefore = (await fs.stat(path.join(wsDir, 'node_modules/pkg/index.js'))).ino;
       const detached = await detachHardlinkedNodeModules(wsDir, stateDir);
       expect(detached).toBe(true);
-      const exists = await fs.access(path.join(wsDir, 'node_modules')).then(() => true).catch(() => false);
-      expect(exists).toBe(false);
+      // W1: detach is copy-on-write — node_modules stays usable (private copies), it is never deleted
+      expect(await fs.readFile(path.join(wsDir, 'node_modules/pkg/index.js'), 'utf8')).toBe('export default 1;');
+      expect((await fs.stat(path.join(wsDir, 'node_modules/pkg/index.js'))).ino).not.toBe(inoBefore);
       expect((await readNodeModulesMeta(stateDir))?.mode).toBe('detached');
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
@@ -658,16 +672,18 @@ describe('workspace-runner git, protection & hygiene', () => {
             return true;
           },
         });
-        setTimeout(() => {
+        setImmediate(() => {
           fake.stdout.emit('data', Buffer.from('  ┃ Local    http://localhost:4329/\n'));
-        }, 10);
+        });
         return fake as unknown as ChildProcess;
       },
+      // the HTTP probe never succeeds and its retry sleep is on a manual clock nobody advances:
+      // only the stdout line can make start() resolve
       probeReady: async () => {
         probeCalls += 1;
-        await new Promise((r) => setTimeout(r, 50));
         return false;
       },
+      clock: new ManualClock(),
     });
 
     const t0 = Date.now();
@@ -698,6 +714,7 @@ const srv = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     ok: true,
+    protocolVersion: 2,
     astroReady: false,
     astroState: 'crashed',
     astroLogs: ['Error: simulated Astro config failure'],

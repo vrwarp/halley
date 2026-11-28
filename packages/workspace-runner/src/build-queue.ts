@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { realClock, type Clock, type TimerHandle } from './clock.js';
+import { ignore } from './log.js';
 
 export type BuildPriority = 'foreground' | 'speculative';
 
@@ -17,12 +19,22 @@ export interface BuildLease {
   release: () => void;
 }
 
+/**
+ * Terminates the lease holder's build. Called when the lease outlives `maxLeaseMs` or when a
+ * preempted speculative holder does not release within `preemptExitGraceMs`. It must resolve only
+ * once the holder's build has stopped (released, or its process group killed); the next waiter is
+ * admitted after that, never while the holder may still be writing to the shared verify sandbox.
+ */
+export type LeaseTerminator = (reason: 'expired' | 'preempted') => Promise<void> | void;
+
 interface ActiveLease {
   leaseId: string;
   sessionId: string;
   priority: BuildPriority;
   preempting?: boolean;
+  terminating?: boolean;
   onPreempted?: () => void;
+  onTerminate?: LeaseTerminator;
 }
 
 interface Waiter {
@@ -32,9 +44,10 @@ interface Waiter {
   onPosition?: (position: number) => void;
   lastPosition?: number;
   onPreempted?: () => void;
+  onTerminate?: LeaseTerminator;
   resolve: (lease: BuildLease) => void;
   reject: (err: Error) => void;
-  timer: NodeJS.Timeout | null;
+  timer: TimerHandle | null;
 }
 
 export class BuildQueueTimeoutError extends Error {
@@ -49,28 +62,70 @@ export class BuildQueueTimeoutError extends Error {
 
 export class FifoBuildQueue {
   private active: ActiveLease | null = null;
-  private activeTimer: NodeJS.Timeout | null = null;
-  private preemptGraceTimer: NodeJS.Timeout | null = null;
+  private activeTimer: TimerHandle | null = null;
+  private preemptGraceTimer: TimerHandle | null = null;
   private deferSpeculativeUntil = 0;
-  private deferTimer: NodeJS.Timeout | null = null;
+  private deferTimer: TimerHandle | null = null;
   private queue: Waiter[] = [];
 
   constructor(
     private readonly defaultTimeoutMs = 10 * 60_000,
     private readonly maxLeaseMs = 15 * 60_000,
     private readonly preemptExitGraceMs = 3_500,
+    private readonly log: (msg: string, fields?: Record<string, unknown>) => void = () => {},
+    private readonly clock: Clock = realClock,
   ) {}
+
+  /**
+   * W7: actively stops the holder (via its terminator) and frees the slot only after the holder
+   * confirmed release or the terminator finished killing it. Without a terminator the lease is
+   * NOT force-freed (a second build would run concurrently in the shared sandbox); it stays held
+   * until the holder releases or its session exits (`releaseBySession`).
+   */
+  private terminateActive(target: ActiveLease, reason: 'expired' | 'preempted'): void {
+    if (this.active?.leaseId !== target.leaseId || target.terminating) return;
+    target.terminating = true;
+    if (!target.onTerminate) {
+      this.log('build-queue: lease overdue but holder has no terminator; waiting for release', {
+        leaseId: target.leaseId,
+        sessionId: target.sessionId,
+        reason,
+      });
+      return;
+    }
+    this.log('build-queue: terminating lease holder', {
+      leaseId: target.leaseId,
+      sessionId: target.sessionId,
+      reason,
+    });
+    void Promise.resolve()
+      .then(() => target.onTerminate!(reason))
+      .catch((err: unknown) => {
+        this.log('build-queue: lease terminator failed', {
+          leaseId: target.leaseId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (this.active?.leaseId === target.leaseId) {
+          this.active = null;
+          this.clearActiveTimer();
+          this.clearPreemptTimer();
+          this.pump();
+        }
+      });
+  }
 
   private clearActiveTimer(): void {
     if (this.activeTimer) {
-      clearTimeout(this.activeTimer);
+      this.clock.clearTimeout(this.activeTimer);
       this.activeTimer = null;
     }
   }
 
   private clearPreemptTimer(): void {
     if (this.preemptGraceTimer) {
-      clearTimeout(this.preemptGraceTimer);
+      this.clock.clearTimeout(this.preemptGraceTimer);
       this.preemptGraceTimer = null;
     }
   }
@@ -78,18 +133,10 @@ export class FifoBuildQueue {
   private armActiveTimer(leaseId: string): void {
     this.clearActiveTimer();
     if (this.maxLeaseMs <= 0) return;
-    this.activeTimer = setTimeout(() => {
+    this.activeTimer = this.clock.setTimeout(() => {
+      this.activeTimer = null;
       if (this.active?.leaseId === leaseId) {
-        const expired = this.active;
-        this.active = null;
-        this.activeTimer = null;
-        this.clearPreemptTimer();
-        try {
-          expired.onPreempted?.();
-        } catch {
-          // ignore
-        }
-        this.pump();
+        this.terminateActive(this.active, 'expired');
       }
     }, this.maxLeaseMs);
     this.activeTimer.unref?.();
@@ -101,15 +148,15 @@ export class FifoBuildQueue {
    * Any currently running speculative build is also preempted cleanly.
    */
   deferSpeculativeFor(durationMs: number): void {
-    const until = Date.now() + Math.max(0, durationMs);
+    const until = this.clock.now() + Math.max(0, durationMs);
     if (until > this.deferSpeculativeUntil) {
       this.deferSpeculativeUntil = until;
     }
-    if (this.deferTimer) clearTimeout(this.deferTimer);
-    this.deferTimer = setTimeout(() => {
+    if (this.deferTimer) this.clock.clearTimeout(this.deferTimer);
+    this.deferTimer = this.clock.setTimeout(() => {
       this.deferTimer = null;
       this.pump();
-    }, Math.max(50, this.deferSpeculativeUntil - Date.now() + 20));
+    }, Math.max(50, this.deferSpeculativeUntil - this.clock.now() + 20));
     this.deferTimer.unref?.();
 
     if (this.active && this.active.priority === 'speculative' && !this.active.preempting) {
@@ -118,7 +165,7 @@ export class FifoBuildQueue {
   }
 
   private isSpeculativeDeferred(): boolean {
-    return Date.now() < this.deferSpeculativeUntil;
+    return this.clock.now() < this.deferSpeculativeUntil;
   }
 
   private beginPreemption(target: ActiveLease): void {
@@ -126,26 +173,21 @@ export class FifoBuildQueue {
     target.preempting = true;
     try {
       target.onPreempted?.();
-    } catch {
-      // ignore callback errors
+    } catch (err) {
+      // a failing notification must not stop the preemption itself
+      ignore(err, 'build-queue: onPreempted callback threw', { leaseId: target.leaseId });
     }
     // Wait until the speculative runner's child process exits and calls releaseByLease(),
     // with a bounded safety fallback so a crashed/unresponsive runner never blocks foreground builds.
     this.clearPreemptTimer();
     if (this.preemptExitGraceMs <= 0) {
-      if (this.active?.leaseId === target.leaseId) {
-        this.active = null;
-        this.clearActiveTimer();
-        this.pump();
-      }
+      this.terminateActive(target, 'preempted');
       return;
     }
-    this.preemptGraceTimer = setTimeout(() => {
+    this.preemptGraceTimer = this.clock.setTimeout(() => {
       this.preemptGraceTimer = null;
       if (this.active?.leaseId === target.leaseId) {
-        this.active = null;
-        this.clearActiveTimer();
-        this.pump();
+        this.terminateActive(target, 'preempted');
       }
     }, this.preemptExitGraceMs);
     this.preemptGraceTimer.unref?.();
@@ -169,6 +211,7 @@ export class FifoBuildQueue {
       signal?: AbortSignal;
       onQueued?: (position: number) => void;
       onPreempted?: () => void;
+      onTerminate?: LeaseTerminator;
     },
   ): Promise<BuildLease> {
     const priority: BuildPriority = opts?.priority ?? 'foreground';
@@ -181,7 +224,13 @@ export class FifoBuildQueue {
 
     if (!this.active && (priority === 'foreground' || !this.isSpeculativeDeferred())) {
       const leaseId = crypto.randomUUID();
-      this.active = { leaseId, sessionId, priority, onPreempted: opts?.onPreempted };
+      this.active = {
+        leaseId,
+        sessionId,
+        priority,
+        onPreempted: opts?.onPreempted,
+        onTerminate: opts?.onTerminate,
+      };
       this.armActiveTimer(leaseId);
       return Promise.resolve({
         leaseId,
@@ -200,6 +249,7 @@ export class FifoBuildQueue {
         priority,
         onPosition: opts?.onQueued,
         onPreempted: opts?.onPreempted,
+        onTerminate: opts?.onTerminate,
         resolve,
         reject,
         timer: null,
@@ -207,7 +257,7 @@ export class FifoBuildQueue {
 
       const cleanup = () => {
         if (waiter.timer) {
-          clearTimeout(waiter.timer);
+          this.clock.clearTimeout(waiter.timer);
           waiter.timer = null;
         }
         const idx = this.queue.indexOf(waiter);
@@ -232,7 +282,7 @@ export class FifoBuildQueue {
         );
       }
 
-      waiter.timer = setTimeout(() => {
+      waiter.timer = this.clock.setTimeout(() => {
         cleanup();
         reject(new BuildQueueTimeoutError(timeoutMs));
       }, timeoutMs);
@@ -264,10 +314,14 @@ export class FifoBuildQueue {
    * session coalesces its own in-flight speculative check into a foreground Publish).
    */
   promoteToForeground(leaseId: string): boolean {
-    if (this.active?.leaseId !== leaseId || this.active.preempting) return false;
+    if (this.active?.leaseId !== leaseId || this.active.preempting || this.active.terminating) return false;
     this.active.priority = 'foreground';
     this.active.onPreempted = undefined;
     return true;
+  }
+
+  isLeaseActive(leaseId: string): boolean {
+    return this.active?.leaseId === leaseId;
   }
 
   releaseByLease(leaseId: string): boolean {
@@ -288,7 +342,7 @@ export class FifoBuildQueue {
     for (let i = this.queue.length - 1; i >= 0; i--) {
       const w = this.queue[i]!;
       if (w.sessionId === sessionId) {
-        if (w.timer) clearTimeout(w.timer);
+        if (w.timer) this.clock.clearTimeout(w.timer);
         this.queue.splice(i, 1);
         w.reject(new Error('Workspace stopped while waiting in build queue'));
         removed = true;
@@ -315,7 +369,7 @@ export class FifoBuildQueue {
     const [next] = this.queue.splice(idx, 1);
     if (!next) return;
     if (next.timer) {
-      clearTimeout(next.timer);
+      this.clock.clearTimeout(next.timer);
       next.timer = null;
     }
     const leaseId = crypto.randomUUID();
@@ -324,6 +378,7 @@ export class FifoBuildQueue {
       sessionId: next.sessionId,
       priority: next.priority,
       onPreempted: next.onPreempted,
+      onTerminate: next.onTerminate,
     };
     this.armActiveTimer(leaseId);
     this.notifyPositions();

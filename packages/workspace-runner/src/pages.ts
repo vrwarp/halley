@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { realClock, type Clock } from './clock.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -24,6 +25,8 @@ import {
   type PageRequestStatus,
 } from '@halley/shared';
 import { detectAstroBase } from './astro-manager.js';
+import { pathExists, readdirEntriesOrEmpty, writeFileAtomic } from './fs-util.js';
+import { errCode, ignore, ignoreCodes, ignoreExpected, isMissingPathError, logger, orDefault } from './log.js';
 import {
   createCheckpoint,
   getGitChanges,
@@ -50,6 +53,8 @@ export interface PageCreationServiceOptions {
   getAstroPort: () => number;
   getPreviewBase: () => string;
   onBroadcast: (msg: ChatServerMessage) => void;
+  /** Clock for the preview fetch deadline (defaults to the real clock). */
+  clock?: Clock;
 }
 
 export class PageCreationService {
@@ -71,21 +76,22 @@ export class PageCreationService {
           }
         }
       }
-    } catch {
-      // no persisted page requests yet
+    } catch (err) {
+      // ENOENT: no persisted page requests yet; anything else (corrupt JSON) is worth a warning
+      ignoreCodes(err, ['ENOENT'], 'pages: load persisted page requests', { path: this.storePath });
     }
   }
 
   private async save(): Promise<void> {
     try {
       await fs.mkdir(this.opts.stateDir, { recursive: true });
-      await fs.writeFile(
-        this.storePath,
-        JSON.stringify(Array.from(this.pageRequests.values()), null, 2),
-        'utf8',
-      );
-    } catch {
-      // non-fatal
+      // tmp + rename: a crash mid-write can never leave a truncated (unloadable) store
+      await writeFileAtomic(this.storePath, JSON.stringify(Array.from(this.pageRequests.values()), null, 2), {
+        durable: true,
+      });
+    } catch (err) {
+      // non-fatal for the request, but page-request state would be lost on wake
+      logger.error('pages: failed to persist page requests', { err, path: this.storePath });
     }
   }
 
@@ -142,14 +148,18 @@ export class PageCreationService {
       let src: string;
       try {
         src = await fs.readFile(abs, 'utf8');
-      } catch {
+      } catch (err) {
+        // page file gone (deleted / undone): the request is obsolete
+        if (!isMissingPathError(err)) ignore(err, 'pages: read requested page source', { file: pr.file });
         this.pageRequests.delete(id);
         changed = true;
         continue;
       }
 
       const ext = path.extname(pr.file);
-      const actualUnlisted = await isPageSourceUnlisted(src, ext).catch(() => pr.unlisted);
+      const actualUnlisted = await orDefault(isPageSourceUnlisted(src, ext), pr.unlisted, 'pages: parse unlisted flag', {
+        fields: { file: pr.file },
+      });
       let nextStatus = pr.status;
       let nextError = pr.error;
 
@@ -198,8 +208,9 @@ export class PageCreationService {
       try {
         const src = await fs.readFile(path.join(this.opts.repoRoot, existing.file), 'utf8');
         nextUnlisted = await isPageSourceUnlisted(src, path.extname(existing.file));
-      } catch {
-        // keep existing
+      } catch (err) {
+        // keep existing visibility flag
+        ignoreCodes(err, ['ENOENT'], 'pages: read finished page to detect visibility', { file: existing.file });
       }
     }
     const updated: PageRequestMetadata = {
@@ -223,21 +234,17 @@ export class PageCreationService {
     try {
       const port = this.opts.getAstroPort();
       const base = this.opts.getPreviewBase();
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 2000);
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}${base}`, {
-          signal: controller.signal,
-        });
-        if (res.ok) {
-          const html = await res.text();
-          navGroups = extractNavGroupsFromHtml(html);
-        }
-      } finally {
-        clearTimeout(timer);
+      // the deadline covers the body read too (the signal stays armed until res.text() settles)
+      const res = await fetch(`http://127.0.0.1:${port}${base}`, {
+        signal: (this.opts.clock ?? realClock).timeoutSignal(2000),
+      });
+      if (res.ok) {
+        const html = await res.text();
+        navGroups = extractNavGroupsFromHtml(html);
       }
-    } catch {
+    } catch (err) {
       // preview may not be serving yet
+      ignoreExpected(err, 'pages: fetch preview for nav groups');
     }
 
     return {
@@ -371,10 +378,13 @@ export class PageCreationService {
       `Created page ${route}`,
       this.opts.gitIdentity,
     );
-    const changes = await getGitChanges(
-      this.opts.repoRoot,
-      `origin/${this.opts.baseBranch}`,
-    ).catch(() => []);
+    // The page operation already succeeded; a failed change listing only affects the count shown
+    const changes = await orDefault(
+      getGitChanges(this.opts.repoRoot, `origin/${this.opts.baseBranch}`),
+      [],
+      'pages: list changes after page operation',
+      { fields: { repoRoot: this.opts.repoRoot } },
+    );
 
     if (checkpoint) {
       this.opts.onBroadcast({
@@ -457,8 +467,8 @@ export class PageCreationService {
         await fs.access(abs);
         foundRel = rel;
         break;
-      } catch {
-        // try next
+      } catch (err) {
+        if (errCode(err) !== 'ENOENT') ignore(err, 'pages: access candidate page file', { rel });
       }
     }
 
@@ -484,10 +494,13 @@ export class PageCreationService {
       `Deleted page ${clean}`,
       this.opts.gitIdentity,
     );
-    const changes = await getGitChanges(
-      this.opts.repoRoot,
-      `origin/${this.opts.baseBranch}`,
-    ).catch(() => []);
+    // The page operation already succeeded; a failed change listing only affects the count shown
+    const changes = await orDefault(
+      getGitChanges(this.opts.repoRoot, `origin/${this.opts.baseBranch}`),
+      [],
+      'pages: list changes after page operation',
+      { fields: { repoRoot: this.opts.repoRoot } },
+    );
 
     if (checkpoint) {
       this.opts.onBroadcast({
@@ -522,8 +535,8 @@ export class PageCreationService {
       try {
         await fs.access(abs);
         return { fileRel: rel, fileAbs: abs, ext: path.extname(rel) };
-      } catch {
-        // try next
+      } catch (err) {
+        if (errCode(err) !== 'ENOENT') ignore(err, 'pages: access candidate page file', { rel });
       }
     }
     return null;
@@ -577,10 +590,13 @@ export class PageCreationService {
 
     const summary = unlisted ? `Marked ${clean} as unlisted` : `Made ${clean} public`;
     const checkpoint = await createCheckpoint(this.opts.repoRoot, summary, this.opts.gitIdentity);
-    const changes = await getGitChanges(
-      this.opts.repoRoot,
-      `origin/${this.opts.baseBranch}`,
-    ).catch(() => []);
+    // The page operation already succeeded; a failed change listing only affects the count shown
+    const changes = await orDefault(
+      getGitChanges(this.opts.repoRoot, `origin/${this.opts.baseBranch}`),
+      [],
+      'pages: list changes after page operation',
+      { fields: { repoRoot: this.opts.repoRoot } },
+    );
 
     if (checkpoint) {
       this.opts.onBroadcast({
@@ -598,15 +614,14 @@ export class PageCreationService {
 
     // Check if astro.config.mjs has a sitemap filter or if scripts/verify-seo.mjs tracks non-indexable routes
     let needsFollowUp = false;
-    try {
-      const astroCfg = await fs
-        .readFile(path.join(this.opts.repoRoot, 'astro.config.mjs'), 'utf8')
-        .catch(() => '');
-      if (/sitemap/i.test(astroCfg) && /filter/i.test(astroCfg)) {
-        needsFollowUp = true;
-      }
-    } catch {
-      // ignore
+    const astroCfg = await fs
+      .readFile(path.join(this.opts.repoRoot, 'astro.config.mjs'), 'utf8')
+      .catch((err) => {
+        ignoreCodes(err, ['ENOENT'], 'pages: read astro.config.mjs for sitemap filter');
+        return '';
+      });
+    if (/sitemap/i.test(astroCfg) && /filter/i.test(astroCfg)) {
+      needsFollowUp = true;
     }
 
     const followUpPrompt = needsFollowUp
@@ -692,7 +707,7 @@ export class PageCreationService {
     });
 
     // Deterministically update exact internal references (including #hash, ?query, trailing /, and base-prefixed config entries)
-    const originalBase = await detectAstroBase(this.opts.repoRoot).catch(() => '/');
+    const originalBase = await orDefault(detectAstroBase(this.opts.repoRoot), '/', 'pages: detect astro base for move');
     const basePrefix = originalBase === '/' ? '' : originalBase.replace(/\/$/, '');
     let updatedReferencesCount = 0;
     const escapedFrom = cleanFrom.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -704,12 +719,7 @@ export class PageCreationService {
 
     const filesToUpdate: string[] = [];
     const walkSrc = async (dir: string) => {
-      let entries;
-      try {
-        entries = await fs.readdir(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
+      const entries = await readdirEntriesOrEmpty(dir, 'pages: list source directory for reference rewrite');
       for (const e of entries) {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) {
@@ -721,11 +731,11 @@ export class PageCreationService {
     };
     await walkSrc(path.join(this.opts.repoRoot, 'src'));
     const astroCfgAbs = path.join(this.opts.repoRoot, 'astro.config.mjs');
-    if (await fs.access(astroCfgAbs).then(() => true).catch(() => false)) {
+    if (await pathExists(astroCfgAbs, 'pages: probe astro.config.mjs')) {
       filesToUpdate.push(astroCfgAbs);
     }
     const verifySeoAbs = path.join(this.opts.repoRoot, 'scripts', 'verify-seo.mjs');
-    if (await fs.access(verifySeoAbs).then(() => true).catch(() => false)) {
+    if (await pathExists(verifySeoAbs, 'pages: probe scripts/verify-seo.mjs')) {
       filesToUpdate.push(verifySeoAbs);
     }
 
@@ -762,7 +772,10 @@ export class PageCreationService {
             updatedReferencesCount += 1;
           }
         })
-        .catch(() => {});
+        .catch((err) =>
+          // a stale reference is recoverable (the agent/user can fix it); the rename itself succeeded
+          logger.warn('pages: failed to update route references in file', { err, file: rel }),
+        );
     }
 
     // Update any stored PageRequestMetadata for this route (including section)
@@ -779,10 +792,13 @@ export class PageCreationService {
       `Moved page ${cleanFrom} to ${toRoute}`,
       this.opts.gitIdentity,
     );
-    const changes = await getGitChanges(
-      this.opts.repoRoot,
-      `origin/${this.opts.baseBranch}`,
-    ).catch(() => []);
+    // The page operation already succeeded; a failed change listing only affects the count shown
+    const changes = await orDefault(
+      getGitChanges(this.opts.repoRoot, `origin/${this.opts.baseBranch}`),
+      [],
+      'pages: list changes after page operation',
+      { fields: { repoRoot: this.opts.repoRoot } },
+    );
 
     if (checkpoint) {
       this.opts.onBroadcast({
@@ -811,7 +827,9 @@ export class PageCreationService {
     try {
       const content = await fs.readFile(path.join(this.opts.repoRoot, fileRel), 'utf8');
       return content.includes(HALLEY_PLACEHOLDER_ATTR);
-    } catch {
+    } catch (err) {
+      // the file was removed (or renamed) since the placeholder was inserted: nothing left to finish
+      if (!isMissingPathError(err)) ignore(err, 'pages: read file for placeholder check', { fileRel });
       return false;
     }
   }
